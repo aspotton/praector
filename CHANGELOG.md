@@ -1,0 +1,108 @@
+# Changelog
+
+All notable changes to Praector are recorded here. README and focused documentation are intentionally release-version-neutral.
+
+**Repository rule:** every repository change must update this file. Add work under `Unreleased` while it is in progress; when publishing a release, move those entries into the new version section and keep the newest release first.
+
+## Unreleased
+
+## 0.2.0
+
+- Established the clean Praector public namespace: native executable/CLI `praector`, Go module/package, Python reference package, project marker (`.praector/project.toml`), default home (`~/.praector`), `PRAECTOR_*` worker/config environment, Git branch prefixes (`praector/collections/...`, `praector/tasks/...`), generated Git identity, and `Praector-*` provenance trailers.
+- Kept the public baseline intentionally migration-free: configuration, markers, worker environment, control shims, branches, and state paths use only the canonical Praector namespace.
+- Added `ROADMAP.md` covering public-repository/general-use hardening, GitHub PR delivery torture testing, parallel-Collection stress, natural live post-repair-review validation, Dolt backup/export/restore, the project-identity edge case, self-dogfooding, GitHub Actions, and complete Windows runtime validation.
+- Defined the planned MCP direction: read-only CLI-parity resources/tools first, then policy-checked mutations over the same durable domain/store operations, with explicit authentication/capability boundaries for remote use.
+- Defined the planned durable human/executive escalation model, including `AWAITING_HUMAN` / `AWAITING_EXEC`-style blocked states, evidence-backed escalation records, shared CLI/MCP visibility, authority-scoped responses, and deterministic graph resumption after a recorded decision.
+- Refreshed README/docs/agent guidance for the Praector identity and public-repository positioning. README now states that Linux and macOS have been runtime-tested; Windows binaries are cross-built and full Windows runtime validation/support is a near-term roadmap item.
+
+## 0.1.40
+
+- Corrected Collection status derivation during parent/delegation handoff. A durable `RUNNING` harness session now counts as active Collection execution even when its parent Task has already moved to `WAITING` and child Tasks are intentionally suppressed until that session exits. This removes the misleading transient `BLOCKED` state without changing runnable-task or dependency semantics; genuinely idle Collections with no executing Task, runnable Task, or running session still become `BLOCKED`. Added native/reference regressions for the exact `WAITING` parent + `READY` child + live-session case observed in black-box testing.
+- Made Praector-generated Git history human-readable while preserving exact provenance. Implementation checkpoint commits now use the Task title as the commit subject, and integration merge commits use `Integrate: <task title>` instead of opaque `praector(...): ...` subjects. Commit bodies include the durable result summary when available plus `Praector-Collection`, `Praector-Task`, `Praector-Attempt`, and `Praector-Operation` trailers. Delegation checkpoints use the same format. Existing repository history is not rewritten; the convention applies to new commits only.
+- Updated workspace/recovery documentation to describe active-session-aware Collection status, the human-readable Git message convention, and repaired-review acceptance lineage accurately.
+
+## 0.1.39
+
+- Strengthened semantic review repair lineage. A successful review with `verdict=fail` now completes as durable historical evidence instead of waiting on its own repair. The repair implementation depends on that failed review, and successful repair integration creates a **fresh durable review Task/context** rather than resuming the original reviewer. The fresh review independently re-evaluates the repaired candidate and carries verification lineage for both the repair implementation and the original implementation it corrected.
+- Updated terminal/acceptance semantics for the stronger lineage model: historical completed `verdict=fail` reviews are preserved and no longer permanently poison acceptance; every completed review must still have an explicit `pass|fail` verdict, and every completed implementation must be covered by a later independent `verdict=pass`. Added native/reference regressions for fresh post-repair review creation and repaired lineage acceptance.
+- Shifted known acceptance failures left into planning. Coordinator, critic, and plan-review contracts now forbid intentionally dispatching implementation work that knowingly violates Collection MUST/MUST NOT, security, or acceptance requirements on the theory that downstream review will repair it. Plan review must fail such a graph. Praector still has no durable fault-injection/human/exec exception authorization, so intentional acceptance contradictions remain blocking operator issues until such a mechanism exists.
+
+## 0.1.38
+
+- Added a capability-specific workspace-hygiene contract to every read-only Task Envelope. Coordinators, critics, plan reviewers, researchers, reviewers, and advisers now baseline the starting Git status, prefer verification modes that avoid incidental repository writes, restore only cache/build/test artifacts caused by their own checks, and verify the final worktree matches the starting baseline before submitting results. The contract explicitly warns against discarding pre-existing or committed candidate state merely to make `git status` clean.
+- Documented non-mutating verification as prevention rather than a replacement for runtime enforcement. `PYTHONDONTWRITEBYTECODE=1` is provided as an optional Python example when bytecode caches are irrelevant, while Praector's deterministic post-run dirty-worktree check, rollback, same-task retry, and retry-budget escalation remain unchanged. Added native/reference envelope regressions proving read-only profiles receive the hygiene contract while `implement` retains write capability.
+
+## 0.1.37
+
+- Reclassified read-only workspace mutation as an execution/protocol failure rather than a semantic review/plan failure. When a coordinator, critic, plan reviewer, researcher, reviewer, or adviser mutates its read-only worktree, Praector rolls the changes back, records the concrete attempt as failed, and retries the same durable Task while retry budget remains. This prevents a reviewer capability violation from incorrectly spawning coordinator repair work for an implementation that was never actually rejected.
+- Added durable `READ_ONLY_CAPABILITY_RETRY` events and native/reference regressions proving the same task returns to `READY` before graph-level escalation; only retry-budget exhaustion produces a terminal failed task that can trigger coordinator attention. Real `verdict=fail` review behavior is unchanged and still creates blocking implementation repair.
+
+## 0.1.36
+
+- Enforced hard-dependency referential integrity in both the native Go runtime and Python reference implementation. Every `depends_on` endpoint must resolve to a durable task in the same Collection before the task/edge is published; missing and cross-Collection references now fail deterministically instead of becoming dangling rows that scheduler joins could silently ignore. The guard covers atomic task creation, direct dependency-edge insertion, and single-flight plan-review reuse.
+- Removed fake `T-*` dependency placeholders from the runtime Task Envelope and documented that agents must use exact task IDs returned by Praector. Coordinator examples now rely on Praector's automatic final-plan-review gating rather than fabricating a future plan-review ID.
+- Added native and reference regressions proving missing/cross-Collection dependencies are rejected before mutation while preserving existing DAG-cycle enforcement.
+
+## 0.1.35
+
+- Added a native Go implementation of the Praector control plane while retaining the Python implementation as a reference implementation during native hardening. The Go runtime preserves the existing Dolt schema, durable IDs/state, planning and delivery policy, critic revalidation, single-flight plan review, review lineage, revisions, acceptance, GitHub PR delivery, Git worktrees, and OpenCode task protocol.
+- Added OS-specific native process/locking adapters, including Windows file locking and Job Object process-tree cleanup, so the same codebase can build native Linux, macOS, and Windows executables without Python or CGO at runtime.
+- Added embedded schema/profile assets plus parity guards so the native executable carries the same durable schema and agent contracts as the reference implementation.
+- Added Go unit/integration coverage for policy classification, material-plan fingerprints, DAG enforcement, staged critic/plan-review gating, claim-time planning barriers, single-flight plan review, stale critic completion blocking, review supersession lineage, revisions, PR copy, CLI parsing, and real Git acceptance behavior. The original Python regression suite remains part of `make test`/`make check`.
+- Reworked the Makefile around the native runtime: `make build` builds the host executable, `make build-all` cross-builds Linux/Windows/macOS on amd64/arm64, `make test` runs native and reference suites, `make parity` compares shared user-facing contracts, and `make smoke` exercises the built binary.
+- Added nested CLI help parity so `-h`/`--help` works without initializing Dolt/project state at command and subcommand levels, matching the Python CLI's operational contract.
+- Added an optional fresh-repository native state smoke target while keeping the default binary smoke fast; store/scheduler behavior remains covered by native integration tests plus the Python regression suite.
+
+## 0.1.34
+
+- Moved package release history and current-package version references out of README and focused docs into this changelog.
+- Made `CHANGELOG.md` part of the repository change contract so every code, behavior, CLI, schema, prompt, workflow, or documentation change records a changelog entry.
+- Added documentation regression checks that keep README/docs release-version-neutral and require package metadata plus the changelog release entry to stay synchronized.
+
+## 0.1.33
+
+- Generated pull-request copy now read like a review description rather than an implementation log. New implementation workers now publish an optional human-facing `pr_title` and are explicitly told to lead `pr_summary`/`changes` with behavior instead of file paths, helper names, regexes, line numbers, or internal event names. For pre-0.1.32 results, the deterministic compatibility formatter recognizes durable behavioral semantics where available and renders concise change bullets instead of exposing code-level findings. Independent review evidence is also presented as compact facts (`Independent Praector review: PASS`, targeted/full-suite counts, scope checks) while the raw commands remain available through `praector result show`. No extra model task is introduced at PR publication time.
+
+## 0.1.32
+
+- Improved deterministic pull-request copy. Completed implementation results can now publish a concise `pr_summary` plus a 3–8 item `changes` list intended for reviewer-facing delivery metadata; `praector collection pr` prefers those fields verbatim for `## Summary` / `## Changes`. Older Collections remain useful: when `changes` is absent, Praector recovers multiple concrete behavior/scope bullets from durable implementation findings and adds regression-test/documentation bullets when supported by evidence, instead of reducing `## Changes` to the implementation task title. Verification and remaining-validation sections continue to come from independent review and unresolved durable results; no extra model task is spawned to write PR prose. Existing open PR bodies are left untouched by default to preserve human edits; pass `--refresh-copy` to replace the body with the current Praector-generated copy.
+
+## 0.1.31
+
+- Added first-class GitHub pull-request delivery with `praector collection pr`. A reviewed `COMPLETE` Collection can now push its integration branch, create a GitHub PR through the authenticated `gh` CLI, or reuse an existing PR for the same collection branch without duplication. PR delivery is idempotent and durable: Praector records provider/number/URL/state/base/head/source commit separately from Collection execution/acceptance state, so reopening a Collection with `collection revise` and completing fresh reviewed work updates the same open PR on the next `collection pr`. The command supports `--draft`, `--title`, `--base`, `--remote`, `--dry-run`, and `--open`; PR copy is assembled deterministically from durable implementation/review results rather than generated by a new model task. Direct `collection accept` remains a separate explicit delivery path.
+
+## 0.1.30
+
+- Closed the revalidation handoff loop exposed by `COL-f575af95a4`. Planning policy no longer treats `WAITING` coordinators as active graph-shaping prerequisites of a final `plan_review`; a waiting coordinator has already handed control to a blocking child/review and therefore must never be wired back ahead of that same review generation. Coordinator-requested final plan review is now single-flight at the store/API layer: if a non-failed nonterminal `plan_review` already exists, Praector reuses it, atomically attaches new critic/research prerequisites, blocks the coordinator on that gate, and gates current implementations instead of creating another review generation. If that review currently waits on the same active coordinator, the final handoff atomically flips `coordinator -> plan_review` into `plan_review -> coordinator` rather than ever persisting both directions. Explicit caller-as-review-prerequisite requests are ignored because the blocking handoff creates the valid opposite edge. This prevents repeated critic-revalidation rounds from manufacturing parallel final-review gates or reverse-edge quarantines.
+
+## 0.1.29
+
+- Added legacy dependency-cycle migration and daemon isolation. Before reconciliation, Praector now scans upgraded collections for the two pre-write cycle edges older releases could persist (`implement -> plan_review` and `coordinator -> plan_review` when part of a cycle) and removes only those protocol-invalid edges, recording `LEGACY_DEPENDENCY_CYCLE_REPAIRED`. Unknown historical cycle shapes are not guessed at: the affected collection is marked `BLOCKED`, a durable `DEPENDENCY_CYCLE_QUARANTINED` event is recorded, its runnable tasks are skipped, and the global daemon continues processing other collections. This closes the upgrade failure where one old collection could terminate `praector daemon` as soon as the 0.1.28 DAG guard encountered it.
+
+## 0.1.28
+
+- Made the durable `depends_on` graph acyclic by invariant rather than by prompt convention. Every new hard dependency is checked for transitive reachability before commit, including the initial dependency/blocking/gating batch published with a new task. Scheduler reconciliation repairs legacy coordinator↔plan-review transitive cycles, collapses multiple unstarted final plan-review gates to the newest surviving gate, rewires waiting coordinators and implementations onto it, and finalizes every waiting coordinator released by a passing final review rather than waking stale planners. The exact multi-node Twilio recovery topology that exposed the 0.1.27 gap is now a regression test.
+
+## 0.1.27
+
+- Prevented and repaired pre-write plan-review dependency cycles. A coordinator-created `plan_review` may depend on critic/research/advice evidence, but any requested dependency on an `implement` task is ignored because the plan reviewer inspects the durable implementation contract before execution. Praector still atomically gates implementation on the plan review. Scheduler reconciliation also repairs the exact reciprocal legacy/live cycle (`implement -> plan_review` plus `plan_review -> implement`) by removing only the invalid implementation-to-plan-review prerequisite and preserving the pre-write gate.
+
+## 0.1.26
+
+- Fixed deterministic policy classification for conversational change requests. Objectives such as “I’d like to add…” and “Can you fix…” now count as implementation delivery even when the first line does not begin with an imperative verb. Non-trivial implementation requests require an independent `plan_review`; external provider/gateway or external-contract changes additionally require a `critic`. Clearly trivial documentation-only edits remain low-ceremony. Claim-time enforcement is regression-tested against the Twilio gateway/extension-transfer wording that exposed the bug, so an `implement` task cannot start before the required critic and plan review even if a coordinator publishes write work first.
+
+## 0.1.25
+
+- Added a mandatory inherited global engineering contract for every Praector worker. The contract preserves durable repository knowledge in relevant README/AGENTS files, prefers minimal coherent code changes, requires surrounding-impact and inheritance/interface awareness, keeps optional adjacent improvements out of scope unless explicitly accepted, favors simple implementations, preserves local code style, and uses useful docstrings/documentation conventions. The coordinator, critic, plan reviewer, implementation worker, and implementation reviewer each reinforce the parts of that contract relevant to planning or verification. Because the global contract is injected by the Task Envelope, delegated/retried/fresh workers inherit it automatically without copying generic prose into material task objectives.
+
+## 0.1.24
+
+- Made critic-baseline provenance race-free. A coordinator-created final `plan_review` now publishes its `CRITIC_PLAN_BASELINE` event in the same locked Dolt mutation as the review task, dependencies, implementation gates, and caller `WAITING` transition. Human revision coordinators use `revision_plan_seal`; deterministic revalidation uses `material_revalidation`; `compatibility_plan_seal` is reserved for legacy graphs that truly lacked baseline metadata. Bootstrap performs a narrow append-only repair for pre-0.1.24 false compatibility labels when revision lineage is provable. The release also adds a forced-stale scheduler regression proving that an unannounced material contract mutation is detected and deterministically inserts fresh critic plus coordinator revalidation before review/write work can proceed.
+
+## 0.1.23
+
+- Fixed false critic staleness caused by workspace preparation populating `base_commit` after the critic seal. Collection/isolated workspace Git pointers are now treated as execution bookkeeping, while explicit inherited delegation checkpoints remain material. Acceptance and terminal-state reconciliation also refuse genuinely stale required critics. Pre-0.1.23 raw-base fingerprints remain compatibility-valid.
+
+## 0.1.22
+
+- Added deterministic critic revalidation for materially changed plans. The initial required critic is sealed to the first critic-informed material plan at final plan-review handoff. After that, changes to implementation/research/advice contracts or their meaningful dependencies stale the critic. Praector blocks plan review and implementation at claim time, runs a fresh critic against the changed graph, and requires a fresh coordinator to consume those findings. If that coordinator materially changes the plan again, another critic round is required. Status/timestamp churn and orchestration-only edges do not invalidate the critic.

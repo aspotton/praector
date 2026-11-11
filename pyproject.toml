@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "praector"
+version = "0.2.0"
+description = "Durable, policy-gated orchestration and delegated command for autonomous agents"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "Praector"}]
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+praector = "praector.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+praector = ["schema.sql", "prompts/*.md"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
