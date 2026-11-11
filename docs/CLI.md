@@ -88,6 +88,8 @@ Only one scheduler owner may execute at a time.
 
 `--once` reconciles/runs available work until no runnable work remains, then exits.
 
+When enabled via `~/.praector/config.toml` `[mcp]` or `PRAECTOR_MCP` (default off), a running `daemon` also hosts a loopback-only MCP listener so agents can drive the same durable control plane. It has no CLI flag; see [OPERATIONS.md](OPERATIONS.md#mcp-server-optional-local).
+
 ## Doctor
 
 ```bash

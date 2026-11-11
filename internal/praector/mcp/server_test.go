@@ -1,0 +1,163 @@
+package mcp
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+type stubProvider struct{}
+
+func (stubProvider) ListTools() []Tool {
+	return []Tool{{Name: "echo", Description: "echoes", InputSchema: map[string]any{"type": "object"}}}
+}
+
+func (stubProvider) CallTool(name string, args json.RawMessage) (ToolResult, error) {
+	if name != "echo" {
+		return ToolResult{}, errUnknownTool(name)
+	}
+	return ToolResult{Content: []ContentItem{{Type: "text", Text: string(args)}}}, nil
+}
+
+func (stubProvider) ListResources() []Resource {
+	return []Resource{{URI: "stub://x", Name: "x"}}
+}
+
+func (stubProvider) ReadResource(uri string) ([]ResourceContents, error) {
+	if uri != "stub://x" {
+		return nil, errUnknownResource(uri)
+	}
+	return []ResourceContents{{URI: uri, Text: "hello"}}, nil
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
+
+func errUnknownTool(n string) error     { return errString("unknown tool: " + n) }
+func errUnknownResource(u string) error { return errString("unknown resource: " + u) }
+
+func newTestServer() *Server {
+	s := stubProvider{}
+	return &Server{ServerName: "test", ServerVersion: "0.0.0", Tools: s, Resources: s}
+}
+
+// post sends one JSON-RPC message to the streamable handler and decodes the
+// single JSON-RPC response.
+func post(t *testing.T, srv *httptest.Server, msg map[string]any) map[string]any {
+	t.Helper()
+	body, _ := json.Marshal(msg)
+	resp, err := http.Post(srv.URL+EndpointPath, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d for %v", resp.StatusCode, msg["method"])
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestMCPInitializeRoundTrip(t *testing.T) {
+	ts := httptest.NewServer(newTestServer().Handler())
+	defer ts.Close()
+	out := post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": ProtocolVersion}})
+	if out["error"] != nil {
+		t.Fatalf("initialize error: %v", out["error"])
+	}
+	res, _ := out["result"].(map[string]any)
+	if res["protocolVersion"] != ProtocolVersion {
+		t.Fatalf("protocolVersion: %v", res)
+	}
+	si, _ := res["serverInfo"].(map[string]any)
+	if si["name"] != "test" {
+		t.Fatalf("serverInfo: %v", res)
+	}
+}
+
+func TestMCPToolsListAndCall(t *testing.T) {
+	ts := httptest.NewServer(newTestServer().Handler())
+	defer ts.Close()
+	out := post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+	res, _ := out["result"].(map[string]any)
+	tools, _ := res["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "echo" {
+		t.Fatalf("tools/list: %v", out)
+	}
+	out = post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": map[string]any{"name": "echo", "arguments": map[string]any{"a": 1}}})
+	res, _ = out["result"].(map[string]any)
+	if res["isError"] == true {
+		t.Fatalf("unexpected tool error: %v", out)
+	}
+	out = post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": map[string]any{"name": "nope"}})
+	res, _ = out["result"].(map[string]any)
+	if res["isError"] != true {
+		t.Fatalf("unknown tool must report isError: %v", out)
+	}
+}
+
+func TestMCPResourcesAndPingAndMethodNotFound(t *testing.T) {
+	ts := httptest.NewServer(newTestServer().Handler())
+	defer ts.Close()
+	out := post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "ping"})
+	if out["error"] != nil {
+		t.Fatalf("ping: %v", out)
+	}
+	out = post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": map[string]any{"uri": "stub://x"}})
+	res, _ := out["result"].(map[string]any)
+	c, _ := res["contents"].([]any)
+	if len(c) != 1 || c[0].(map[string]any)["text"] != "hello" {
+		t.Fatalf("resources/read: %v", out)
+	}
+	out = post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 3, "method": "bogus/method"})
+	if e, _ := out["error"].(map[string]any); e == nil || e["code"].(float64) != codeMethodNotFound {
+		t.Fatalf("expected method-not-found: %v", out)
+	}
+}
+
+func TestMCPNotificationReturnsNoBody(t *testing.T) {
+	ts := httptest.NewServer(newTestServer().Handler())
+	defer ts.Close()
+	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
+	resp, err := http.Post(ts.URL+EndpointPath, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("notification status: %d", resp.StatusCode)
+	}
+}
+
+func TestIsLoopbackAddr(t *testing.T) {
+	cases := map[string]bool{
+		"127.0.0.1:8080": true,
+		"127.0.0.1:0":    true,
+		"localhost:8080": true,
+		":8080":          true,
+		"::1:8080":       false, // malformed host:port for SplitHostPort; host becomes weird
+		"0.0.0.0:8080":   false,
+		"10.0.0.5:8080":  false,
+		"example.com:80": false,
+	}
+	for addr, want := range cases {
+		if got := IsLoopbackAddr(addr); got != want {
+			t.Errorf("IsLoopbackAddr(%q)=%v want %v", addr, got, want)
+		}
+	}
+}
+
+func TestNewLoopbackServerRefusesNonLoopback(t *testing.T) {
+	if _, err := NewLoopbackServer("0.0.0.0:9999", newTestServer()); err == nil {
+		t.Fatal("expected refusal for non-loopback bind")
+	}
+	if _, err := NewLoopbackServer("127.0.0.1:0", newTestServer()); err != nil {
+		t.Fatalf("expected acceptance for loopback bind: %v", err)
+	}
+}
