@@ -65,6 +65,7 @@ docs/OPERATIONS.md           install/run/operate/troubleshoot
 docs/DEVELOPMENT.md          code layout/change guidance
 cmd/praector/main.go              native executable entry point
 internal/praector/cli.go          CLI parser and operator commands
+internal/praector/service.go      shared typed domain service layer (CLI/MCP parity seam)
 internal/praector/store.go        Dolt persistence and graph operations
 internal/praector/scheduler.go    deterministic scheduler/executor/recovery
 internal/praector/policy.go       deterministic pre-write risk/gate classifier
@@ -85,7 +86,8 @@ tests/                        original Python behavioral regression contract
 
 Keep responsibilities separated:
 
-- **CLI (`internal/praector/cli.go`)**: parse input, resolve project/context, validate operator actions, format output.
+- **CLI (`internal/praector/cli.go`)**: parse input, resolve project/context, validate operator actions, format output, and launch the scheduler. Every domain operation delegates to the shared service layer.
+- **Shared service layer (`internal/praector/service.go`)**: one typed `Op(ctx, Input) -> Output` per CLI command that BOTH the CLI and the future MCP adapter call, so the surfaces cannot diverge. It performs durable domain reads/mutations via the existing store/workspace only; adapters own parsing/formatting/exit codes and process launching. The `serviceOps` registry maps each `commandHelp` entry 1:1 to an op; a parity test enforces this. It must not launch processes or introduce a second store/orchestration path.
 - **Dolt store (`internal/praector/store.go`)**: durable entities, graph edges, state transitions, attempts/sessions/events/memory/decisions/PR/acceptance records.
 - **Scheduler (`internal/praector/scheduler.go`)**: readiness, execution, retry/recovery, deterministic planning-gate enforcement, post-run verification, review/repair policy.
 - **Planning policy (`internal/praector/policy.go`)**: auditable deterministic classification that sets mandatory pre-write safety gates.

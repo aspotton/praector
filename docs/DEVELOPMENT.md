@@ -25,6 +25,7 @@ The native Go implementation is the primary runtime. The Python implementation r
 cmd/praector/main.go              executable entry point
 internal/praector/
 ├── cli.go                    CLI/operator/worker command surface
+├── service.go                shared typed domain service layer (CLI/MCP parity seam)
 ├── config.go                 global/project configuration
 ├── store.go                  Dolt persistence + graph/state operations
 ├── scheduler.go              execution/retry/recovery/review policy
@@ -66,6 +67,28 @@ Avoid:
 - embedding Git merge/worktree implementation;
 - embedding scheduler loops;
 - provider-specific process control.
+
+### `internal/praector/service.go`
+
+`Service` is the shared typed domain seam that BOTH the CLI `cmd*` adapters and
+the future MCP adapter call for the same domain operations, so the two
+surfaces can never diverge ("now and always", decision DEC-28fcd38435). Each
+`commandHelp` entry in `help.go` maps 1:1 to one typed `Op(ctx, Input) -> Output`
+method via the `serviceOps` registry; `service_parity_test.go` enforces that
+mapping in both directions.
+
+Good place for:
+
+- one typed domain op per CLI command, reusing existing `*Store` / `GitWorkspace`
+  methods and deterministic policy classification;
+- durable reads/mutations that an adapter would otherwise call inline.
+
+Avoid:
+
+- argument parsing, stdout formatting, or exit codes (adapter-only);
+- scheduler/daemon process launching (the scheduler remains the sole launcher);
+- external PR provider delivery and privileged accept/merge writes (adapter,
+  opt-in); a second store or orchestration implementation.
 
 ### `internal/praector/store.go`
 
