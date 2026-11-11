@@ -7,14 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/user"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/datascape/praector/internal/assets"
 )
 
 type parsedArgs struct {
@@ -221,95 +217,12 @@ func cmdInit(args []string) int {
 	if len(p.Pos) > 0 {
 		return fail(fmt.Errorf("usage: praector init [--name NAME] [--base-branch BRANCH] [--opencode PATH]"))
 	}
-	git, e := RequireBinary("git")
+	svc := &Service{}
+	out, e := svc.Init(context.Background(), InitInput{Name: p.str("name"), BaseBranch: p.str("base-branch"), OpenCode: p.str("opencode")})
 	if e != nil {
 		return fail(e)
 	}
-	if _, e = RequireBinary("dolt"); e != nil {
-		return fail(e)
-	}
-	r, e := Run(context.Background(), []string{git, "rev-parse", "--show-toplevel"}, "", nil, "", true)
-	if e != nil {
-		return fail(e)
-	}
-	root, _ := filepath.Abs(strings.TrimSpace(r.Stdout))
-	marker := filepath.Join(root, ".praector", "project.toml")
-	var cfg ProjectConfig
-	if _, e = os.Stat(marker); e == nil {
-		cfg, e = ReadProjectMarker(marker)
-		if e != nil {
-			return fail(e)
-		}
-	} else {
-		br := p.str("base-branch")
-		if br == "" {
-			q, _ := Run(context.Background(), []string{git, "-C", root, "branch", "--show-current"}, "", nil, "", false)
-			br = strings.TrimSpace(q.Stdout)
-			if br == "" {
-				br = "main"
-			}
-		}
-		oc := p.str("opencode")
-		if oc == "" {
-			if x, er := RequireBinary("opencode"); er == nil {
-				oc = x
-			} else {
-				oc = "opencode"
-			}
-		}
-		models := map[string]string{}
-		for _, n := range ProfileNames {
-			models[n] = ""
-		}
-		cfg = ProjectConfig{ProjectID: MakeID("PRJ"), Name: filepath.Base(root), Root: root, BaseBranch: br, Harness: "opencode", OpenCodeCommand: oc, Models: models, Limits: DefaultLimits()}
-	}
-	if x := p.str("name"); x != "" {
-		cfg.Name = x
-	}
-	if x := p.str("base-branch"); x != "" {
-		cfg.BaseBranch = x
-	}
-	if x := p.str("opencode"); x != "" {
-		cfg.OpenCodeCommand = x
-	}
-	marker, e = WriteProjectMarker(cfg)
-	if e != nil {
-		return fail(e)
-	}
-	q, e := Run(context.Background(), []string{git, "-C", root, "rev-parse", "--git-path", "info/exclude"}, "", nil, "", true)
-	if e == nil {
-		ex := strings.TrimSpace(q.Stdout)
-		if !filepath.IsAbs(ex) {
-			ex = filepath.Join(root, ex)
-		}
-		_ = os.MkdirAll(filepath.Dir(ex), 0755)
-		data, _ := os.ReadFile(ex)
-		lines := strings.Split(string(data), "\n")
-		found := false
-		for _, l := range lines {
-			if l == ".praector/" {
-				found = true
-			}
-		}
-		if !found {
-			f, _ := os.OpenFile(ex, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-			if f != nil {
-				if len(data) > 0 && !strings.HasSuffix(string(data), "\n") {
-					_, _ = f.WriteString("\n")
-				}
-				_, _ = f.WriteString(".praector/\n")
-				_ = f.Close()
-			}
-		}
-	}
-	store, _, e := newStore()
-	if e != nil {
-		return fail(e)
-	}
-	if _, e = store.RegisterProject(cfg); e != nil {
-		return fail(e)
-	}
-	fmt.Printf("Initialized Praector project %s (%s)\nProject marker: %s\nBase branch: %s\nOpenCode: %s\n", cfg.Name, cfg.ProjectID, marker, cfg.BaseBranch, cfg.OpenCodeCommand)
+	fmt.Printf("Initialized Praector project %s (%s)\nProject marker: %s\nBase branch: %s\nOpenCode: %s\n", out.Name, out.ProjectID, out.Marker, out.BaseBranch, out.OpenCodeCommand)
 	return 0
 }
 
@@ -317,35 +230,29 @@ func cmdProfile(args []string) int {
 	if len(args) == 0 {
 		return fail(fmt.Errorf("usage: praector profile {list|show}"))
 	}
+	svc := &Service{}
 	switch args[0] {
 	case "list":
 		if len(args) != 1 {
 			return fail(fmt.Errorf("usage: praector profile list"))
 		}
-		for _, n := range ProfileNames {
-			mode := "write"
-			if ReadOnlyProfiles[n] {
-				mode = "read-only"
-			}
-			fmt.Printf("%-12s %-9s %s\n", n, mode, ProfileTitles[n])
+		out, e := svc.ProfileList(context.Background(), ProfileListInput{})
+		if e != nil {
+			return fail(e)
+		}
+		for _, pf := range out.Profiles {
+			fmt.Printf("%-12s %-9s %s\n", pf.Name, pf.Mode, pf.Title)
 		}
 		return 0
 	case "show":
 		if len(args) != 2 {
 			return fail(fmt.Errorf("usage: praector profile show PROFILE"))
 		}
-		valid := false
-		for _, n := range ProfileNames {
-			if args[1] == n {
-				valid = true
-			}
+		out, e := svc.ProfileShow(context.Background(), ProfileShowInput{Profile: args[1]})
+		if e != nil {
+			return fail(e)
 		}
-		if !valid {
-			return fail(fmt.Errorf("unknown profile: %s", args[1]))
-		}
-		g, _ := assets.FS.ReadFile("prompts/global.md")
-		r, _ := assets.FS.ReadFile("prompts/" + args[1] + ".md")
-		fmt.Printf("# Inherited global engineering contract\n\n%s\n\n# Role-specific operating contract\n\n%s\n", strings.TrimSpace(string(g)), strings.TrimSpace(string(r)))
+		fmt.Printf("# Inherited global engineering contract\n\n%s\n\n# Role-specific operating contract\n\n%s\n", out.Global, out.Role)
 		return 0
 	}
 	return fail(fmt.Errorf("unknown profile command: %s", args[0]))
@@ -355,7 +262,7 @@ func cmdProject(args []string) int {
 	if len(args) == 0 {
 		return fail(fmt.Errorf("usage: praector project {list|show}"))
 	}
-	store, _, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
@@ -364,11 +271,11 @@ func cmdProject(args []string) int {
 		if len(args) != 1 {
 			return fail(fmt.Errorf("usage: praector project list"))
 		}
-		xs, e := store.ListProjects()
+		out, e := svc.ProjectList(context.Background(), ProjectListInput{})
 		if e != nil {
 			return fail(e)
 		}
-		for _, r := range xs {
+		for _, r := range out.Projects {
 			fmt.Printf("%s  %s  %s\n", S(r, "id"), S(r, "name"), S(r, "root_path"))
 		}
 		return 0
@@ -380,11 +287,11 @@ func cmdProject(args []string) int {
 		if len(p.Pos) > 0 {
 			return fail(fmt.Errorf("usage: praector project show [--project ID]"))
 		}
-		r, e := projectFromContext(store, p.str("project"))
+		out, e := svc.ProjectShow(context.Background(), ProjectShowInput{ProjectID: p.str("project")})
 		if e != nil {
 			return fail(e)
 		}
-		fmt.Println(pretty(r))
+		fmt.Println(pretty(out.Project))
 		return 0
 	}
 	return fail(fmt.Errorf("unknown project command: %s", args[0]))
@@ -402,33 +309,21 @@ func cmdRun(args []string) int {
 	if e != nil {
 		return fail(e)
 	}
-	store, cfg, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	project, e := projectFromContext(store, p.str("project"))
+	out, e := svc.Run(context.Background(), RunInput{Objective: p.Pos[0], Title: p.str("title"), ProjectID: p.str("project")})
 	if e != nil {
 		return fail(e)
 	}
-	if e = preflightProjectRuntime(project); e != nil {
-		return fail(e)
-	}
-	objective := p.Pos[0]
-	title := p.str("title")
-	if title == "" {
-		title = HumanTitle(objective, 80)
-	}
-	coordObj := fmt.Sprintf("Own the initial decomposition of the new collection: %s. Inspect project context only as needed. Create durable critic/plan_review/research/implement/review/advise tasks using praector as appropriate. Do not perform implementation or substantive specialist work yourself. Ensure implementation tasks are sequenced by dependencies; independent review is automatically enforced for implementation tasks.", objective)
-	c, coord, e := store.CreateCollectionWithCoordinator(S(project, "id"), title, objective, coordObj)
-	if e != nil {
-		return fail(e)
-	}
-	fmt.Printf("Created %s in project %s\nObjective: %s\nIntegration branch: %s\nCoordinator task: %s\n", S(c, "id"), S(project, "name"), S(c, "objective"), S(c, "integration_branch"), S(coord, "id"))
+	c, coord := out.Collection, out.Coordinator
+	fmt.Printf("Created %s in project %s\nObjective: %s\nIntegration branch: %s\nCoordinator task: %s\n", S(c, "id"), out.ProjectName, S(c, "objective"), S(c, "integration_branch"), S(coord, "id"))
 	if p.bool("detach") {
 		fmt.Println("Queued. Run `praector daemon` to execute pending work.")
 		return 0
 	}
-	sched, e := NewScheduler(store, cfg, mw)
+	sched, e := NewScheduler(svc.store, svc.cfg, mw)
 	if e != nil {
 		return fail(e)
 	}
@@ -438,7 +333,7 @@ func cmdRun(args []string) int {
 	}
 	fmt.Printf("Collection %s: %s\n", S(c, "id"), state)
 	if state == "BLOCKED" {
-		printBlockedDiagnostics(store, S(c, "id"))
+		printBlockedDiagnostics(svc.store, S(c, "id"))
 	}
 	if state == "COMPLETE" {
 		return 0
@@ -446,63 +341,41 @@ func cmdRun(args []string) int {
 	return 2
 }
 
-func printCollectionStatus(store *Store, c Row) {
-	tasks, _ := store.ListTasks(S(c, "id"))
-	counts := map[string]int{}
-	for _, t := range tasks {
-		counts[S(t, "status")]++
-	}
-	keys := make([]string, 0, len(counts))
-	for k := range counts {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+func formatCollectionStatus(c CollectionStatus) {
 	parts := []string{}
-	for _, k := range keys {
-		parts = append(parts, fmt.Sprintf("%s=%d", k, counts[k]))
+	for _, kv := range c.TaskCounts {
+		parts = append(parts, fmt.Sprintf("%s=%d", kv.Key, kv.Count))
 	}
 	summary := strings.Join(parts, ", ")
 	if summary == "" {
 		summary = "no tasks (invalid/orphaned; `praector daemon --once` will repair)"
 	}
-	fmt.Printf("%s  %s  %s\n  objective: %s\n  branch: %s\n", S(c, "id"), S(c, "status"), S(c, "title"), S(c, "objective"), firstNonEmpty(S(c, "integration_branch"), "-"))
-	if a, _ := store.GetCollectionAcceptance(S(c, "id"), ""); a != nil {
-		fmt.Printf("  accepted: %s @ %s (%s, %s)\n", S(a, "target_branch"), shortSHA(S(a, "accepted_commit")), S(a, "merge_mode"), S(a, "created_at"))
+	fmt.Printf("%s  %s  %s\n  objective: %s\n  branch: %s\n", c.ID, c.Status, c.Title, c.Objective, c.Branch)
+	if c.Acceptance != nil {
+		fmt.Printf("  accepted: %s @ %s (%s, %s)\n", S(c.Acceptance, "target_branch"), shortSHA(S(c.Acceptance, "accepted_commit")), S(c.Acceptance, "merge_mode"), S(c.Acceptance, "created_at"))
 	}
-	if pr, _ := store.GetCollectionPullRequest(S(c, "id"), "github"); pr != nil {
+	if c.PR != nil {
 		draft := ""
-		if B(pr, "is_draft") {
+		if B(c.PR, "is_draft") {
 			draft = " draft"
 		}
-		fmt.Printf("  pr: %s #%s [%s%s] %s\n", S(pr, "provider"), S(pr, "pr_number"), S(pr, "state"), draft, S(pr, "url"))
+		fmt.Printf("  pr: %s #%s [%s%s] %s\n", S(c.PR, "provider"), S(c.PR, "pr_number"), S(c.PR, "state"), draft, S(c.PR, "url"))
 	}
-	revs, _ := store.ListCollectionRevisions(S(c, "id"), "")
-	if len(revs) > 0 {
-		rc := map[string]int{}
-		for _, r := range revs {
-			rc[S(r, "status")]++
-		}
-		rk := make([]string, 0, len(rc))
-		for k := range rc {
-			rk = append(rk, k)
-		}
-		sort.Strings(rk)
+	if len(c.Revisions) > 0 {
 		rp := []string{}
-		for _, k := range rk {
-			rp = append(rp, fmt.Sprintf("%s=%d", k, rc[k]))
+		for _, kv := range sortedCounts(c.Revisions, func(r Row) string { return S(r, "status") }) {
+			rp = append(rp, fmt.Sprintf("%s=%d", kv.Key, kv.Count))
 		}
 		fmt.Println("  revisions: " + strings.Join(rp, ", "))
-		for _, r := range revs {
+		for _, r := range c.Revisions {
 			if S(r, "status") == "OPEN" {
 				fmt.Printf("    %s [OPEN] %s\n", S(r, "id"), S(r, "reason"))
 			}
 		}
 	}
 	fmt.Println("  tasks: " + summary)
-	for _, t := range tasks {
-		if map[string]bool{TaskFailed: true, TaskRunning: true, TaskWaiting: true, TaskVerifying: true, TaskReady: true, TaskPending: true}[S(t, "status")] {
-			fmt.Printf("    %s [%s/%s] %s\n", S(t, "id"), S(t, "status"), S(t, "profile"), S(t, "title"))
-		}
+	for _, t := range c.Active {
+		fmt.Printf("    %s [%s/%s] %s\n", S(t, "id"), S(t, "status"), S(t, "profile"), S(t, "title"))
 	}
 }
 func cmdStatus(args []string) int {
@@ -513,7 +386,7 @@ func cmdStatus(args []string) int {
 	if len(p.Pos) > 1 {
 		return fail(fmt.Errorf("usage: praector status [TARGET] [--project ID]"))
 	}
-	store, _, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
@@ -521,40 +394,20 @@ func cmdStatus(args []string) int {
 	if len(p.Pos) > 0 {
 		target = p.Pos[0]
 	}
-	if strings.HasPrefix(target, "COL-") {
-		_, _ = store.UpdateCollectionTerminalState(target)
-		c, e := store.GetCollection(target)
-		if e != nil {
-			return fail(e)
-		}
-		printCollectionStatus(store, c)
-		return 0
-	}
-	if strings.HasPrefix(target, "T-") {
-		t, e := store.GetTask(target)
-		if e != nil {
-			return fail(e)
-		}
-		fmt.Println(pretty(t))
-		return 0
-	}
-	id := p.str("project")
-	if id == "" {
-		id = target
-	}
-	project, e := projectFromContext(store, id)
+	out, e := svc.Status(context.Background(), StatusInput{Target: target, ProjectID: p.str("project")})
 	if e != nil {
 		return fail(e)
 	}
-	fmt.Printf("Project %s (%s)\n", S(project, "name"), S(project, "id"))
-	cs, e := store.ListCollections(S(project, "id"))
-	if e != nil {
-		return fail(e)
-	}
-	for _, c := range cs {
-		_, _ = store.UpdateCollectionTerminalState(S(c, "id"))
-		fresh, _ := store.GetCollection(S(c, "id"))
-		printCollectionStatus(store, fresh)
+	switch out.Kind {
+	case "collection":
+		formatCollectionStatus(*out.Collection)
+	case "task":
+		fmt.Println(pretty(out.Task))
+	default:
+		fmt.Printf("Project %s (%s)\n", out.ProjectName, out.ProjectID)
+		for _, c := range out.Collections {
+			formatCollectionStatus(*c)
+		}
 	}
 	return 0
 }
@@ -566,34 +419,22 @@ func cmdGraph(args []string) int {
 	if len(p.Pos) > 1 {
 		return fail(fmt.Errorf("usage: praector graph [COLLECTION] [--project ID]"))
 	}
-	store, _, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	var c Row
+	coll := ""
 	if len(p.Pos) > 0 {
-		c, e = store.GetCollection(p.Pos[0])
-	} else {
-		var pr Row
-		pr, e = projectFromContext(store, p.str("project"))
-		if e == nil {
-			c, e = latestCollection(store, S(pr, "id"))
-		}
+		coll = p.Pos[0]
 	}
+	out, e := svc.Graph(context.Background(), GraphInput{Collection: coll, ProjectID: p.str("project")})
 	if e != nil {
 		return fail(e)
 	}
-	tasks, _ := store.ListTasks(S(c, "id"))
-	edges, _ := store.ListEdges(S(c, "id"))
-	deps := map[string][]string{}
-	for _, ed := range edges {
-		if S(ed, "relation") == "depends_on" {
-			deps[S(ed, "to_task_id")] = append(deps[S(ed, "to_task_id")], S(ed, "from_task_id"))
-		}
-	}
+	c := out.Collection
 	fmt.Printf("%s %s [%s]\n", S(c, "id"), S(c, "title"), S(c, "status"))
-	for _, t := range tasks {
-		d := strings.Join(deps[S(t, "id")], ",")
+	for _, t := range out.Tasks {
+		d := strings.Join(out.Deps[S(t, "id")], ",")
 		if d == "" {
 			d = "-"
 		}
@@ -637,57 +478,32 @@ func cmdTask(args []string) int {
 		if len(args) != 2 {
 			return fail(fmt.Errorf("usage: praector task show TASK"))
 		}
-		store, _, e := newStore()
+		svc, e := newService()
 		if e != nil {
 			return fail(e)
 		}
-		t, e := store.GetTask(args[1])
+		out, e := svc.TaskShow(context.Background(), TaskShowInput{TaskID: args[1]})
 		if e != nil {
 			return fail(e)
 		}
-		ds, _ := store.Dependencies(args[1])
-		dps, _ := store.Dependents(args[1])
-		a, b := []string{}, []string{}
-		for _, x := range ds {
-			a = append(a, S(x, "id"))
-		}
-		for _, x := range dps {
-			b = append(b, S(x, "id"))
-		}
-		t["dependencies"] = a
-		t["dependents"] = b
-		fmt.Println(pretty(t))
+		fmt.Println(pretty(out.Task))
 		return 0
 	case "list":
 		p, e := parseArgs(args[1:], map[string]bool{"collection": true, "project": true})
 		if e != nil {
 			return fail(e)
 		}
-		store, _, e := newStore()
+		svc, e := newService()
 		if e != nil {
 			return fail(e)
 		}
-		var c Row
-		if x := p.str("collection"); x != "" {
-			c, e = store.GetCollection(x)
-		} else {
-			var pr Row
-			pr, e = projectFromContext(store, p.str("project"))
-			if e == nil {
-				c, e = latestCollection(store, S(pr, "id"))
-			}
-		}
+		out, e := svc.TaskList(context.Background(), TaskListInput{Collection: p.str("collection"), ProjectID: p.str("project")})
 		if e != nil {
 			return fail(e)
 		}
-		ts, _ := store.ListTasks(S(c, "id"))
-		for _, t := range ts {
-			ds, _ := store.Dependencies(S(t, "id"))
-			ids := []string{}
-			for _, d := range ds {
-				ids = append(ids, S(d, "id"))
-			}
-			dt := strings.Join(ids, ",")
+		for _, entry := range out.Tasks {
+			t := entry.Task
+			dt := strings.Join(entry.Deps, ",")
 			if dt == "" {
 				dt = "-"
 			}
@@ -717,45 +533,31 @@ func cmdTaskRetry(args []string) int {
 	if e != nil {
 		return fail(e)
 	}
-	reason := p.str("reason")
-	if reason == "" {
-		reason = "Operator-requested retry after task failure"
-	}
-	store, cfg, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	failed, e := store.GetTask(p.Pos[0])
+	out, e := svc.TaskRetry(context.Background(), TaskRetryInput{TaskID: p.Pos[0], Reason: p.str("reason")})
 	if e != nil {
 		return fail(e)
 	}
-	project, e := store.GetProject(S(failed, "project_id"))
-	if e != nil {
-		return fail(e)
-	}
-	if e = preflightProjectRuntime(project); e != nil {
-		return fail(e)
-	}
-	replacement, e := store.RetryFailedTask(p.Pos[0], reason)
-	if e != nil {
-		return fail(e)
-	}
-	fmt.Printf("%s -> %s\nCollection %s resumed\n", p.Pos[0], S(replacement, "id"), S(failed, "collection_id"))
+	replacement, cid := out.Replacement, out.CollectionID
+	fmt.Printf("%s -> %s\nCollection %s resumed\n", p.Pos[0], S(replacement, "id"), cid)
 	if p.bool("detach") {
 		fmt.Println("Queued. Run `praector daemon` to execute pending work.")
 		return 0
 	}
-	sched, e := NewScheduler(store, cfg, mw)
+	sched, e := NewScheduler(svc.store, svc.cfg, mw)
 	if e != nil {
 		return fail(e)
 	}
-	state, e := sched.RunCollection(S(failed, "collection_id"), 500*time.Millisecond)
+	state, e := sched.RunCollection(cid, 500*time.Millisecond)
 	if e != nil {
 		return fail(e)
 	}
-	fmt.Printf("Collection %s: %s\n", S(failed, "collection_id"), state)
+	fmt.Printf("Collection %s: %s\n", cid, state)
 	if state == "BLOCKED" {
-		printBlockedDiagnostics(store, S(failed, "collection_id"))
+		printBlockedDiagnostics(svc.store, cid)
 	}
 	if state == "COMPLETE" {
 		return 0
@@ -770,29 +572,15 @@ func cmdTaskAddDependency(args []string) int {
 	if len(p.Pos) != 1 || p.str("on") == "" {
 		return fail(fmt.Errorf("usage: praector task add-dependency TASK --on DEPENDENCY [--caller TASK]"))
 	}
-	store, _, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	caller, e := requireCoordinator(store, p.str("caller"))
+	out, e := svc.TaskAddDependency(context.Background(), TaskAddDependencyInput{TaskID: p.Pos[0], OnID: p.str("on"), Caller: p.str("caller")})
 	if e != nil {
 		return fail(e)
 	}
-	t, e := store.GetTask(p.Pos[0])
-	if e != nil {
-		return fail(e)
-	}
-	d, e := store.GetTask(p.str("on"))
-	if e != nil {
-		return fail(e)
-	}
-	if S(t, "collection_id") != S(caller, "collection_id") || S(d, "collection_id") != S(caller, "collection_id") {
-		return fail(fmt.Errorf("Coordinator may only mutate its current collection"))
-	}
-	if e = store.AddDependency(S(t, "id"), S(d, "id")); e != nil {
-		return fail(e)
-	}
-	fmt.Printf("%s depends_on %s\n", S(t, "id"), S(d, "id"))
+	fmt.Printf("%s depends_on %s\n", S(out.Task, "id"), S(out.Dep, "id"))
 	return 0
 }
 func cmdTaskSupersede(args []string) int {
@@ -803,29 +591,15 @@ func cmdTaskSupersede(args []string) int {
 	if len(p.Pos) != 1 || p.str("with") == "" || p.str("reason") == "" {
 		return fail(fmt.Errorf("usage: praector task supersede OLD --with NEW --reason TEXT [--caller TASK]"))
 	}
-	store, _, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	caller, e := requireCoordinator(store, p.str("caller"))
+	out, e := svc.TaskSupersede(context.Background(), TaskSupersedeInput{OldID: p.Pos[0], NewID: p.str("with"), Reason: p.str("reason"), Caller: p.str("caller")})
 	if e != nil {
 		return fail(e)
 	}
-	old, e := store.GetTask(p.Pos[0])
-	if e != nil {
-		return fail(e)
-	}
-	rep, e := store.GetTask(p.str("with"))
-	if e != nil {
-		return fail(e)
-	}
-	if S(old, "collection_id") != S(caller, "collection_id") || S(rep, "collection_id") != S(caller, "collection_id") {
-		return fail(fmt.Errorf("Coordinator may only mutate its current collection"))
-	}
-	if e = store.SupersedeTask(S(old, "id"), S(rep, "id"), p.str("reason")); e != nil {
-		return fail(e)
-	}
-	fmt.Printf("%s -> %s\n", S(old, "id"), S(rep, "id"))
+	fmt.Printf("%s -> %s\n", S(out.Old, "id"), S(out.New, "id"))
 	return 0
 }
 func cmdTaskRequest(args []string) int {
@@ -839,50 +613,16 @@ func cmdTaskRequest(args []string) int {
 	if p.str("profile") == "coordinator" {
 		return fail(fmt.Errorf("--profile coordinator is not valid for task request; use coordinator attention"))
 	}
-	store, cfg, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	callerID, e := currentTaskID(p.str("task"))
+	out, e := svc.TaskRequest(context.Background(), TaskRequestInput{CallerID: p.str("task"), Profile: p.str("profile"), Title: p.str("title"), Objective: p.str("objective"), Reason: p.str("reason"), Blocking: p.bool("blocking"), DependsOn: p.strs("depends-on"), Workspace: p.str("workspace")})
 	if e != nil {
 		return fail(e)
 	}
-	caller, e := store.GetTask(callerID)
-	if e != nil {
-		return fail(e)
-	}
-	mode := p.str("workspace")
-	if mode == "" || mode == "auto" {
-		if S(caller, "profile") == "implement" {
-			mode = "inherit"
-		} else {
-			mode = "collection"
-		}
-	}
-	if S(caller, "profile") == "implement" && p.str("profile") == "implement" && mode == "inherit" && !p.bool("blocking") {
-		return fail(fmt.Errorf("An inherited implementation child must be --blocking so its branch can safely merge back into the parent."))
-	}
-	base := ""
-	if mode == "inherit" {
-		w, e := NewGitWorkspace(store, cfg)
-		if e != nil {
-			return fail(e)
-		}
-		base, e = w.CheckpointForDelegation(callerID)
-		if e != nil {
-			return fail(e)
-		}
-	}
-	lim, e := limitsForProject(store, S(caller, "project_id"))
-	if e != nil {
-		return fail(e)
-	}
-	t, created, e := store.RequestTask(callerID, RequestTaskOptions{Profile: p.str("profile"), Title: p.str("title"), Objective: p.str("objective"), Reason: p.str("reason"), Blocking: p.bool("blocking"), DependsOn: p.strs("depends-on"), WorkspaceMode: mode, BaseCommit: base, Limits: lim})
-	if e != nil {
-		return fail(e)
-	}
-	fmt.Println(S(t, "id"))
-	if !created {
+	fmt.Println(S(out.Task, "id"))
+	if !out.Created {
 		fmt.Fprintln(os.Stderr, "deduplicated")
 	}
 	return 0
@@ -896,31 +636,15 @@ func cmdContext(args []string) int {
 	if e != nil {
 		return fail(e)
 	}
-	store, _, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	tid, e := currentTaskID(p.str("task"))
+	out, e := svc.ContextShow(context.Background(), ContextShowInput{TaskID: p.str("task")})
 	if e != nil {
 		return fail(e)
 	}
-	t, e := store.GetTask(tid)
-	if e != nil {
-		return fail(e)
-	}
-	pr, _ := store.GetProject(S(t, "project_id"))
-	c, _ := store.GetCollection(S(t, "collection_id"))
-	parent, _ := store.GetParent(t)
-	deps, _ := store.Dependencies(tid)
-	tasks, _ := store.ListTasks(S(c, "id"))
-	small := Rows{}
-	for _, x := range tasks {
-		small = append(small, Row{"id": S(x, "id"), "profile": S(x, "profile"), "title": S(x, "title"), "status": S(x, "status"), "result": M(x, "result")})
-	}
-	mem, _ := store.ListMemories(S(pr, "id"), S(c, "id"), "")
-	dec, _ := store.ListDecisions(S(pr, "id"), S(c, "id"))
-	payload := Row{"execution": Row{"assigned_worktree": firstNonEmpty(S(t, "worktree_path"), os.Getenv("PRAECTOR_WORKTREE")), "rule": "Use assigned_worktree for all repository/file/shell operations; project.root_path is reference metadata only."}, "project": pr, "collection": c, "task": t, "parent": parent, "dependencies": deps, "tasks": small, "memories": mem, "decisions": dec}
-	fmt.Println(pretty(payload))
+	fmt.Println(pretty(out.Payload))
 	return 0
 }
 func cmdCoordinator(args []string) int {
@@ -934,27 +658,15 @@ func cmdCoordinator(args []string) int {
 	if p.str("reason") == "" {
 		return fail(fmt.Errorf("--reason is required"))
 	}
-	store, _, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	tid, e := currentTaskID(p.str("task"))
+	out, e := svc.CoordinatorAttention(context.Background(), CoordinatorAttentionInput{TaskID: p.str("task"), Reason: p.str("reason"), Blocking: p.bool("blocking")})
 	if e != nil {
 		return fail(e)
 	}
-	caller, e := store.GetTask(tid)
-	if e != nil {
-		return fail(e)
-	}
-	lim, e := limitsForProject(store, S(caller, "project_id"))
-	if e != nil {
-		return fail(e)
-	}
-	t, _, e := store.RequestCoordinatorAttention(tid, p.str("reason"), p.bool("blocking"), lim)
-	if e != nil {
-		return fail(e)
-	}
-	fmt.Println(S(t, "id"))
+	fmt.Println(S(out.Task, "id"))
 	return 0
 }
 
@@ -962,7 +674,7 @@ func cmdResult(args []string) int {
 	if len(args) == 0 {
 		return fail(fmt.Errorf("usage: praector result {show|submit}"))
 	}
-	store, _, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
@@ -975,15 +687,11 @@ func cmdResult(args []string) int {
 		if len(args) == 2 {
 			explicit = args[1]
 		}
-		tid, e := currentTaskID(explicit)
+		out, e := svc.ResultShow(context.Background(), ResultShowInput{TaskID: explicit})
 		if e != nil {
 			return fail(e)
 		}
-		t, e := store.GetTask(tid)
-		if e != nil {
-			return fail(e)
-		}
-		fmt.Println(pretty(M(t, "result")))
+		fmt.Println(pretty(out.Result))
 		return 0
 	case "submit":
 		p, e := parseArgs(args[1:], map[string]bool{"task": true, "stdin": false, "file": true, "summary": true, "status": true})
@@ -1023,23 +731,11 @@ func cmdResult(args []string) int {
 		if S(result, "status") == "" {
 			result["status"] = status
 		}
-		before, e := store.GetTask(tid)
+		out, e := svc.ResultSubmit(context.Background(), ResultSubmitInput{TaskID: tid, Result: result})
 		if e != nil {
 			return fail(e)
 		}
-		st := strings.ToLower(S(result, "status"))
-		if (S(before, "profile") == "review" || S(before, "profile") == "plan_review") && (st == "complete" || st == "completed") {
-			v := strings.ToLower(strings.TrimSpace(S(result, "verdict")))
-			if v != "pass" && v != "fail" {
-				return fail(fmt.Errorf("A completed review/plan_review result must include verdict='pass' or verdict='fail'"))
-			}
-			result["verdict"] = v
-		}
-		t, e := store.SubmitResult(tid, result)
-		if e != nil {
-			return fail(e)
-		}
-		fmt.Println(S(t, "status"))
+		fmt.Println(out.Status)
 		return 0
 	}
 	return fail(fmt.Errorf("unknown result command: %s", args[0]))
@@ -1049,7 +745,7 @@ func cmdMemory(args []string) int {
 	if len(args) == 0 {
 		return fail(fmt.Errorf("usage: praector memory {add|list}"))
 	}
-	store, _, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
@@ -1062,63 +758,22 @@ func cmdMemory(args []string) int {
 		if p.str("text") == "" {
 			return fail(fmt.Errorf("--text is required"))
 		}
-		taskID := p.str("task")
-		if taskID == "" {
-			taskID = os.Getenv("PRAECTOR_TASK_ID")
-		}
-		pid, cid := "", ""
-		if taskID != "" {
-			t, e := store.GetTask(taskID)
-			if e != nil {
-				return fail(e)
-			}
-			pid, cid = S(t, "project_id"), S(t, "collection_id")
-		} else {
-			pr, e := projectFromContext(store, p.str("project"))
-			if e != nil {
-				return fail(e)
-			}
-			pid, cid = S(pr, "id"), p.str("collection")
-		}
-		scope := p.str("scope")
-		if scope == "" {
-			scope = "collection"
-		}
-		state := p.str("state")
-		if state == "" {
-			state = "candidate"
-		}
-		kind := p.str("kind")
-		if kind == "" {
-			kind = "finding"
-		}
-		if scope != "collection" {
-			cid = ""
-		}
-		r, e := store.AddMemory(pid, cid, taskID, scope, state, kind, p.str("text"), nil)
+		out, e := svc.MemoryAdd(context.Background(), MemoryAddInput{ProjectID: p.str("project"), CollectionID: p.str("collection"), TaskID: p.str("task"), Scope: p.str("scope"), State: p.str("state"), Kind: p.str("kind"), Text: p.str("text")})
 		if e != nil {
 			return fail(e)
 		}
-		fmt.Println(S(r, "id"))
+		fmt.Println(S(out.Memory, "id"))
 		return 0
 	case "list":
 		p, e := parseArgs(args[1:], map[string]bool{"project": true, "collection": true, "state": true})
 		if e != nil {
 			return fail(e)
 		}
-		pr, e := projectFromContext(store, p.str("project"))
+		out, e := svc.MemoryList(context.Background(), MemoryListInput{ProjectID: p.str("project"), CollectionID: p.str("collection"), State: p.str("state")})
 		if e != nil {
 			return fail(e)
 		}
-		state := p.str("state")
-		if state == "" {
-			state = "accepted"
-		}
-		xs, e := store.ListMemories(S(pr, "id"), p.str("collection"), state)
-		if e != nil {
-			return fail(e)
-		}
-		for _, m := range xs {
+		for _, m := range out.Memories {
 			fmt.Printf("%s [%s/%s/%s] %s\n", S(m, "id"), S(m, "scope"), S(m, "state"), S(m, "kind"), S(m, "text"))
 		}
 		return 0
@@ -1136,33 +791,15 @@ func cmdDecision(args []string) int {
 	if p.str("statement") == "" {
 		return fail(fmt.Errorf("--statement is required"))
 	}
-	store, _, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	taskID := p.str("task")
-	if taskID == "" {
-		taskID = os.Getenv("PRAECTOR_TASK_ID")
-	}
-	pid, cid := "", ""
-	if taskID != "" {
-		t, e := store.GetTask(taskID)
-		if e != nil {
-			return fail(e)
-		}
-		pid, cid = S(t, "project_id"), S(t, "collection_id")
-	} else {
-		pr, e := projectFromContext(store, p.str("project"))
-		if e != nil {
-			return fail(e)
-		}
-		pid, cid = S(pr, "id"), p.str("collection")
-	}
-	r, e := store.AddDecision(pid, cid, taskID, p.str("statement"), p.str("rationale"), nil, nil)
+	out, e := svc.DecisionAdd(context.Background(), DecisionAddInput{ProjectID: p.str("project"), CollectionID: p.str("collection"), TaskID: p.str("task"), Statement: p.str("statement"), Rationale: p.str("rationale")})
 	if e != nil {
 		return fail(e)
 	}
-	fmt.Println(S(r, "id"))
+	fmt.Println(S(out.Decision, "id"))
 	return 0
 }
 
@@ -1236,20 +873,6 @@ func validateCollectionForAcceptance(store *Store, c Row) (Row, Rows, error) {
 	}
 	return c, tasks, nil
 }
-func acceptActor(project Row) string {
-	git, er := RequireBinary("git")
-	if er == nil {
-		r, _ := Run(context.Background(), []string{git, "-C", S(project, "root_path"), "config", "user.name"}, "", nil, "", false)
-		if v := strings.TrimSpace(r.Stdout); v != "" {
-			return v
-		}
-	}
-	u, er := user.Current()
-	if er == nil && u.Username != "" {
-		return u.Username
-	}
-	return os.Getenv("USER")
-}
 
 func cmdCollection(args []string) int {
 	if len(args) == 0 {
@@ -1275,22 +898,15 @@ func cmdCollectionShow(args []string) int {
 	if len(args) != 1 {
 		return fail(fmt.Errorf("usage: praector collection show COL-ID"))
 	}
-	store, _, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	c, e := store.GetCollection(args[0])
+	out, e := svc.CollectionShow(context.Background(), CollectionShowInput{CollectionID: args[0]})
 	if e != nil {
 		return fail(e)
 	}
-	c["planning_policy"] = ClassifyPlanningPolicy(S(c, "objective")).AsRow()
-	c["delivery_policy"] = ClassifyDeliveryPolicy(S(c, "objective")).AsRow()
-	c["acceptances"], _ = store.ListCollectionAcceptances(S(c, "id"))
-	c["pull_requests"], _ = store.ListCollectionPullRequests(S(c, "id"))
-	c["revisions"], _ = store.ListCollectionRevisions(S(c, "id"), "")
-	c["tasks"], _ = store.ListTasks(S(c, "id"))
-	c["critic_revalidation"], _ = store.CriticRevalidationState(S(c, "id"))
-	fmt.Println(pretty(c))
+	fmt.Println(pretty(out.Collection))
 	return 0
 }
 func cmdCollectionRevise(args []string) int {
@@ -1305,48 +921,31 @@ func cmdCollectionRevise(args []string) int {
 	if e != nil {
 		return fail(e)
 	}
-	store, cfg, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	c, e := store.GetCollection(p.Pos[0])
+	out, e := svc.CollectionRevise(context.Background(), CollectionReviseInput{CollectionID: p.Pos[0], Reason: p.str("reason")})
 	if e != nil {
 		return fail(e)
 	}
-	project, e := store.GetProject(S(c, "project_id"))
-	if e != nil {
-		return fail(e)
-	}
-	if e = preflightProjectRuntime(project); e != nil {
-		return fail(e)
-	}
-	state, e := store.UpdateCollectionTerminalState(S(c, "id"))
-	if e != nil {
-		return fail(e)
-	}
-	if state != "COMPLETE" {
-		return fail(fmt.Errorf("Collection %s is %s, not COMPLETE", S(c, "id"), state))
-	}
-	rev, coord, e := store.RequestCollectionRevision(S(c, "id"), p.str("reason"))
-	if e != nil {
-		return fail(e)
-	}
+	rev, coord, c := out.Revision, out.Coordinator, out.Collection
 	fmt.Printf("Revision %s opened for %s\nCoordinator task: %s\nReason: %s\n", S(rev, "id"), S(c, "id"), S(coord, "id"), S(rev, "reason"))
 	if p.bool("detach") {
 		fmt.Println("Queued. Run `praector daemon` to execute revision work.")
 		return 0
 	}
-	sched, e := NewScheduler(store, cfg, mw)
+	sched, e := NewScheduler(svc.store, svc.cfg, mw)
 	if e != nil {
 		return fail(e)
 	}
-	state, e = sched.RunCollection(S(c, "id"), 500*time.Millisecond)
+	state, e := sched.RunCollection(S(c, "id"), 500*time.Millisecond)
 	if e != nil {
 		return fail(e)
 	}
 	fmt.Printf("Collection %s: %s\n", S(c, "id"), state)
 	if state == "BLOCKED" {
-		printBlockedDiagnostics(store, S(c, "id"))
+		printBlockedDiagnostics(svc.store, S(c, "id"))
 	}
 	if state == "COMPLETE" {
 		return 0
@@ -1361,36 +960,15 @@ func cmdCollectionDiff(args []string) int {
 	if len(p.Pos) != 1 {
 		return fail(fmt.Errorf("usage: praector collection diff COL-ID [--target BRANCH] [--stat]"))
 	}
-	store, _, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	c, e := store.GetCollection(p.Pos[0])
+	out, e := svc.CollectionDiff(context.Background(), CollectionDiffInput{CollectionID: p.Pos[0], Target: p.str("target"), Stat: p.bool("stat")})
 	if e != nil {
 		return fail(e)
 	}
-	pr, e := store.GetProject(S(c, "project_id"))
-	if e != nil {
-		return fail(e)
-	}
-	target := p.str("target")
-	if target == "" {
-		target = S(pr, "base_branch")
-	}
-	git, e := RequireBinary("git")
-	if e != nil {
-		return fail(e)
-	}
-	cmd := []string{git, "-C", S(pr, "root_path"), "diff"}
-	if p.bool("stat") {
-		cmd = append(cmd, "--stat")
-	}
-	cmd = append(cmd, target+"..."+S(c, "integration_branch"))
-	r, e := Run(context.Background(), cmd, "", nil, "", true)
-	if e != nil {
-		return fail(e)
-	}
-	fmt.Print(r.Stdout)
+	fmt.Print(out.Stdout)
 	return 0
 }
 func resolvePRRemote(repo, base, explicit string) (string, error) {
@@ -1456,63 +1034,18 @@ func cmdCollectionPR(args []string) int {
 	if len(p.Pos) != 1 {
 		return fail(fmt.Errorf("usage: praector collection pr COL-ID [--draft] [--title TITLE] [--base BRANCH] [--remote REMOTE] [--dry-run] [--refresh-copy] [--open]"))
 	}
-	store, cfg, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	c, e := store.GetCollection(p.Pos[0])
+	store := svc.store
+	planOut, e := svc.CollectionPRPlan(context.Background(), CollectionPRPlanInput{CollectionID: p.Pos[0], Base: p.str("base"), Title: p.str("title"), Remote: p.str("remote"), Draft: p.bool("draft")})
 	if e != nil {
 		return fail(e)
 	}
-	project, e := store.GetProject(S(c, "project_id"))
-	if e != nil {
-		return fail(e)
-	}
-	c, tasks, e := validateCollectionForAcceptance(store, c)
-	if e != nil {
-		return fail(e)
-	}
-	existing, _ := store.GetCollectionPullRequest(S(c, "id"), "github")
-	base := p.str("base")
-	if base == "" && existing != nil {
-		base = S(existing, "base_branch")
-	}
-	if base == "" {
-		base = S(project, "base_branch")
-	}
-	w, e := NewGitWorkspace(store, cfg)
-	if e != nil {
-		return fail(e)
-	}
-	if ip := S(c, "integration_worktree"); ip != "" {
-		if _, er := os.Stat(ip); er == nil {
-			dirty, er := w.IsDirty(ip)
-			if er == nil && dirty {
-				return fail(fmt.Errorf("Collection integration worktree is dirty: %s. Resolve or checkpoint those changes before creating/updating a PR.", ip))
-			}
-		}
-	}
-	plan, e := w.AcceptancePlan(project, c, base)
-	if e != nil {
-		return fail(e)
-	}
+	c, project, existing, plan := planOut.Collection, planOut.Project, planOut.Existing, planOut.Plan
+	base, remote, title, body := planOut.Base, planOut.Remote, planOut.Title, planOut.Body
 	repo, _ := filepath.Abs(S(project, "root_path"))
-	remote := p.str("remote")
-	if remote == "" && existing != nil {
-		remote = S(existing, "remote_name")
-	}
-	remote, e = resolvePRRemote(repo, base, remote)
-	if e != nil {
-		return fail(e)
-	}
-	title := p.str("title")
-	if title == "" && existing != nil {
-		title = S(existing, "title")
-	}
-	if title == "" {
-		title = DefaultPullRequestTitle(c, tasks)
-	}
-	body := BuildPullRequestBody(c, tasks, S(plan, "source_commit"))
 	if p.bool("dry-run") {
 		acc, _ := store.GetCollectionAcceptance(S(c, "id"), "")
 		if existing == nil && (acc != nil || B(plan, "already_contained")) {
@@ -1630,31 +1163,17 @@ func cmdCollectionAccept(args []string) int {
 	if p.bool("delete-branches") && !p.bool("cleanup") {
 		return fail(fmt.Errorf("--delete-branches requires --cleanup"))
 	}
-	store, cfg, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	c, e := store.GetCollection(p.Pos[0])
+	store := svc.store
+	accOut, e := svc.CollectionAccept(context.Background(), CollectionAcceptInput{CollectionID: p.Pos[0], Target: p.str("target")})
 	if e != nil {
 		return fail(e)
 	}
-	project, e := store.GetProject(S(c, "project_id"))
-	if e != nil {
-		return fail(e)
-	}
-	if _, _, e = validateCollectionForAcceptance(store, c); e != nil {
-		return fail(e)
-	}
-	target := p.str("target")
-	if target == "" {
-		target = S(project, "base_branch")
-	}
-	existing, _ := store.GetCollectionAcceptance(S(c, "id"), target)
-	w, e := NewGitWorkspace(store, cfg)
-	if e != nil {
-		return fail(e)
-	}
-	plan, e := w.AcceptancePlan(project, c, target)
+	c, project, target, existing, plan := accOut.Collection, accOut.Project, accOut.Target, accOut.Existing, accOut.Plan
+	w, e := NewGitWorkspace(store, svc.cfg)
 	if e != nil {
 		return fail(e)
 	}
@@ -1719,40 +1238,21 @@ func cmdCollectionCleanup(args []string) int {
 	if len(p.Pos) != 1 {
 		return fail(fmt.Errorf("usage: praector collection cleanup COL-ID [--delete-branches] [--force]"))
 	}
-	store, cfg, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	c, e := store.GetCollection(p.Pos[0])
+	out, e := svc.CollectionCleanup(context.Background(), CollectionCleanupInput{CollectionID: p.Pos[0], DeleteBranches: p.bool("delete-branches"), Force: p.bool("force")})
 	if e != nil {
 		return fail(e)
 	}
-	pr, e := store.GetProject(S(c, "project_id"))
-	if e != nil {
-		return fail(e)
-	}
-	if S(c, "status") != "COMPLETE" {
-		return fail(fmt.Errorf("Collection cleanup requires status COMPLETE"))
-	}
-	acc, _ := store.GetCollectionAcceptance(S(c, "id"), "")
-	if acc == nil && !p.bool("force") {
-		return fail(fmt.Errorf("Collection has not been accepted. Pass --force to remove worktrees anyway."))
-	}
-	w, e := NewGitWorkspace(store, cfg)
-	if e != nil {
-		return fail(e)
-	}
-	cl, e := w.CleanupCollection(pr, c, p.bool("delete-branches"))
-	if e != nil {
-		return fail(e)
-	}
-	for _, x := range Slice(cl, "worktrees") {
+	for _, x := range out.Worktrees {
 		fmt.Printf("removed worktree %v\n", x)
 	}
-	for _, x := range Slice(cl, "branches") {
+	for _, x := range out.Branches {
 		fmt.Printf("deleted branch %v\n", x)
 	}
-	if len(Slice(cl, "worktrees")) == 0 && len(Slice(cl, "branches")) == 0 {
+	if len(out.Worktrees) == 0 && len(out.Branches) == 0 {
 		fmt.Println("Nothing to clean.")
 	}
 	return 0
@@ -1782,11 +1282,11 @@ func tailFile(path string, n int, prefix string) {
 		fmt.Println(prefix + l)
 	}
 }
-func printTaskLogs(store *Store, t Row, heading bool, tail int) int {
-	rows, _ := store.Query("SELECT * FROM attempts WHERE task_id=" + SQLLiteral(S(t, "id")) + " ORDER BY attempt_no")
+func printTaskLog(tl TaskLog, heading bool, tail int) int {
+	rows := tl.Attempts
 	prefix := ""
 	if heading {
-		fmt.Printf("%s [%s/%s] %s\n", S(t, "id"), S(t, "status"), S(t, "profile"), S(t, "title"))
+		fmt.Printf("%s [%s/%s] %s\n", tl.ID, tl.Status, tl.Profile, tl.Title)
 		prefix = "  "
 	}
 	if len(rows) == 0 {
@@ -1817,100 +1317,54 @@ func cmdLogs(args []string) int {
 	if e != nil {
 		return fail(e)
 	}
-	store, _, e := newStore()
+	svc, e := newService()
 	if e != nil {
 		return fail(e)
 	}
-	target := p.Pos[0]
-	if strings.HasPrefix(target, "COL-") {
-		c, e := store.GetCollection(target)
-		if e != nil {
-			return fail(e)
-		}
-		ts, _ := store.ListTasks(S(c, "id"))
-		fmt.Printf("%s %s [%s]\n", S(c, "id"), S(c, "title"), S(c, "status"))
-		if len(ts) == 0 {
+	out, e := svc.Logs(context.Background(), LogsInput{Target: p.Pos[0]})
+	if e != nil {
+		return fail(e)
+	}
+	if out.Kind == "collection" {
+		fmt.Printf("%s %s [%s]\n", out.CollectionID, out.Title, out.Status)
+		if out.NoTasks {
 			fmt.Println("  no tasks")
 			return 0
 		}
 		total := 0
-		for _, t := range ts {
-			total += printTaskLogs(store, t, true, tail)
+		for _, tl := range out.TaskLogs {
+			total += printTaskLog(tl, true, tail)
 		}
 		if total == 0 {
 			fmt.Println("No task attempts have been recorded for this collection.")
 		}
 		return 0
 	}
-	t, e := store.GetTask(target)
-	if e != nil {
-		return fail(e)
-	}
-	printTaskLogs(store, t, false, tail)
+	printTaskLog(out.TaskLogs[0], false, tail)
 	return 0
 }
 func cmdDoctor(args []string) int {
 	if len(args) > 0 {
 		return fail(fmt.Errorf("usage: praector doctor"))
 	}
-	failures := 0
-	for _, b := range []string{"git", "dolt", "opencode"} {
-		if p, e := RequireBinary(b); e == nil {
-			fmt.Printf("✓ %s: %s\n", b, p)
-		} else {
-			fmt.Printf("✗ %s: not found\n", b)
-			failures++
+	svc := &Service{}
+	out, e := svc.Doctor(context.Background(), DoctorInput{})
+	if e != nil {
+		return fail(e)
+	}
+	for _, c := range out.Checks {
+		switch c.Status {
+		case "ok":
+			fmt.Printf("✓ %s\n", c.Text)
+		case "fail":
+			fmt.Printf("✗ %s\n", c.Text)
+		case "warn":
+			fmt.Printf("⚠ %s\n", c.Text)
+		default:
+			fmt.Println("  " + c.Text)
 		}
 	}
-	if p, e := RequireBinary("gh"); e == nil {
-		fmt.Printf("✓ gh: %s (collection PR delivery available)\n", p)
-	} else {
-		fmt.Println("⚠ gh: not found (required only for `praector collection pr`)")
-	}
-	store, cfg, e := newStore()
-	if e == nil {
-		fmt.Printf("✓ Dolt state: %s\n", store.StateDir)
-	} else {
-		fmt.Printf("✗ Dolt state: %v\n", e)
-		failures++
-		store = nil
-	}
-	if marker, ok := FindProjectMarker(""); ok {
-		pc, e := ReadProjectMarker(marker)
-		if e != nil {
-			fmt.Printf("✗ project marker: %v\n", e)
-			failures++
-		} else {
-			fmt.Printf("✓ project: %s (%s)\n", pc.Name, pc.ProjectID)
-			if store != nil {
-				if _, e = store.GetProject(pc.ProjectID); e == nil {
-					fmt.Println("✓ project registered in Dolt")
-				} else {
-					fmt.Printf("✗ project registered in Dolt: %v\n", e)
-					failures++
-				}
-			}
-			if _, e = pc.ResolvedOpenCode(); e == nil {
-				fmt.Printf("✓ project OpenCode command: %s\n", pc.OpenCodeCommand)
-			} else {
-				fmt.Printf("✗ project OpenCode command: %v\n", e)
-				failures++
-			}
-			if v := os.Getenv("VIRTUAL_ENV"); v != "" {
-				va, _ := filepath.Abs(v)
-				ra, _ := filepath.Abs(pc.Root)
-				rel, _ := filepath.Rel(ra, va)
-				if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-					fmt.Printf("⚠ active virtualenv outside project will be stripped from managed worker commands by default: %s\n", va)
-					fmt.Println("  Prefer running Praector from a neutral shell/tool install. Set PRAECTOR_SANITIZE_PARENT_VENV=0 only if your OpenCode installation intentionally needs that parent venv.")
-				}
-			}
-		}
-	} else {
-		fmt.Println("⚠ no project marker in current directory tree")
-	}
-	_ = cfg
-	if failures > 0 {
+	if out.Failures > 0 {
 		return 1
 	}
 	return 0

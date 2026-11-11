@@ -6,6 +6,8 @@ All notable changes to Praector are recorded here. README and focused documentat
 
 ## Unreleased
 
+- Extracted a shared typed service layer (`internal/praector/service.go`) as the single domain seam that both the CLI and the future MCP adapter call, so the two surfaces can never diverge ("now and always"). Every `cmd*` function now delegates its durable domain work to one typed `Op(ctx, Input) -> Output` per CLI command while keeping argument parsing, stdout formatting, exit codes, and scheduler/process launching adapter-side; CLI output, formatting, and exit codes are unchanged. A `serviceOps` registry maps each `commandHelp` entry 1:1 to an op, enforced by a new parity test, so adding a CLI command without wiring a domain op fails the build. The layer launches no processes and introduces no second store or orchestration implementation.
+
 ## 0.2.0
 
 - Established the clean Praector public namespace: native executable/CLI `praector`, Go module/package, Python reference package, project marker (`.praector/project.toml`), default home (`~/.praector`), `PRAECTOR_*` worker/config environment, Git branch prefixes (`praector/collections/...`, `praector/tasks/...`), generated Git identity, and `Praector-*` provenance trailers.
