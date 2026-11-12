@@ -172,7 +172,7 @@ Every disposable attempt receives the same packaged global engineering contract 
 
 ### Task Envelope compiler — `internal/praector/envelope.go`
 
-Builds `ORCH TASK ENVELOPE v1` for every fresh attempt.
+Builds `PRAECTOR TASK ENVELOPE v1` for every fresh attempt.
 
 It compiles:
 
@@ -241,7 +241,7 @@ Collection + coordinator Task created durably
         ▼
 Scheduler launches fresh coordinator Attempt
         │
-        ├── coordinator creates durable critic/plan_review/research/implement/review/advise Tasks
+        ├── Praector injects explore -> critic preflight; coordinator creates durable plan_review/research/implement/review/advise Tasks
         │
         └── coordinator submits result and exits
         │
@@ -321,6 +321,9 @@ fresh Parent Attempt with child result in the Envelope
 No model session is kept alive merely to wait for a dependency.
 
 ## Profiles and authority
+
+Repository exploration is a distinct planning phase. For implementation Collections, reconciliation injects a read-only `explore` task before the initial or acceptance-revision coordinator is allowed to shape material work. Purely local implementation makes the mandatory critic depend on exploration; when planning policy requires current external evidence, fresh `research` runs in parallel and the critic depends on both. This gives the coordinator an evidence-grounded current-system map, current external truth where material, and an independent planning challenge before it creates implementation contracts. Internal critic-revalidation coordinators do not recursively trigger new exploration; exploration is per operator planning generation, while material-plan fingerprinting covers implementation/research/advice contracts and completed research evidence.
+
 
 Praector currently uses one runtime contract and a small role-based profile taxonomy:
 
@@ -578,10 +581,12 @@ The design leaves room for later additions without making them current dependenc
     and never push, merge, or implicitly accept, while `cleanup` performs real
     worktree/branch removal and `init` performs real project registration.
     The listener advertises only the single MCP protocol revision it implements
-    and meets a well-formed request for any other revision with a legacy
-    **counter-offer** — a successful result advertising the implemented revision,
-    never echoing an unsupported one (Invalid-params is reserved for a malformed
-    version), requires a matching `MCP-Protocol-Version` header on
+    and meets a well-formed request naming a non-empty older/newer/unknown
+    revision with a **counter-offer** — a successful result advertising the
+    implemented revision, never echoing an unsupported one (Invalid-params is
+    reserved for a missing/empty/non-string/malformed version, the missing/empty
+    edge being a documented fail-closed hardening), requires a matching
+    `MCP-Protocol-Version` header on
     post-`initialize` requests (HTTP 400 otherwise), and — because it is
     loopback-only and unauthenticated — validates each request's Host/Origin as a
     loopback authority before dispatch (HTTP 403 on a foreign, literal `null`, or
@@ -656,7 +661,7 @@ Cross-process orchestration cannot assume several coordinator CLI calls form one
 
 All `depends_on` edges form an acyclic directed graph. The store rejects an edge `A -> B` when a path already exists from `B` back to `A`; task creation validates the whole initial dependency/blocking/gating batch before publishing the task row. This is a control-plane invariant, not a model convention.
 
-`plan_review` is a pre-write gate over durable implementation contracts. It may wait for prerequisite evidence (`critic`, `research`, `advise`) but must not depend on `implement` execution or on a coordinator that transitively waits on that review. Reconciliation detects those legacy coordinator/review back-edges, removes the review-side prerequisite, and if repair activity produced multiple unstarted final reviews, supersedes older gates into the newest one. Waiting coordinators and implementations are rewired to that one surviving gate. When it passes, every waiting coordinator whose hard dependencies are satisfied is terminalized instead of being awakened to reshape an already approved graph.
+`plan_review` is a pre-write gate over durable implementation contracts. It may wait for prerequisite evidence (`explore`, `critic`, `research`, `advise`) but must not depend on `implement` execution or on a coordinator that transitively waits on that review. Reconciliation detects those legacy coordinator/review back-edges, removes the review-side prerequisite, and if repair activity produced multiple unstarted final reviews, supersedes older gates into the newest one. Waiting coordinators and implementations are rewired to that one surviving gate. When it passes, every waiting coordinator whose hard dependencies are satisfied is terminalized instead of being awakened to reshape an already approved graph.
 
 
 ### Single-flight final review and coordinator handoff
@@ -668,3 +673,13 @@ Final plan review is a single-flight control-plane gate. When a coordinator requ
 ### Legacy DAG migration and scheduler fault containment
 
 Acyclicity applies to persistent upgraded state as well as new mutations. Before normal reconciliation, the store detects cycles and removes only recognized historical pre-write violations (`implement -> plan_review` and cyclic `coordinator -> plan_review`). Unrecognized legacy cycles are quarantined at Collection scope. Scheduler fault containment guarantees that one quarantined Collection cannot stop the daemon or consume worker slots; runnable work is collected only from non-quarantined Collections.
+
+## Fresh-evidence planning and input lineage
+
+Planning policy can classify a Collection as requiring current external evidence, external conformance, and/or threat modeling. For such initial/revision generations the scheduler creates repository `explore` and fresh external `research` in parallel, then makes the `critic` depend on both before coordinator planning. Deterministic research results carry structured source/claim/oracle provenance with stable claim ids, source authority levels, normative strength, and claim-backed planner directives; their result digests participate in the material-plan fingerprint. Completed research claims are projected into downstream Task Envelopes as `inherited_research_constraints`, so the canonical evidence-derived directive is visible independently of critic paraphrase. Critic, plan-review, and research-aware review results must report a per-claim `research_consistency` disposition (`preserved`, `strengthened`, or `explicit_exception`) and repeat the exact inherited directive; a normative requirement cannot disappear or reverse without an explicit durable exception decision. Active planning generations created before this stricter contract are revalidated with a fresh critic, while historical completed Collections remain untouched.
+
+For external-conformance work, verification evidence is classified as `internal_test`, `black_box_test`, `independent_implementation`, `official_reference_oracle`, or `live_provider_oracle`. A passing final review requires an authoritative independent oracle actually exercised (`independent_implementation`, `official_reference_oracle`, or `live_provider_oracle`) unless a durable exception decision records why such an oracle is unavailable; an implementation-owned black-box client is not promoted merely because it runs out of process.
+
+Read-only specialists can durably escalate an external uncertainty with `RESEARCH_REQUIRED`. The requesting task waits on bounded research and becomes runnable again afterward. If the project disables `current_external_research`, Praector blocks the Collection with `RESEARCH_CAPABILITY_REQUIRED` instead of silently using stale model knowledge.
+
+Each task attempt records a `TASK_INPUT_LINEAGE` snapshot containing the material-plan fingerprint and direct prerequisite digest. When an implementation integrates after that lineage changed, its mandatory review becomes a reconciliation review and Praector emits `RECONCILIATION_REQUIRED`; the completed code is preserved but must be verified against the current accepted evidence/prerequisite state.

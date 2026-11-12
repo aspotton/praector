@@ -11,7 +11,17 @@ from typing import Any, Iterator
 
 from .config import GlobalConfig, ProjectConfig, PROFILE_NAMES, project_config_to_json
 from .models import TaskStatus
-from .planning_policy import classify_delivery_policy, classify_planning_policy, material_plan_fingerprint
+from .planning_policy import (
+    classify_delivery_policy,
+    classify_planning_policy,
+    material_plan_fingerprint,
+    material_plan_fingerprint_v021,
+    validate_deterministic_research_result,
+    validate_external_conformance_review_result,
+    validate_research_consumer_result,
+    research_exception_decision_ids,
+    research_consumer_exception_decision_ids,
+)
 from .util import dedupe_key, json_dumps, json_loads, make_id, require_binary, sql_literal, utcnow
 
 
@@ -467,7 +477,7 @@ class DoltStore:
             return None
         coordinator_objective = (
             f"Own the initial decomposition of collection {collection_id}: {collection['objective']}. "
-            "Inspect project context only as needed. Create durable critic/plan_review/research/implement/review/advise tasks using praector as appropriate. "
+            "Consume the deterministic explore/critic preflight when present. Create durable plan_review/research/implement/review/advise tasks using praector as appropriate; request additional explore/critic work only when genuinely needed. "
             "Do not perform implementation or substantive specialist work yourself. Ensure implementation tasks are sequenced by dependencies; "
             "independent review is automatically enforced for implementation tasks."
         )
@@ -1072,11 +1082,24 @@ class DoltStore:
         legacy_current = self.material_plan_fingerprint(
             collection_id, legacy_raw_base_commit=True
         )
+        collection = self.get_collection(collection_id)
+        edges = self.list_edges(collection_id)
+        v021_current = material_plan_fingerprint_v021(
+            str(collection.get("objective") or ""), tasks, edges
+        )
+        v021_legacy_current = material_plan_fingerprint_v021(
+            str(collection.get("objective") or ""), tasks, edges, legacy_raw_base_commit=True
+        )
         baseline = self.critic_plan_baseline(latest["id"]) if latest else None
         sealed = baseline.get("fingerprint") if baseline else None
         compatible_via = None
-        if sealed and sealed != current and sealed == legacy_current:
-            compatible_via = "legacy_raw_base_commit"
+        if sealed and sealed != current:
+            if sealed == legacy_current:
+                compatible_via = "legacy_raw_base_commit"
+            elif sealed == v021_current:
+                compatible_via = "v0.2.1_material_plan"
+            elif sealed == v021_legacy_current:
+                compatible_via = "v0.2.1_legacy_raw_base_commit"
         stale = bool(latest and sealed and sealed != current and not compatible_via)
         return {
             "latest_critic_task_id": latest.get("id") if latest else None,
@@ -1159,6 +1182,50 @@ class DoltStore:
             "SELECT t.* FROM task_edges e JOIN tasks t ON t.id=e.from_task_id "
             f"WHERE e.to_task_id={sql_literal(task_id)} AND e.relation='depends_on' ORDER BY e.created_at"
         )
+
+    def research_ancestors(self, task_id: str) -> list[dict[str, Any]]:
+        """Return completed research Tasks reachable through hard dependency lineage."""
+        seen = {task_id}
+        queue = [task_id]
+        by_id: dict[str, dict[str, Any]] = {}
+        while queue:
+            current = queue.pop(0)
+            for dep in self.dependencies(current):
+                dep_id = str(dep.get("id") or "")
+                if not dep_id:
+                    continue
+                if dep.get("profile") == "research" and dep.get("status") == TaskStatus.COMPLETE.value:
+                    dep = dict(dep)
+                    dep["result"] = json_loads(dep.get("result_json") or "{}")
+                    by_id[dep_id] = dep
+                if dep_id not in seen:
+                    seen.add(dep_id)
+                    queue.append(dep_id)
+        return sorted(by_id.values(), key=lambda row: (str(row.get("created_at") or ""), str(row.get("id") or "")))
+
+    def _research_ancestors_locked(self, task_id: str) -> list[dict[str, Any]]:
+        """Locked claim-time variant of research_ancestors."""
+        seen = {task_id}
+        queue = [task_id]
+        by_id: dict[str, dict[str, Any]] = {}
+        while queue:
+            current = queue.pop(0)
+            deps = self._query_locked(
+                "SELECT t.* FROM task_edges e JOIN tasks t ON t.id=e.from_task_id "
+                f"WHERE e.to_task_id={sql_literal(current)} AND e.relation='depends_on' ORDER BY e.created_at"
+            )
+            for dep in deps:
+                dep_id = str(dep.get("id") or "")
+                if not dep_id:
+                    continue
+                if dep.get("profile") == "research" and dep.get("status") == TaskStatus.COMPLETE.value:
+                    dep = dict(dep)
+                    dep["result"] = json_loads(dep.get("result_json") or "{}")
+                    by_id[dep_id] = dep
+                if dep_id not in seen:
+                    seen.add(dep_id)
+                    queue.append(dep_id)
+        return sorted(by_id.values(), key=lambda row: (str(row.get("created_at") or ""), str(row.get("id") or "")))
 
     def dependents(self, task_id: str) -> list[dict[str, Any]]:
         return self.query(
@@ -1332,6 +1399,7 @@ class DoltStore:
         )
 
     def submit_result(self, task_id: str, result: dict[str, Any]) -> dict[str, Any]:
+        before = self.get_task(task_id)
         status = str(result.get("status", "complete")).strip().lower()
         mapping = {
             # A submitted "complete" result is not dependency-visible until the
@@ -1343,6 +1411,49 @@ class DoltStore:
         }
         if status not in mapping:
             raise ValueError("Result status must be one of: complete, waiting, failed")
+        if before.get("profile") == "research" and status in {"complete", "completed"}:
+            title = str(before.get("title") or "").lower()
+            reason = str(before.get("reason") or "").lower()
+            strict = "fresh external research" in title or "fresh external evidence" in reason or title.startswith("research requested by")
+            if strict:
+                collection = self.get_collection(before["collection_id"])
+                policy = classify_planning_policy(collection.get("objective") or "")
+                validate_deterministic_research_result(result, require_oracle=policy.external_conformance_required)
+                exception_ids = research_exception_decision_ids(result)
+                if exception_ids:
+                    decisions = self.list_decisions(before["project_id"], before["collection_id"])
+                    known = {str(decision.get("id") or "") for decision in decisions}
+                    for decision_id in exception_ids:
+                        if decision_id not in known:
+                            raise ValueError(
+                                f"research exception_decision_id {decision_id} is not a durable decision in this Collection"
+                            )
+
+        if status in {"complete", "completed"}:
+            profile = str(before.get("profile") or "")
+            collection = self.get_collection(before["collection_id"])
+            policy = classify_planning_policy(collection.get("objective") or "")
+            if profile in {"critic", "plan_review", "review"}:
+                research_deps = self.research_ancestors(task_id)
+                if research_deps:
+                    require_pass = profile in {"plan_review", "review"} and str(result.get("verdict") or "").strip().lower() == "pass"
+                    validate_research_consumer_result(result, research_deps, require_pass=require_pass)
+                    exception_ids = research_consumer_exception_decision_ids(result)
+                    if exception_ids:
+                        known = {row["id"] for row in self.list_decisions(before["project_id"], before["collection_id"])}
+                        missing = [decision_id for decision_id in exception_ids if decision_id not in known]
+                        if missing:
+                            raise ValueError(
+                                "research consistency exception_decision_id is not a durable decision in this Collection: "
+                                + ",".join(missing)
+                            )
+            if profile == "review" and policy.external_conformance_required:
+                validate_external_conformance_review_result(result)
+                decision_id = str(result.get("oracle_exception_decision_id") or "").strip()
+                if decision_id:
+                    decisions = self.list_decisions(before["project_id"], before["collection_id"])
+                    if not any(str(decision.get("id") or "") == decision_id for decision in decisions):
+                        raise ValueError(f"oracle_exception_decision_id {decision_id} is not a durable decision in this Collection")
         task_status = mapping[status]
         payload = json_dumps(result)
         self.mutate(
@@ -1636,6 +1747,16 @@ class DoltStore:
             critic = critics[-1]
             if critic.get("status") != TaskStatus.COMPLETE.value:
                 return False
+            if policy.research_required:
+                research = self._research_ancestors_locked(str(critic["id"]))
+                if not research:
+                    return False
+                try:
+                    validate_research_consumer_result(
+                        json_loads(critic.get("result_json") or "{}"), research, require_pass=False
+                    )
+                except ValueError:
+                    return False
             critic_edge = self._query_locked(
                 "SELECT 1 AS ok FROM task_edges WHERE "
                 f"from_task_id={sql_literal(critic['id'])} AND to_task_id={sql_literal(task['id'])} "
@@ -1669,6 +1790,17 @@ class DoltStore:
             return False
         if str(review.get("updated_at") or "") < str(task.get("created_at") or ""):
             return False
+        review_result = json_loads(review.get("result_json") or "{}")
+        if str(review_result.get("verdict") or "").strip().lower() != "pass":
+            return False
+        if policy.research_required:
+            research = self._research_ancestors_locked(str(review["id"]))
+            if not research:
+                return False
+            try:
+                validate_research_consumer_result(review_result, research, require_pass=True)
+            except ValueError:
+                return False
 
         edge = self._query_locked(
             "SELECT 1 AS ok FROM task_edges WHERE "
@@ -1689,6 +1821,16 @@ class DoltStore:
             critic = critics[-1]
             if critic.get("status") != TaskStatus.COMPLETE.value:
                 return False
+            if policy.research_required:
+                research = self._research_ancestors_locked(str(critic["id"]))
+                if not research:
+                    return False
+                try:
+                    validate_research_consumer_result(
+                        json_loads(critic.get("result_json") or "{}"), research, require_pass=False
+                    )
+                except ValueError:
+                    return False
             baseline = self._critic_plan_baseline_locked(str(critic["id"]))
             if not baseline or not baseline.get("fingerprint"):
                 return False
@@ -2252,6 +2394,22 @@ class DoltStore:
             },
         )
         return self.get_collection_pull_request(collection_id, provider) or {}
+
+    def task_input_lineage(self, task_id: str) -> dict[str, Any] | None:
+        rows = self.query(
+            "SELECT payload_json,attempt_id,created_at FROM events WHERE "
+            f"task_id={sql_literal(task_id)} AND event_type='TASK_INPUT_LINEAGE' "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        if not rows:
+            return None
+        payload = json_loads(rows[0].get("payload_json"), {})
+        if not isinstance(payload, dict):
+            return None
+        out = dict(payload)
+        out.setdefault("attempt_id", rows[0].get("attempt_id"))
+        out.setdefault("created_at", rows[0].get("created_at"))
+        return out
 
     def events_for_collection(self, collection_id: str, limit: int = 100) -> list[dict[str, Any]]:
         return self.query(

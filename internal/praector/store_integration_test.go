@@ -397,3 +397,267 @@ func TestCollectionRemainsRunningWhileParentSessionIsStillActive(t *testing.T) {
 		t.Fatalf("live durable session must keep collection RUNNING, got %s", state)
 	}
 }
+
+func TestV021CriticSealRemainsCompatibleAfterResearchDigestUpgrade(t *testing.T) {
+	s, _ := newFakeStore(t)
+	p, _ := s.RegisterProject(testProjectConfig(t.TempDir()))
+	c, coord, err := s.CreateCollectionWithCoordinator(
+		S(p, "id"),
+		"Current framework docs",
+		"Update README with the latest current framework guidance and add tests for the documented example.",
+		"Plan",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	research, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "research",
+		Title: "Verify current framework guidance (first-party)", Objective: "Research current framework guidance", Reason: "operator requested research",
+		ParentTaskID: S(coord, "id"), RequestedByTaskID: S(coord, "id"), WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	critic, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "critic",
+		Title: "Preflight implementation plan", Objective: "Critique current documentation plan", Reason: "policy",
+		ParentTaskID: S(coord, "id"), RequestedByTaskID: S(coord, "id"), DependsOn: []string{S(research, "id")}, WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	impl, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "implement",
+		Title: "Implement current docs update", Objective: "Implement researched current guidance", Reason: "plan",
+		ParentTaskID: S(coord, "id"), RequestedByTaskID: S(coord, "id"), WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _ = s.SubmitResult(S(research, "id"), Row{"status": "complete", "summary": "fresh framework evidence", "evidence": []any{"official documentation"}})
+	if err = s.SetTaskStatus(S(research, "id"), TaskComplete, "research complete"); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = s.SubmitResult(S(critic, "id"), Row{"status": "complete", "summary": "preflight complete"})
+	if err = s.SetTaskStatus(S(critic, "id"), TaskComplete, "critic complete"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the material-plan seal produced by 0.2.1, which did not include
+	// completed research result bytes in the fingerprint.
+	tasks, err := s.ListTasks(S(c, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges, err := s.ListEdges(S(c, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v021Fingerprint := MaterialPlanFingerprintV021(S(c, "objective"), tasks, edges, false)
+	currentFingerprint := MaterialPlanFingerprint(S(c, "objective"), tasks, edges, false)
+	if v021Fingerprint == currentFingerprint {
+		t.Fatal("test setup requires 0.2.2 research digest to change the material fingerprint")
+	}
+	plan, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "plan_review",
+		Title: "Review current docs work graph", Objective: "Review plan", Reason: "gate",
+		ParentTaskID: S(coord, "id"), DependsOn: []string{S(critic, "id")}, WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+		GateImplementTasks: true, CriticBaselineTaskID: S(critic, "id"), CriticBaselineFingerprint: v021Fingerprint, CriticBaselineSource: "initial_plan_seal",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = s.SubmitResult(S(plan, "id"), Row{"status": "complete", "summary": "pass", "verdict": "pass"})
+	if err = s.SetTaskStatus(S(plan, "id"), TaskComplete, "plan review complete"); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = s.SubmitResult(S(coord, "id"), Row{"status": "complete", "summary": "planned"})
+	if err = s.SetTaskStatus(S(coord, "id"), TaskComplete, "coordinator complete"); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = s.SubmitResult(S(impl, "id"), Row{"status": "complete", "summary": "implemented"})
+	if err = s.SetTaskStatus(S(impl, "id"), TaskComplete, "implementation complete"); err != nil {
+		t.Fatal(err)
+	}
+	review, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "review",
+		Title: "Review current docs update", Objective: "Review implementation", Reason: "auto",
+		ParentTaskID: S(impl, "id"), DependsOn: []string{S(impl, "id")}, WorkspaceMode: "collection", Depth: 2, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.AddEdge(S(impl, "id"), S(review, "id"), S(c, "id"), "verifies"); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = s.SubmitResult(S(review, "id"), Row{"status": "complete", "summary": "pass", "verdict": "pass"})
+	if err = s.SetTaskStatus(S(review, "id"), TaskComplete, "review complete"); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := s.CriticRevalidationState(S(c, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if B(state, "stale") || S(state, "compatible_via") != "v0.2.1_material_plan" {
+		t.Fatalf("0.2.1 critic seal should remain upgrade-compatible: %v", state)
+	}
+	terminal, err := s.UpdateCollectionTerminalState(S(c, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal != "COMPLETE" {
+		t.Fatalf("upgraded completed collection must remain COMPLETE, got %s", terminal)
+	}
+	if _, _, err = s.RequestCollectionRevision(S(c, "id"), "Correct remaining documentation issues"); err != nil {
+		t.Fatalf("0.2.1-complete collection must remain revisable after 0.2.2 upgrade: %v", err)
+	}
+}
+
+func TestClaimGateRejectsLegacyCriticUnderTransitiveResearchContract(t *testing.T) {
+	s, _ := newFakeStore(t)
+	p, _ := s.RegisterProject(testProjectConfig(t.TempDir()))
+	c, coord, err := s.CreateCollectionWithCoordinator(S(p, "id"), "MCP", "Implement support for the current MCP protocol specification in an HTTP server.", "Plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	research, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "research", Title: "Fresh external research preflight",
+		Objective: "research", Reason: "fresh external evidence", ParentTaskID: S(coord, "id"), RequestedByTaskID: S(coord, "id"), WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.SubmitResult(S(research, "id"), validFreshResearchResult()); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SetTaskStatus(S(research, "id"), TaskComplete, "research complete"); err != nil {
+		t.Fatal(err)
+	}
+	critic, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "critic", Title: "Preflight implementation plan",
+		Objective: "critique", Reason: "policy", ParentTaskID: S(coord, "id"), RequestedByTaskID: S(coord, "id"), DependsOn: []string{S(research, "id")}, WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := Row{"status": "complete", "summary": "legacy critic", "research_consistency": Row{"verdict": "pass", "checked_claim_ids": []any{"claim-x"}, "contradictions": []any{}}}
+	if err = s.Mutate("UPDATE tasks SET status='COMPLETE',result_json="+SQLLiteral(JSONDumps(legacy))+" WHERE id="+SQLLiteral(S(critic, "id")), "seed legacy critic"); err != nil {
+		t.Fatal(err)
+	}
+	plan, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "plan_review", Title: "Review MCP plan", Objective: "Review plan", Reason: "gate",
+		ParentTaskID: S(coord, "id"), RequestedByTaskID: S(coord, "id"), DependsOn: []string{S(critic, "id")}, WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp, err := s.MaterialPlanFingerprint(S(c, "id"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.RecordCriticPlanBaseline(S(critic, "id"), fp, "test", S(plan, "id")); err != nil {
+		t.Fatal(err)
+	}
+	claimed, attempt, err := s.ClaimTask(S(plan, "id"), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed != nil || attempt != nil {
+		t.Fatalf("plan review claimed with legacy critic that cannot satisfy current research contract: task=%v attempt=%v", claimed, attempt)
+	}
+}
+
+func TestTransitiveResearchContractReachesPlanReviewImplementationAndReview(t *testing.T) {
+	s, _ := newFakeStore(t)
+	p, _ := s.RegisterProject(testProjectConfig(t.TempDir()))
+	c, coord, err := s.CreateCollectionWithCoordinator(S(p, "id"), "MCP", "Implement support for the current MCP protocol specification in an HTTP server.", "Plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	research, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "research", Title: "Fresh external research preflight",
+		Objective: "research", Reason: "fresh external evidence", ParentTaskID: S(coord, "id"), RequestedByTaskID: S(coord, "id"), WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.SubmitResult(S(research, "id"), validFreshResearchResult()); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.SetTaskStatus(S(research, "id"), TaskComplete, "research complete")
+
+	critic, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "critic", Title: "Preflight implementation plan", Objective: "critique", Reason: "policy",
+		ParentTaskID: S(coord, "id"), RequestedByTaskID: S(coord, "id"), DependsOn: []string{S(research, "id")}, WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.SubmitResult(S(critic, "id"), Row{"status": "complete", "summary": "critic", "research_consistency": researchConsistencyFor(Rows{mustGetTask(t, s, S(research, "id"))})}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.SetTaskStatus(S(critic, "id"), TaskComplete, "critic complete")
+
+	plan, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "plan_review", Title: "Review MCP plan", Objective: "Review plan", Reason: "gate",
+		ParentTaskID: S(coord, "id"), RequestedByTaskID: S(coord, "id"), DependsOn: []string{S(critic, "id")}, WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	impl, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "implement", Title: "Implement MCP", Objective: "Implement the reviewed plan", Reason: "plan",
+		ParentTaskID: S(coord, "id"), RequestedByTaskID: S(coord, "id"), DependsOn: []string{S(plan, "id")}, WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp, err := s.MaterialPlanFingerprint(S(c, "id"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.RecordCriticPlanBaseline(S(critic, "id"), fp, "test", S(plan, "id")); err != nil {
+		t.Fatal(err)
+	}
+	claimedPlan, planAttempt, err := s.ClaimTask(S(plan, "id"), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimedPlan == nil || planAttempt == nil {
+		t.Fatal("valid plan review was not claimable")
+	}
+	if _, err = s.SubmitResult(S(plan, "id"), Row{"status": "complete", "summary": "pass", "verdict": "pass", "research_consistency": researchConsistencyFor(Rows{mustGetTask(t, s, S(research, "id"))})}); err != nil {
+		t.Fatalf("plan review did not validate transitive research ancestry: %v", err)
+	}
+	_ = s.SetTaskStatus(S(plan, "id"), TaskComplete, "plan review complete")
+	if _, err = s.SubmitResult(S(coord, "id"), Row{"status": "complete", "summary": "planned"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.SetTaskStatus(S(coord, "id"), TaskComplete, "coordinator complete")
+
+	ancestors, err := s.ResearchAncestors(S(impl, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ancestors) != 1 || S(ancestors[0], "id") != S(research, "id") {
+		t.Fatalf("implementation lost transitive research ancestry: %v", ancestors)
+	}
+	claimedImpl, implAttempt, err := s.ClaimTask(S(impl, "id"), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimedImpl == nil || implAttempt == nil {
+		t.Fatal("implementation was not claimable after valid transitive research-aware gates")
+	}
+}
+
+func mustGetTask(t *testing.T, s *Store, id string) Row {
+	t.Helper()
+	row, err := s.GetTask(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return row
+}

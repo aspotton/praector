@@ -10,12 +10,13 @@ import (
 	"strings"
 )
 
-var ProfileNames = []string{"coordinator", "critic", "plan_review", "research", "implement", "review", "advise"}
-var ReadOnlyProfiles = map[string]bool{"coordinator": true, "critic": true, "plan_review": true, "research": true, "review": true, "advise": true}
+var ProfileNames = []string{"coordinator", "explore", "critic", "plan_review", "research", "implement", "review", "advise"}
+var ReadOnlyProfiles = map[string]bool{"coordinator": true, "explore": true, "critic": true, "plan_review": true, "research": true, "review": true, "advise": true}
 var WriteProfiles = map[string]bool{"implement": true}
 
 var ProfileTitles = map[string]string{
 	"coordinator": "Coordinator / Planner",
+	"explore":     "Repository Explorer",
 	"critic":      "Pre-planning Critic",
 	"plan_review": "Plan Reviewer",
 	"research":    "Researcher",
@@ -35,6 +36,15 @@ type Limits struct {
 
 func DefaultLimits() Limits { return Limits{8, 100, 10, 4, 3, 3600} }
 
+type ProjectCapabilities struct {
+	CurrentExternalResearch bool `json:"current_external_research"`
+	explicit                bool
+}
+
+func DefaultProjectCapabilities() ProjectCapabilities {
+	return ProjectCapabilities{CurrentExternalResearch: true, explicit: true}
+}
+
 type ProjectConfig struct {
 	ProjectID       string
 	Name            string
@@ -44,6 +54,7 @@ type ProjectConfig struct {
 	OpenCodeCommand string
 	Models          map[string]string
 	Limits          Limits
+	Capabilities    ProjectCapabilities
 }
 
 func (p ProjectConfig) ModelFor(profile string) string    { return strings.TrimSpace(p.Models[profile]) }
@@ -247,6 +258,7 @@ func ReadProjectMarker(path string) (ProjectConfig, error) {
 	h := d["harness"]
 	md := d["models"]
 	lr := d["limits"]
+	cr := d["capabilities"]
 	if pr["id"] == "" || pr["name"] == "" {
 		return ProjectConfig{}, fmt.Errorf("invalid project marker: missing project id/name")
 	}
@@ -265,6 +277,12 @@ func ReadProjectMarker(path string) (ProjectConfig, error) {
 	lim.MaxParallelTasks = intOr(lr["max_parallel_tasks"], lim.MaxParallelTasks)
 	lim.MaxAttemptsPerTask = intOr(lr["max_attempts_per_task"], lim.MaxAttemptsPerTask)
 	lim.TaskTimeoutSeconds = intOr(lr["task_timeout_seconds"], lim.TaskTimeoutSeconds)
+	caps := DefaultProjectCapabilities()
+	if v, ok := cr["current_external_research"]; ok {
+		if b, e := strconv.ParseBool(strings.TrimSpace(v)); e == nil {
+			caps.CurrentExternalResearch = b
+		}
+	}
 	models := map[string]string{}
 	for _, n := range ProfileNames {
 		models[n] = md[n]
@@ -281,7 +299,7 @@ func ReadProjectMarker(path string) (ProjectConfig, error) {
 	if base == "" {
 		base = "main"
 	}
-	return ProjectConfig{ProjectID: pr["id"], Name: pr["name"], Root: filepath.Clean(root), BaseBranch: base, Harness: harness, OpenCodeCommand: cmd, Models: models, Limits: lim}, nil
+	return ProjectConfig{ProjectID: pr["id"], Name: pr["name"], Root: filepath.Clean(root), BaseBranch: base, Harness: harness, OpenCodeCommand: cmd, Models: models, Limits: lim, Capabilities: caps}, nil
 }
 
 func tomlString(v string) string { return strconv.Quote(v) }
@@ -303,13 +321,22 @@ func WriteProjectMarker(c ProjectConfig) (string, error) {
 	for _, n := range ProfileNames {
 		fmt.Fprintf(&b, "%s = %s\n", n, tomlString(c.Models[n]))
 	}
+	caps := c.Capabilities
+	if !caps.explicit {
+		caps = DefaultProjectCapabilities()
+	}
+	fmt.Fprintf(&b, "\n[capabilities]\ncurrent_external_research = %t\n", caps.CurrentExternalResearch)
 	l := c.Limits
 	fmt.Fprintf(&b, "\n[limits]\nmax_task_depth = %d\nmax_tasks_per_collection = %d\nmax_children_per_task = %d\nmax_parallel_tasks = %d\nmax_attempts_per_task = %d\ntask_timeout_seconds = %d\n", l.MaxTaskDepth, l.MaxTasksPerCollection, l.MaxChildrenPerTask, l.MaxParallelTasks, l.MaxAttemptsPerTask, l.TaskTimeoutSeconds)
 	return p, os.WriteFile(p, []byte(b.String()), 0644)
 }
 
 func ProjectConfigJSON(c ProjectConfig) Row {
-	return Row{"harness": c.Harness, "opencode_command": c.OpenCodeCommand, "models": c.Models, "limits": Row{"max_task_depth": c.Limits.MaxTaskDepth, "max_tasks_per_collection": c.Limits.MaxTasksPerCollection, "max_children_per_task": c.Limits.MaxChildrenPerTask, "max_parallel_tasks": c.Limits.MaxParallelTasks, "max_attempts_per_task": c.Limits.MaxAttemptsPerTask, "task_timeout_seconds": c.Limits.TaskTimeoutSeconds}}
+	caps := c.Capabilities
+	if !caps.explicit {
+		caps = DefaultProjectCapabilities()
+	}
+	return Row{"harness": c.Harness, "opencode_command": c.OpenCodeCommand, "models": c.Models, "capabilities": Row{"current_external_research": caps.CurrentExternalResearch}, "limits": Row{"max_task_depth": c.Limits.MaxTaskDepth, "max_tasks_per_collection": c.Limits.MaxTasksPerCollection, "max_children_per_task": c.Limits.MaxChildrenPerTask, "max_parallel_tasks": c.Limits.MaxParallelTasks, "max_attempts_per_task": c.Limits.MaxAttemptsPerTask, "task_timeout_seconds": c.Limits.TaskTimeoutSeconds}}
 }
 
 func ProjectConfigFromRow(r Row) ProjectConfig {
@@ -354,8 +381,13 @@ func ProjectConfigFromRow(r Row) ProjectConfig {
 	if cmd == "" {
 		cmd = "opencode"
 	}
+	caps := DefaultProjectCapabilities()
+	cm := M(raw, "capabilities")
+	if cm != nil && cm["current_external_research"] != nil {
+		caps.CurrentExternalResearch = B(cm, "current_external_research")
+	}
 	root, _ := filepath.Abs(S(r, "root_path"))
-	return ProjectConfig{ProjectID: S(r, "id"), Name: S(r, "name"), Root: root, BaseBranch: S(r, "base_branch"), Harness: h, OpenCodeCommand: cmd, Models: models, Limits: lim}
+	return ProjectConfig{ProjectID: S(r, "id"), Name: S(r, "name"), Root: root, BaseBranch: S(r, "base_branch"), Harness: h, OpenCodeCommand: cmd, Models: models, Limits: lim, Capabilities: caps}
 }
 
 func MarshalPretty(v any) string { b, _ := json.MarshalIndent(v, "", "  "); return string(b) }

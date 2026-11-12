@@ -12,7 +12,7 @@ func TestProjectMarkerRoundTrip(t *testing.T) {
 	for _, n := range ProfileNames {
 		models[n] = ""
 	}
-	c := ProjectConfig{ProjectID: "PRJ-1", Name: "demo", Root: root, BaseBranch: "main", Harness: "opencode", OpenCodeCommand: "opencode", Models: models, Limits: DefaultLimits()}
+	c := ProjectConfig{ProjectID: "PRJ-1", Name: "demo", Root: root, BaseBranch: "main", Harness: "opencode", OpenCodeCommand: "opencode", Models: models, Limits: DefaultLimits(), Capabilities: DefaultProjectCapabilities()}
 	p, e := WriteProjectMarker(c)
 	if e != nil {
 		t.Fatal(e)
@@ -29,7 +29,7 @@ func TestProjectMarkerRoundTrip(t *testing.T) {
 	}
 }
 func TestProfileTaxonomy(t *testing.T) {
-	want := []string{"coordinator", "critic", "plan_review", "research", "implement", "review", "advise"}
+	want := []string{"coordinator", "explore", "critic", "plan_review", "research", "implement", "review", "advise"}
 	if len(ProfileNames) != len(want) {
 		t.Fatal(ProfileNames)
 	}
@@ -90,5 +90,30 @@ func TestFindProjectMarkerUsesPraectorNamespace(t *testing.T) {
 	got, ok := FindProjectMarker(nested)
 	if !ok || got != marker {
 		t.Fatalf("expected canonical marker %s, got %s ok=%v", marker, got, ok)
+	}
+}
+
+func TestProjectResearchCapabilityRoundTripAndDefault(t *testing.T) {
+	root := t.TempDir()
+	models := map[string]string{}
+	for _, n := range ProfileNames {
+		models[n] = ""
+	}
+	cfg := ProjectConfig{ProjectID: "PRJ-cap", Name: "cap", Root: root, BaseBranch: "main", Harness: "opencode", OpenCodeCommand: "opencode", Models: models, Limits: DefaultLimits(), Capabilities: DefaultProjectCapabilities()}
+	cfg.Capabilities.CurrentExternalResearch = false
+	marker, err := WriteProjectMarker(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadProjectMarker(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Capabilities.CurrentExternalResearch {
+		t.Fatal("expected explicit false research capability to round-trip")
+	}
+	legacy := ProjectConfigFromRow(Row{"id": "PRJ-old", "name": "old", "root_path": root, "base_branch": "main", "config_json": "{}"})
+	if !legacy.Capabilities.CurrentExternalResearch {
+		t.Fatal("legacy project rows must default current_external_research=true")
 	}
 }

@@ -20,7 +20,11 @@ Privileged planner/graph authority. It classifies the work, inspects context, re
 
 For complex/ambiguous work it can request a blocking `critic`. For architecture/tradeoff work it can request `advise`. For non-trivial plans it can create `plan_review` and gate write tasks on it.
 
-In addition, `planning_policy` in the Task Envelope is mandatory. When it marks `critic_required` or `plan_review_required`, the coordinator may not waive the gate; the scheduler will insert missing gates before write work if necessary. This makes independent planning controls an orchestration invariant rather than a self-review preference.
+In addition, `planning_policy` in the Task Envelope is mandatory. `explore_required`, `research_required`, `critic_required`, `plan_review_required`, `external_conformance_required`, and `threat_model_required` are scheduler-enforced policy, not coordinator preferences. Fresh research may run in parallel with exploration; the critic depends on both when research is required.
+
+### `explore`
+
+Read-only current-system discovery. It maps relevant code, tests, configuration, runtime boundaries, dependencies, conventions, and durable documentation before planning. It reports evidence and constraints but does not choose architecture or design the implementation. Implementation Collections receive this preflight automatically.
 
 ### `critic`
 
@@ -32,7 +36,10 @@ Read-only practical reviewer of the proposed durable work graph. It checks refer
 
 ### `research`
 
-Read-only bounded evidence gathering. It distinguishes observed facts from inference and returns reproducible repository/source evidence.
+Read-only bounded evidence work. Deterministic fresh research uses current external retrieval, records `as_of`, structured `sources` and `claims`, normative level, claim-to-directive effect, confidence, and classified `verification_oracles`. Those fields are preserved in dependency envelopes and research result digests participate in material-plan staleness.
+
+Critic, plan-review, review, and advise tasks that hit a decisive externally-verifiable uncertainty may submit `status: waiting` with `research_required`; Praector creates a blocking research child and reruns the same durable task after the evidence completes.
+
 
 ### `implement`
 
@@ -66,6 +73,7 @@ Inspect the active built-in contracts with:
 ```bash
 praector profile list
 praector profile show coordinator
+praector profile show explore
 praector profile show critic
 praector profile show plan_review
 praector profile show advise
@@ -79,7 +87,7 @@ The role prompt files specialize reasoning behavior; deterministic authority sti
 
 ## Task Envelope
 
-Every fresh Attempt receives a generated `ORCH TASK ENVELOPE v1`.
+Every fresh Attempt receives a generated `PRAECTOR TASK ENVELOPE v1`.
 
 The Envelope is the semantic continuity layer between disposable sessions. It includes:
 
@@ -403,4 +411,4 @@ For collections whose deterministic planning policy requires plan review, implem
 
 ### Plan-review dependency direction
 
-`plan_review` is a pre-write gate over durable implementation contracts. It may wait for prerequisite evidence (`critic`, `research`, `advise`) but must not depend on `implement` execution. The valid direction is `plan_review -> implement` (implementation depends on the passing plan review). Praector strips coordinator-requested implementation prerequisites from plan review and repairs the exact reciprocal deadlock if encountered in an existing collection.
+`plan_review` is a pre-write gate over durable implementation contracts. It may wait for prerequisite evidence (`explore`, `critic`, `research`, `advise`) but must not depend on `implement` execution. The valid direction is `plan_review -> implement` (implementation depends on the passing plan review). Praector strips coordinator-requested implementation prerequisites from plan review and repairs the exact reciprocal deadlock if encountered in an existing collection.

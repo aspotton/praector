@@ -117,12 +117,13 @@ func TestServeRejectsForeignAuthorityBeforeDispatch(t *testing.T) {
 	}
 }
 
-// TestVersionNegotiationCountersOffers proves legacy 2025-06-18 negotiation
-// (DEC-0edf905672): a well-formed initialize for any revision — matching, empty,
-// older, newer, or unknown — is met with a SUCCESSFUL result advertising the one
+// TestVersionNegotiationCountersOffers proves 2025-06-18 negotiation
+// (DEC-0edf905672): a well-formed initialize naming a non-empty older, newer, or
+// unknown revision is met with a SUCCESSFUL result advertising the one
 // implemented revision (2025-06-18) and NEVER echoes the client's value. The
-// Invalid-params error -32602 is reserved solely for a malformed body or a
-// present-but-non-string protocolVersion.
+// Invalid-params error -32602 is returned for a missing/empty protocolVersion, a
+// present-but-non-string protocolVersion, or a malformed body — the missing/empty
+// edge is a fail-closed hardening (DEC-12a3ff57db), not a spec mandate.
 func TestVersionNegotiationCountersOffers(t *testing.T) {
 	ts := httptest.NewServer(newTestServer().Handler())
 	defer ts.Close()
@@ -139,17 +140,34 @@ func TestVersionNegotiationCountersOffers(t *testing.T) {
 			t.Fatalf("server must never echo the client revision %q", version)
 		}
 	}
-	// Absent protocolVersion still succeeds with the implemented revision.
-	out := post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": map[string]any{}})
-	res, _ := out["result"].(map[string]any)
-	if res["protocolVersion"] != ProtocolVersion {
-		t.Fatalf("empty version must advertise implemented revision, got %v", out)
+	// An empty-string protocolVersion is a fail-closed Invalid-params error, not a
+	// counter-offer success (DEC-12a3ff57db).
+	out := post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": map[string]any{"protocolVersion": ""}})
+	if e, _ := out["error"].(map[string]any); e == nil || e["code"].(float64) != codeInvalidParams {
+		t.Fatalf("empty protocolVersion must yield -32602, got %v", out)
 	}
 	// A present-but-non-string protocolVersion is a malformed Invalid-params error,
 	// not a counter-offer success.
 	out = post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": map[string]any{"protocolVersion": 12345}})
 	if e, _ := out["error"].(map[string]any); e == nil || e["code"].(float64) != codeInvalidParams {
 		t.Fatalf("non-string protocolVersion must yield -32602, got %v", out)
+	}
+}
+
+// TestVersionNegotiationMissingProtocolVersion proves a MISSING protocolVersion
+// field (empty params, or params without the key) is a fail-closed -32602
+// Invalid-params error (DEC-12a3ff57db), not a counter-offer success.
+func TestVersionNegotiationMissingProtocolVersion(t *testing.T) {
+	ts := httptest.NewServer(newTestServer().Handler())
+	defer ts.Close()
+	for _, params := range []any{
+		map[string]any{},
+		map[string]any{"other": "x"},
+	} {
+		out := post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params})
+		if e, _ := out["error"].(map[string]any); e == nil || e["code"].(float64) != codeInvalidParams {
+			t.Fatalf("missing protocolVersion %#v must yield -32602, got %v", params, out)
+		}
 	}
 }
 

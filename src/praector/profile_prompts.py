@@ -5,6 +5,7 @@ from importlib.resources import files
 
 PROFILE_TITLES = {
     "coordinator": "Coordinator / Planner",
+    "explore": "Repository Explorer",
     "critic": "Pre-planning Critic",
     "plan_review": "Plan Reviewer",
     "research": "Researcher",

@@ -6,14 +6,19 @@ from typing import Any
 from .config import READ_ONLY_PROFILES
 from .db import DoltStore
 from .profile_prompts import load_global_prompt, load_profile_prompt
-from .planning_policy import classify_delivery_policy, classify_planning_policy
+from .planning_policy import classify_delivery_policy, classify_planning_policy, research_claim_constraints
 
 
 PROFILE_GUIDANCE = {
     "coordinator": {
         "purpose": "Produce/refine a decision-complete durable work graph and own graph-level reasoning.",
-        "own": "Inspect context, classify the work, resolve planning assumptions, decompose work, and define dependencies/verification.",
-        "delegate": "Substantive research, implementation, independent plan review, implementation review, or specialist consultation.",
+        "own": "Consume exploration/critic evidence, resolve planning assumptions, decompose work, and define dependencies/verification.",
+        "delegate": "Repository exploration, substantive research, implementation, independent plan review, implementation review, or specialist consultation.",
+    },
+    "explore": {
+        "purpose": "Map the existing repository/system surface relevant to the Collection objective before planning.",
+        "own": "Inspect relevant files, modules, tests, configuration, runtime boundaries, callers/dependencies, existing patterns, and documentation; return evidence-grounded current-state context.",
+        "delegate": "Solution design, architecture preference, implementation, graph mutation, or independent review.",
     },
     "critic": {
         "purpose": "Challenge the request before planning by surfacing hidden intent, ambiguity, scope hazards, and verification gaps.",
@@ -26,9 +31,9 @@ PROFILE_GUIDANCE = {
         "delegate": "Plan repair or implementation. Return a verdict; Praector/coordinator handles graph repair.",
     },
     "research": {
-        "purpose": "Investigate a bounded question and return verifiable evidence.",
-        "own": "Repository investigation, evidence gathering, source comparison, and analysis within the assigned question.",
-        "delegate": "Independent specialist work, implementation, architecture changes, or review outside this task's scope.",
+        "purpose": "Resolve a bounded factual uncertainty with current, verifiable evidence when freshness matters.",
+        "own": "Authoritative source retrieval, version/date scoping, claim-to-directive traceability, oracle classification, and explicit uncertainty/contradiction reporting.",
+        "delegate": "Implementation, architecture changes, or pretending model memory is current evidence when fresh retrieval is required.",
     },
     "implement": {
         "purpose": "Make the bounded code/file change assigned by this task and prove it works.",
@@ -48,9 +53,10 @@ PROFILE_GUIDANCE = {
 }
 
 AVAILABLE_PROFILES = {
+    "explore": "Use for broad repository/system discovery before planning: what exists, how it connects, and what constraints matter.",
     "critic": "Use for pre-planning gap analysis: hidden intent, ambiguity, scope hazards, assumptions, and QA directives.",
     "plan_review": "Use to review whether a proposed graph/task plan is executable before write work begins.",
-    "research": "Use for additional facts, repository investigation, authoritative evidence, or bounded discovery.",
+    "research": "Use for bounded authoritative evidence gathering; freshness-sensitive work must use current external retrieval and structured claim/source/oracle evidence.",
     "implement": "Use when an actual code/file change must be produced.",
     "review": "Use for independent post-implementation verification and pass/fail judgment.",
     "advise": "Use for difficult conceptual/architectural judgment and a concrete recommendation.",
@@ -81,6 +87,14 @@ _RESULT_KEYS = (
     "artifacts",
     "risks",
     "unresolved",
+    "as_of",
+    "sources",
+    "claims",
+    "verification_oracles",
+    "research_consistency",
+    "authoritative_oracle_unavailable_reason",
+    "oracle_exception_decision_id",
+    "research_required",
 )
 
 
@@ -149,6 +163,18 @@ def build_task_envelope(
 
     planning_policy = classify_planning_policy(collection.get("objective") or "")
     delivery_policy = classify_delivery_policy(collection.get("objective") or "")
+    research_ancestors = store.research_ancestors(task["id"])
+    inherited_constraints = [
+        {
+            "claim_id": item["claim_ref"],
+            "research_task_id": item["task_id"],
+            "normative_level": item["normative_level"],
+            "authority": item["authority"],
+            "source": item["source"],
+            "planner_directive": item["planner_directive"],
+        }
+        for item in research_claim_constraints(research_ancestors)
+    ]
 
     context: dict[str, Any] = {
         "project": {"id": project["id"], "name": project["name"], "base_branch": project["base_branch"]},
@@ -174,6 +200,7 @@ def build_task_envelope(
         "attempt": {"id": attempt["id"], "number": attempt["attempt_no"]},
         "parent": _result_summary(parent) if parent else None,
         "completed_dependencies": [_result_summary(dep) for dep in deps if dep["status"] == "COMPLETE"],
+        "inherited_research_constraints": inherited_constraints,
         "project_and_collection_memory": [
             {"kind": m["kind"], "text": m["text"], "scope": m["scope"]} for m in memories
         ],
@@ -209,7 +236,7 @@ def build_task_envelope(
             "A fail remains blocking; Praector will wake a coordinator to repair the graph before this reviewer runs again."
         )
 
-    return f"""# ORCH TASK ENVELOPE v1
+    return f"""# PRAECTOR TASK ENVELOPE v1
 
 You are running as one disposable execution attempt inside a durable orchestrator. The task, graph, workspace, and results persist outside this OpenCode session.
 

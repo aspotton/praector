@@ -4,8 +4,8 @@ import "testing"
 
 func TestPlanningPolicyCompatibility(t *testing.T) {
 	p := ClassifyPlanningPolicy("Add API-key authentication and per-key rate limiting to the public API endpoint.")
-	if !p.CriticRequired || !p.PlanReviewRequired {
-		t.Fatalf("expected both gates: %#v", p)
+	if !p.ExploreRequired || !p.CriticRequired || !p.PlanReviewRequired {
+		t.Fatalf("expected explore, critic, and plan-review gates: %#v", p)
 	}
 	has := func(x string) bool {
 		for _, v := range p.Categories {
@@ -19,8 +19,8 @@ func TestPlanningPolicyCompatibility(t *testing.T) {
 		t.Fatalf("missing categories: %v", p.Categories)
 	}
 	p = ClassifyPlanningPolicy("Fix a typo in README.md and update one example sentence.")
-	if p.CriticRequired || p.PlanReviewRequired {
-		t.Fatalf("docs-only change should be low ceremony: %#v", p)
+	if !p.ExploreRequired || !p.CriticRequired || p.PlanReviewRequired {
+		t.Fatalf("trivial implementation should explore + critique but skip plan review: %#v", p)
 	}
 }
 func TestTwilioConversationalObjectiveCompatibility(t *testing.T) {

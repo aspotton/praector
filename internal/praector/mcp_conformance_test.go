@@ -9,22 +9,22 @@ import (
 	"testing"
 )
 
-// TestMCPExternalConformanceOracle is the independent black-box interoperability
-// oracle required for the 0.2.1 hardening revision. Praector's in-process protocol
-// tests are necessary but not sufficient for an external protocol, so this drives
-// the SAME loopback MCP listener a running daemon hosts (built by startMCPServer,
-// the daemon's sole construction gate, with no scheduler and no process launch)
-// from an EXTERNAL client — a stdlib-only Python MCP client script that is
-// independent of Praector's own Go MCP core.
+// TestMCPExternalConformanceOracle is an ADDITIONAL non-authoritative black-box
+// interoperability probe. It is NOT the official conformance oracle: the
+// authoritative independent client path is TestMCPOfficialClientInteroperability
+// (an official Inspector CLI / Tier-1 SDK client). This probe drives the SAME
+// loopback MCP listener a running daemon hosts (built by startMCPServer, the
+// daemon's sole construction gate, with no scheduler and no process launch) from
+// an EXTERNAL stdlib-only Python client that is independent of Praector's own Go
+// MCP core, exercising protocol negotiation, tools/list, resources/list/read (with
+// accurate content types), a safe read-only tool call, and a safe durable
+// queue-write that records a real task through the shared Service/Store path.
 //
-// Against the live loopback listener the external client verifies protocol
-// negotiation, tools/list, resources/list/read (with accurate content types), a
-// safe read-only tool call, and a safe durable queue-write that records a real
-// task through the shared Service/Store path.
-//
-// If python3 is not installed the oracle skips with an explicit reason rather than
-// silently passing; the script remains documented-runnable by hand against a live
-// daemon (see scripts/mcp_conformance.py).
+// Because the client is implementation-owned, it is a black_box_test and is
+// insufficient by itself as authoritative external conformance; it is retained for
+// its fast, dependency-free coverage of the live transport. If python3 is not
+// installed the probe skips with an explicit reason; the script remains
+// documented-runnable by hand against a live daemon (scripts/mcp_conformance.py).
 func TestMCPExternalConformanceOracle(t *testing.T) {
 	python, err := exec.LookPath("python3")
 	if err != nil {
@@ -71,14 +71,20 @@ func TestMCPExternalConformanceOracle(t *testing.T) {
 }
 
 // TestMCPOfficialClientInteroperability is the AUTHORITATIVE independent
-// conformance path required for 0.2.1: it drives the SAME loopback MCP listener a
-// running daemon hosts (startMCPServer, no scheduler/no process launch) from an
-// official MCP client — the Inspector CLI (`npx @modelcontextprotocol/inspector
-// --cli --transport http`) or a Tier-1 official SDK client — rather than only by
+// conformance path: it drives the SAME loopback MCP listener a running daemon
+// hosts (startMCPServer, no scheduler/no process launch) from an official MCP
+// client — the Inspector CLI (`npx @modelcontextprotocol/inspector --cli
+// --transport http`) or a Tier-1 official SDK client — rather than only by
 // Praector's own in-process Go tests or the Praector-owned black-box script. It
-// verifies initialize/version negotiation, tools/list, resources/list/read, a
-// safe read tool, and one safe durable queue-write round-trip through the real
-// protocol stack of a second implementation.
+// ACTUALLY exercises every required surface as a separate Inspector `--method`
+// invocation against the live loopback listener, each preceded by an implicit
+// initialize/version-negotiation handshake:
+//
+//	initialize/version negotiation (implicit on every request),
+//	tools/list, resources/list, resources/read,
+//	one safe read tool call (praector_project_list), and
+//	one safe durable queue-write (praector_task_request) recording a real task
+//	through the shared Service/Store path.
 //
 // It is deliberately OFF the default `go test ./...` path so it never requires a
 // network fetch or raises the go toolchain floor: set PRAECTOR_MCP_INSPECTOR to a
@@ -87,10 +93,12 @@ func TestMCPExternalConformanceOracle(t *testing.T) {
 //	PRAECTOR_MCP_INSPECTOR="npx -y @modelcontextprotocol/inspector --cli --transport http" \
 //	  go test ./internal/praector -run TestMCPOfficialClientInteroperability
 //
-// The command is invoked with the live loopback endpoint appended, then
-// `--method tools/list`. When unset the test SKIPS with an explicit reason rather
-// than silently passing or pretending the in-process tests are authoritative. The
-// official client is never a runtime module dependency.
+// Each surface is run as `<command> <url> <surface-args>`; every invocation must
+// exit successfully. When PRAECTOR_MCP_INSPECTOR is unset the test SKIPS with an
+// explicit reason rather than silently passing or pretending the in-process tests
+// are authoritative. The official client is never a runtime module dependency;
+// scripts/mcp_conformance.py remains an additional non-authoritative black-box
+// probe (see TestMCPExternalConformanceOracle), not this oracle.
 func TestMCPOfficialClientInteroperability(t *testing.T) {
 	inspector := strings.TrimSpace(os.Getenv("PRAECTOR_MCP_INSPECTOR"))
 	if inspector == "" {
@@ -103,7 +111,8 @@ func TestMCPOfficialClientInteroperability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.CreateCollectionWithCoordinator(S(p, "id"), "Interop", "Official client probe", "Plan"); err != nil {
+	_, coord, err := s.CreateCollectionWithCoordinator(S(p, "id"), "Interop", "Official client probe", "Plan")
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -121,11 +130,32 @@ func TestMCPOfficialClientInteroperability(t *testing.T) {
 	url := "http://" + ln.Addr().String() + "/mcp"
 
 	fields := strings.Fields(inspector)
-	args := append(fields[1:], url, "--method", "tools/list")
-	cmd := exec.Command(fields[0], args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("official MCP client interoperability check failed: %v\n%s", err, out)
-	} else {
-		t.Logf("official client output:\n%s", out)
+	run := func(name string, extra ...string) {
+		t.Helper()
+		args := append(append([]string{}, fields[1:]...), url)
+		args = append(args, extra...)
+		cmd := exec.Command(fields[0], args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("official MCP client failed on %s (%v): %s\n%s", name, err, strings.Join(args, " "), out)
+		} else {
+			t.Logf("official client %s output:\n%s", name, out)
+		}
 	}
+
+	// Surface 1+2: tools/list (implicit initialize/version negotiation + tool set).
+	run("tools/list", "--method", "tools/list")
+	// Surface 3: resources/list.
+	run("resources/list", "--method", "resources/list")
+	// Surface 4: resources/read against a registered-projects resource.
+	run("resources/read", "--method", "resources/read", "--uri", "praector://projects")
+	// Surface 5: one safe read tool call.
+	run("read-tool", "--method", "tools/call", "--tool-name", "praector_project_list")
+	// Surface 6: one safe durable queue-write that records a real task.
+	run("queue-write", "--method", "tools/call", "--tool-name", "praector_task_request",
+		"--tool-arg", "caller="+S(coord, "id"),
+		"--tool-arg", "profile=research",
+		"--tool-arg", "title=Official client probe",
+		"--tool-arg", "objective=Determine X with evidence",
+		"--tool-arg", "reason=authoritative official-client queue-write conformance probe",
+	)
 }

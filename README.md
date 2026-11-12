@@ -36,8 +36,8 @@ Praector currently provides:
 
 - **OpenCode** as the first harness implementation;
 - Git repositories as project workspaces;
-- coordinator, critic, plan-review, research, implement, review, and advise profiles;
-- deterministic planning-policy gates for non-trivial, security-sensitive, stateful, migration, destructive, and external-integration work;
+- coordinator, explore, critic, plan-review, research, implement, review, and advise profiles;
+- deterministic `explore -> critic` preflight for local implementation work, upgraded to parallel `explore + fresh research -> critic` when external/current evidence is material, plus plan-review gates for non-trivial/security-sensitive/stateful/migration/destructive/integration work;
 - bounded local parallelism with durable crash/retry recovery;
 - orchestration state/history in **Dolt**, with `depends_on` maintained as an acyclic DAG;
 - isolated Git branches/worktrees, with human-readable Praector-generated commit subjects and durable provenance trailers;
@@ -102,6 +102,7 @@ Inspect runtime roles/prompts:
 ```bash
 praector profile list
 praector profile show coordinator
+praector profile show explore
 praector profile show critic
 praector profile show plan_review
 praector profile show advise
@@ -113,16 +114,23 @@ See [`docs/PROFILES.md`](docs/PROFILES.md) for the role map, inherited global en
 A successful implementation normally evolves like this:
 
 ```text
-coordinator
-    ↓
-implement
-    ↓
-independent review
-    ↓
-Collection COMPLETE
+                 explore
+                /       \
+objective ------           --> critic --> coordinator
+                \       /
+                 research       (when fresh external evidence is required)
+                                  ↓
+                             plan_review   (when policy requires it)
+                                  ↓
+                              implement
+                                  ↓
+                         independent review
+                                  ↓
+                         Collection COMPLETE
 ```
 
-More complex work can add a pre-planning critic, plan-review gate, research, architecture advice, blocking child tasks, repair tasks, retries, and coordinator graph repair dynamically.
+Every implementation Collection receives deterministic read-only repository exploration before coordinator planning. Purely local work follows `explore -> critic`; when correctness depends on a current protocol/standard/provider/regulatory/dependency contract or explicit freshness, Praector also injects fresh external `research` in parallel with exploration and makes the critic consume both. Structured research provenance and result digests become durable planning evidence, and materially refreshed evidence can stale prior planning. Specialists that discover a decisive external uncertainty may return `RESEARCH_REQUIRED` and resume after bounded fresh research instead of guessing. Clearly trivial documentation-only implementation may still skip final `plan_review`; all implementation remains subject to independent post-write review.
+For non-implementation objectives whose answer itself depends on changing reality—such as current news, events, pricing, availability, or support status—the same freshness policy can inject research without adding implementation-only ceremony.
 
 ## Completed work is not automatically merged
 

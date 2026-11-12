@@ -8,6 +8,7 @@ from praector.profile_prompts import PROFILE_TITLES, load_global_prompt, load_pr
 def test_profile_taxonomy_and_capabilities():
     assert PROFILE_NAMES == (
         "coordinator",
+        "explore",
         "critic",
         "plan_review",
         "research",
@@ -17,7 +18,7 @@ def test_profile_taxonomy_and_capabilities():
     )
     assert WRITE_PROFILES == {"implement"}
     assert READ_ONLY_PROFILES == {
-        "coordinator", "critic", "plan_review", "research", "review", "advise"
+        "coordinator", "explore", "critic", "plan_review", "research", "review", "advise"
     }
     assert set(PROFILE_TITLES) == set(PROFILE_NAMES)
 
@@ -25,6 +26,7 @@ def test_profile_taxonomy_and_capabilities():
 def test_every_profile_has_a_substantive_packaged_prompt():
     required_phrases = {
         "coordinator": "durable work graph",
+        "explore": "current-state map",
         "critic": "pre-planning",
         "plan_review": "blocker",
         "research": "bounded question",

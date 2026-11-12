@@ -261,6 +261,7 @@ Inspect the built-in runtime profile contracts that are injected into every mana
 ```bash
 praector profile list
 praector profile show coordinator
+praector profile show explore
 praector profile show critic
 praector profile show plan_review
 praector profile show advise
@@ -301,7 +302,7 @@ This is the preferred recovery path for transient harness/provider failures afte
 ```bash
 praector task request \
   [--task CALLER] \
-  --profile critic|plan_review|research|implement|review|advise \
+  --profile explore|critic|plan_review|research|implement|review|advise \
   --title TITLE \
   --objective OBJECTIVE \
   --reason REASON \
