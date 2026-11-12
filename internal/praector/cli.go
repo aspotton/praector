@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -461,6 +462,24 @@ func cmdDaemon(args []string) int {
 	sched, e := NewScheduler(store, cfg, mw)
 	if e != nil {
 		return fail(e)
+	}
+	// The MCP listener is a separate, loopback-only HTTP goroutine decoupled from
+	// the reconcile loop and from scheduler.lock: it performs only Store reads and
+	// durable enqueues on the per-call state lock, and never launches processes or
+	// runs a collection. It shares the daemon's already-open store connection.
+	if LoadMCPServerConfig(cfg).Enabled {
+		svc := &Service{store: store, cfg: cfg}
+		mcpSrv, e := startMCPServer(svc)
+		if e != nil {
+			return fail(e)
+		}
+		defer mcpSrv.Close()
+		go func() {
+			if err := mcpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				fmt.Fprintf(os.Stderr, "mcp listener: %v\n", err)
+			}
+		}()
+		fmt.Printf("MCP listener enabled on %s (loopback only)\n", mcpSrv.Addr)
 	}
 	fmt.Println("praector daemon running (Ctrl-C to stop)")
 	if e = sched.Daemon(p.bool("once"), time.Second); e != nil {

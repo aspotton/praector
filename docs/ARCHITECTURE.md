@@ -557,7 +557,16 @@ Dolt also preserves an event stream and semantic commit history. Git preserves c
 
 The design leaves room for later additions without making them current dependencies. The prioritized sequence is maintained in [`../ROADMAP.md`](../ROADMAP.md). Important attachment points include:
 
-- **MCP** as another interface over the same durable domain/store operations used by the CLI, beginning read-only and adding policy-checked mutations deliberately;
+- **MCP** is now a live interface over the same durable domain/service/store
+  operations used by the CLI: when enabled and the daemon is running, Praector
+  hosts a **loopback-only** (127.0.0.1) streamable-HTTP MCP listener as a goroutine
+  decoupled from the reconcile loop and `scheduler.lock`. It performs only Store
+  reads and durable enqueues on the same gated paths, never constructs a
+  scheduler, and never launches processes or runs a collection inline. It is
+  disabled by default, binds loopback only, and defers auth/identity to the
+  remote boundary. It began read-only with enqueue-only actions and is expanding
+  toward full CLI command parity over the same `Service` layer
+  (decisions DEC-1580dff0e0 / DEC-9997d2394f / DEC-aacb7bfc23);
 - **durable human/executive escalation** above Projects/Collections, with blocked work waiting on recorded decisions rather than live session continuity;
 - **additional harnesses** through the native harness boundary;
 - **multi-workspace/multi-repo Projects** above the current one-repo mapping;

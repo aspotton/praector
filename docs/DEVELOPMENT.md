@@ -26,7 +26,9 @@ cmd/praector/main.go              executable entry point
 internal/praector/
 ├── cli.go                    CLI/operator/worker command surface
 ├── service.go                shared typed domain service layer (CLI/MCP parity seam)
-├── config.go                 global/project configuration
+├── config.go                 global/project configuration + MCP enable config
+├── mcp_server.go             MCP tool/resource bridge over the shared service layer
+├── mcp/                      dependency-light stdlib MCP core + streamable-HTTP transport
 ├── store.go                  Dolt persistence + graph/state operations
 ├── scheduler.go              execution/retry/recovery/review policy
 ├── policy.go                 deterministic planning/delivery classifier
@@ -89,6 +91,36 @@ Avoid:
 - scheduler/daemon process launching (the scheduler remains the sole launcher);
 - external PR provider delivery and privileged accept/merge writes (adapter,
   opt-in); a second store or orchestration implementation.
+
+### `internal/praector/mcp/` + `mcp_server.go`
+
+The MCP surface is another adapter over the same `Service` layer the CLI uses
+(decision DEC-9997d2394f: dependency-light stdlib MCP core; defer the official
+`modelcontextprotocol/go-sdk`). `internal/praector/mcp` is a pure protocol +
+transport package (JSON-RPC 2.0 framing, MCP initialize/ping/tools/resources,
+streamable-HTTP transport, loopback-only server constructor) that depends only
+on the standard library and knows nothing about Praector's domain.
+`internal/praector/mcp_server.go` is the bridge that maps MCP tools/resources
+onto typed `Service` ops. The daemon hosts a **loopback-only (127.0.0.1)**
+listener goroutine, started from `cmdDaemon` when enabled and fully decoupled
+from the reconcile loop and `scheduler.lock`.
+
+Good place for:
+
+- JSON-RPC/MCP protocol framing and the streamable-HTTP transport (`mcp/`);
+- tool/resource definitions that delegate to a single typed `Service` op
+  (`mcp_server.go`);
+- enqueue-only "execute"-style actions that create durable work via the same
+  `CreateCollectionWithCoordinator`/`CreateTask` Store paths as the CLI `--detach`
+  path and rely on the running daemon.
+
+Avoid:
+
+- constructing a scheduler, launching worker processes, or running a collection
+  inline (the single-owner invariant; enforced by a source-level test);
+- binding any non-loopback address, or introducing auth/identity (deferred
+  boundary, decision DEC-aacb7bfc23);
+- a second store/orchestration path or any bypass of policy/review/acceptance.
 
 ### `internal/praector/store.go`
 

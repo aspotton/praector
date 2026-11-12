@@ -151,6 +151,61 @@ func intOr(s string, d int) int {
 	return d
 }
 
+// DefaultMCPAddr is the loopback address the MCP listener binds when enabled but
+// no explicit address is configured. It is loopback-only by construction.
+const DefaultMCPAddr = "127.0.0.1:8765"
+
+// MCPServerConfig is the resolved, effective configuration for the daemon-hosted
+// MCP listener. It is DISABLED by default; enabling it is an explicit operator
+// opt-in via ~/.praector/config.toml [mcp] or the PRAECTOR_MCP environment
+// override. Binding is always restricted to loopback (auth/identity deferred per
+// DEC-aacb7bfc23).
+type MCPServerConfig struct {
+	Enabled bool
+	Addr    string
+}
+
+// LoadMCPServerConfig resolves the MCP listener settings from the global
+// config.toml [mcp] section (parsed by the same dependency-light parseMarkerTOML
+// used for project markers) with a PRAECTOR_MCP environment override. A missing
+// or unreadable config file yields the safe default: disabled on loopback.
+func LoadMCPServerConfig(g GlobalConfig) MCPServerConfig {
+	cfg := MCPServerConfig{Enabled: false, Addr: DefaultMCPAddr}
+	if d, err := parseMarkerTOML(filepath.Join(g.Home, "config.toml")); err == nil {
+		if m := d["mcp"]; m != nil {
+			cfg.Enabled = boolOr(m["enabled"], false)
+			if a := strings.TrimSpace(m["addr"]); a != "" {
+				cfg.Addr = a
+			}
+		}
+	}
+	// PRAECTOR_MCP overrides the file: a truthy/falsey token toggles enablement;
+	// any other value is treated as an explicit loopback address and enables.
+	if v := strings.TrimSpace(os.Getenv("PRAECTOR_MCP")); v != "" {
+		switch strings.ToLower(v) {
+		case "1", "true", "on", "yes":
+			cfg.Enabled = true
+		case "0", "false", "off", "no", "":
+			cfg.Enabled = false
+		default:
+			cfg.Addr = v
+			cfg.Enabled = true
+		}
+	}
+	return cfg
+}
+
+func boolOr(s string, d bool) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "on", "yes":
+		return true
+	case "0", "false", "off", "no":
+		return false
+	default:
+		return d
+	}
+}
+
 func ReadProjectMarker(path string) (ProjectConfig, error) {
 	d, err := parseMarkerTOML(path)
 	if err != nil {

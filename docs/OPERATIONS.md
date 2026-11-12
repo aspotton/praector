@@ -192,6 +192,38 @@ praector run --max-workers 2 "..."
 praector daemon --max-workers 2
 ```
 
+## MCP server (optional, local)
+
+When enabled, a running `praector daemon` also hosts a **loopback-only**
+(127.0.0.1) streamable-HTTP MCP listener as a background goroutine, so AI agents
+speaking MCP can drive the same durable control plane the CLI uses. It is
+**disabled by default** and always binds loopback only; authentication/identity
+is deferred to the remote-access boundary and is not part of this local release.
+
+Enable it in `~/.praector/config.toml`:
+
+```toml
+[mcp]
+enabled = true
+addr = "127.0.0.1:8765"   # optional; loopback only
+```
+
+or for a single invocation via the `PRAECTOR_MCP` environment override (a truthy
+token toggles enablement; any other value is treated as an explicit loopback
+`host:port`):
+
+```bash
+PRAECTOR_MCP=1 praector daemon
+PRAECTOR_MCP=127.0.0.1:9000 praector daemon
+```
+
+The listener is decoupled from the reconcile loop and the scheduler lock. It
+performs only durable Store reads and enqueue-only actions (for example
+`praector_run` and `praector_task_request` create durable work that the running
+daemon then executes); it never launches worker processes or runs a collection
+inline, and never bypasses dependency, planning, review, capability, or
+acceptance checks. A non-loopback address is refused at startup.
+
 ## Observe work
 
 Project/Collection status:
