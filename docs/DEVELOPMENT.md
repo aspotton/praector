@@ -284,7 +284,7 @@ When changing profiles, Task Envelope fields, delegation semantics, or result sc
 4. add/update tests in `tests/test_profiles.py`, `tests/test_envelope.py`, or integration tests;
 5. update [`PROFILES.md`](PROFILES.md) and [`AGENT_PROTOCOL.md`](AGENT_PROTOCOL.md);
 6. update [`ARCHITECTURE.md`](ARCHITECTURE.md) if the authority/lifecycle model changed;
-7. update [`CLI.md`](CLI.md) / [`OPERATIONS.md`](OPERATIONS.md) when commands/configuration change.
+7. update [`CLI.md`](CLI.md) / [`OPERATIONS.md`](OPERATIONS.md) when commands/configuration change, and the repo-local skill CLI reference `.agents/skills/praector/references/cli.md` (derive its usage table from `internal/praector/help.go` `commandHelp`; kept in sync by `TestSkillCLICommandHelpCoversCommandHelp`).
 
 Prompt guidance is not enough for safety-critical rules. Pair it with deterministic permissions/state validation where possible.
 
@@ -376,7 +376,7 @@ When behavior changes, update the focused doc in the same change:
 
 | Behavior | Document |
 | --- | --- |
-| CLI | `CLI.md` |
+| CLI | `CLI.md`; also `.agents/skills/praector/references/cli.md` (from `internal/praector/help.go` `commandHelp`; enforced by `TestSkillCLICommandHelpCoversCommandHelp`) |
 | profile roles/prompts | `PROFILES.md` |
 | Envelope/delegation/result | `AGENT_PROTOCOL.md` |
 | Git/worktrees/integration/acceptance | `WORKSPACES.md` |
