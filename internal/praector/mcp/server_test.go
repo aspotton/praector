@@ -50,7 +50,15 @@ func newTestServer() *Server {
 func post(t *testing.T, srv *httptest.Server, msg map[string]any) map[string]any {
 	t.Helper()
 	body, _ := json.Marshal(msg)
-	resp, err := http.Post(srv.URL+EndpointPath, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+EndpointPath, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// Post-initialize requests must name the protocol revision; Praector does not
+	// implement pre-2025-06-18 clients and rejects a missing header.
+	req.Header.Set(ProtocolVersionHeader, ProtocolVersion)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +134,12 @@ func TestMCPNotificationReturnsNoBody(t *testing.T) {
 	ts := httptest.NewServer(newTestServer().Handler())
 	defer ts.Close()
 	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
-	resp, err := http.Post(ts.URL+EndpointPath, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, ts.URL+EndpointPath, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(ProtocolVersionHeader, ProtocolVersion)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -95,7 +95,12 @@ func TestMCPRoundTripOverLoopback(t *testing.T) {
 
 	call := func(payload map[string]any) map[string]any {
 		body, _ := json.Marshal(payload)
-		resp, err := http.Post(base+mcpEndpoint(), "application/json", bytes.NewReader(body))
+		req, err := http.NewRequest(http.MethodPost, base+mcpEndpoint(), bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("MCP-Protocol-Version", "2025-06-18")
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -181,7 +186,12 @@ func TestMCPPrivilegedToolsUnavailableWhileDisabled(t *testing.T) {
 	defer srv.Close()
 	call := func(payload map[string]any) map[string]any {
 		body, _ := json.Marshal(payload)
-		resp, err := http.Post("http://"+ln.Addr().String()+mcpEndpoint(), "application/json", bytes.NewReader(body))
+		req, err := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+mcpEndpoint(), bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("MCP-Protocol-Version", "2025-06-18")
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}

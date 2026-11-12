@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -71,6 +72,7 @@ type mcpSurfaceEntry struct {
 	// resource surface (opGroup / opLaunchOnly keys)
 	resourceURI  string
 	resourceName string
+	resourceMIME string // empty => text/plain (CLI/help-text resources)
 	read         resourceFunc
 }
 
@@ -78,7 +80,7 @@ type mcpSurfaceEntry struct {
 // call exactly one typed Service op each and never launch a process.
 var mcpSurface = map[string]mcpSurfaceEntry{
 	// --- top-level commands ---
-	"init": {toolName: "praector_init", privileged: true, desc: "Register the requested target repository as a Praector project. Requires an explicit root_path (never operates on the daemon cwd); privileged project registration.",
+	"init": {toolName: "praector_init", privileged: true, desc: "Perform real project registration for the requested target repository (creates the marker and Dolt registration; filesystem changes). Requires an explicit absolute root_path and never operates on the daemon cwd; privileged.",
 		schema: objectSchema(map[string]any{"root_path": stringProp, "name": stringProp, "base_branch": stringProp, "opencode": stringProp}, "root_path"),
 		call: func(s *Service, raw json.RawMessage) (string, error) {
 			var a struct {
@@ -93,6 +95,12 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 			if strings.TrimSpace(a.RootPath) == "" {
 				return "", fmt.Errorf("root_path is required")
 			}
+			// MCP has no safe implicit cwd: the target must be an absolute path so
+			// its interpretation can never depend on the daemon process working
+			// directory (".", "..", or a bare repository name are refused).
+			if !filepath.IsAbs(a.RootPath) {
+				return "", fmt.Errorf("root_path must be an absolute path (got %q); MCP init never resolves a relative path against the daemon working directory", a.RootPath)
+			}
 			// Clone the Service so Init's internal store re-registration never
 			// mutates the daemon's shared store connection.
 			out, e := (&Service{store: s.store, cfg: s.cfg}).Init(context.Background(), InitInput{Root: a.RootPath, Name: a.Name, BaseBranch: a.BaseBranch, OpenCode: a.OpenCode})
@@ -101,8 +109,8 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 			}
 			return fmt.Sprintf("Initialized project %s (%s) base=%s opencode=%s marker=%s", out.Name, out.ProjectID, out.BaseBranch, out.OpenCodeCommand, out.Marker), nil
 		}},
-	"run": {toolName: "praector_run", desc: "Enqueue a new collection with its coordinator task (the running daemon executes it). Does not run inline.",
-		schema: objectSchema(map[string]any{"objective": stringProp, "title": stringProp, "project": stringProp}, "objective"),
+	"run": {toolName: "praector_run", desc: "Enqueue a new collection with its coordinator task against an explicit project (the running daemon executes it). Does not run inline.",
+		schema: objectSchema(map[string]any{"objective": stringProp, "title": stringProp, "project": stringProp}, "objective", "project"),
 		call: func(s *Service, raw json.RawMessage) (string, error) {
 			var a struct{ Objective, Title, Project string }
 			if err := bindArgs(raw, &a); err != nil {
@@ -111,17 +119,23 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 			if a.Objective == "" {
 				return "", fmt.Errorf("objective is required")
 			}
+			if err := mcpRequireProjectContext(a.Project); err != nil {
+				return "", err
+			}
 			out, e := s.Run(context.Background(), RunInput{Objective: a.Objective, Title: a.Title, ProjectID: a.Project})
 			if e != nil {
 				return "", e
 			}
 			return fmt.Sprintf("Queued collection %s (coordinator %s). The running daemon executes pending work.", S(out.Collection, "id"), S(out.Coordinator, "id")), nil
 		}},
-	"status": {toolName: "praector_status", desc: "Show project, collection, or task status.",
+	"status": {toolName: "praector_status", desc: "Show project, collection, or task status for an explicit project/collection/task identifier.",
 		schema: objectSchema(map[string]any{"target": stringProp, "project": stringProp}),
 		call: func(s *Service, raw json.RawMessage) (string, error) {
 			var a struct{ Target, Project string }
 			if err := bindArgs(raw, &a); err != nil {
+				return "", err
+			}
+			if err := mcpRequireProjectContext(a.Project, a.Target); err != nil {
 				return "", err
 			}
 			out, e := s.Status(context.Background(), StatusInput{Target: a.Target, ProjectID: a.Project})
@@ -130,11 +144,14 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 			}
 			return MarshalPretty(out), nil
 		}},
-	"graph": {toolName: "praector_graph", desc: "Show the current durable task graph.",
+	"graph": {toolName: "praector_graph", desc: "Show the current durable task graph for an explicit collection or project.",
 		schema: objectSchema(map[string]any{"collection": stringProp, "project": stringProp}),
 		call: func(s *Service, raw json.RawMessage) (string, error) {
 			var a struct{ Collection, Project string }
 			if err := bindArgs(raw, &a); err != nil {
+				return "", err
+			}
+			if err := mcpRequireProjectContext(a.Project, a.Collection); err != nil {
 				return "", err
 			}
 			out, e := s.Graph(context.Background(), GraphInput{Collection: a.Collection, ProjectID: a.Project})
@@ -144,10 +161,17 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 			return MarshalPretty(out), nil
 		}},
 	"daemon": {resourceURI: "praector://help/daemon", resourceName: "daemon (launch-only)", read: helpResource("daemon")},
-	"doctor": {toolName: "praector_doctor", desc: "Validate local dependencies and project registration.",
-		schema: objectSchema(map[string]any{}),
-		call: func(s *Service, _ json.RawMessage) (string, error) {
-			out, e := s.Doctor(context.Background(), DoctorInput{})
+	"doctor": {toolName: "praector_doctor", desc: "Validate local dependencies and project registration for an explicit project (never the daemon cwd).",
+		schema: objectSchema(map[string]any{"project": stringProp}),
+		call: func(s *Service, raw json.RawMessage) (string, error) {
+			var a struct{ Project string }
+			if err := bindArgs(raw, &a); err != nil {
+				return "", err
+			}
+			if err := mcpRequireProjectContext(a.Project); err != nil {
+				return "", err
+			}
+			out, e := s.Doctor(context.Background(), DoctorInput{ProjectID: a.Project})
 			if e != nil {
 				return "", e
 			}
@@ -256,7 +280,7 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 		}},
 
 	// --- profile ---
-	"profile": {resourceURI: "praector://profiles", resourceName: "Built-in profiles", read: func(s *Service) (string, error) {
+	"profile": {resourceURI: "praector://profiles", resourceName: "Built-in profiles", resourceMIME: "application/json", read: func(s *Service) (string, error) {
 		out, e := s.ProfileList(context.Background(), ProfileListInput{})
 		if e != nil {
 			return "", e
@@ -287,7 +311,7 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 		}},
 
 	// --- project ---
-	"project": {resourceURI: "praector://projects", resourceName: "Registered projects", read: func(s *Service) (string, error) {
+	"project": {resourceURI: "praector://projects", resourceName: "Registered projects", resourceMIME: "application/json", read: func(s *Service) (string, error) {
 		out, e := s.ProjectList(context.Background(), ProjectListInput{})
 		if e != nil {
 			return "", e
@@ -303,11 +327,14 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 			}
 			return MarshalPretty(out.Projects), nil
 		}},
-	"project show": {toolName: "praector_project_show", desc: "Show a registered project.",
-		schema: objectSchema(map[string]any{"project": stringProp}),
+	"project show": {toolName: "praector_project_show", desc: "Show a registered project by explicit project identifier.",
+		schema: objectSchema(map[string]any{"project": stringProp}, "project"),
 		call: func(s *Service, raw json.RawMessage) (string, error) {
 			var a struct{ Project string }
 			if err := bindArgs(raw, &a); err != nil {
+				return "", err
+			}
+			if err := mcpRequireProjectContext(a.Project); err != nil {
 				return "", err
 			}
 			out, e := s.ProjectShow(context.Background(), ProjectShowInput{ProjectID: a.Project})
@@ -335,11 +362,14 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 			}
 			return MarshalPretty(out.Task), nil
 		}},
-	"task list": {toolName: "praector_task_list", desc: "List tasks in a collection with dependencies.",
+	"task list": {toolName: "praector_task_list", desc: "List tasks in an explicit collection or project with dependencies.",
 		schema: objectSchema(map[string]any{"collection": stringProp, "project": stringProp}),
 		call: func(s *Service, raw json.RawMessage) (string, error) {
 			var a struct{ Collection, Project string }
 			if err := bindArgs(raw, &a); err != nil {
+				return "", err
+			}
+			if err := mcpRequireProjectContext(a.Project, a.Collection); err != nil {
 				return "", err
 			}
 			out, e := s.TaskList(context.Background(), TaskListInput{Collection: a.Collection, ProjectID: a.Project})
@@ -501,17 +531,23 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 			if err := bindArgs(raw, &a); err != nil {
 				return "", err
 			}
+			if err := mcpRequireProjectContext(a.Project, a.Collection, a.Task); err != nil {
+				return "", err
+			}
 			out, e := s.MemoryAdd(context.Background(), MemoryAddInput{Text: a.Text, ProjectID: a.Project, CollectionID: a.Collection, TaskID: a.Task, Scope: a.Scope, State: a.State, Kind: a.Kind})
 			if e != nil {
 				return "", e
 			}
 			return fmt.Sprintf("Added memory %s", S(out.Memory, "id")), nil
 		}},
-	"memory list": {toolName: "praector_memory_list", desc: "List durable memory.",
-		schema: objectSchema(map[string]any{"project": stringProp, "collection": stringProp, "state": stringProp}),
+	"memory list": {toolName: "praector_memory_list", desc: "List durable memory for an explicit project.",
+		schema: objectSchema(map[string]any{"project": stringProp, "collection": stringProp, "state": stringProp}, "project"),
 		call: func(s *Service, raw json.RawMessage) (string, error) {
 			var a struct{ Project, Collection, State string }
 			if err := bindArgs(raw, &a); err != nil {
+				return "", err
+			}
+			if err := mcpRequireProjectContext(a.Project); err != nil {
 				return "", err
 			}
 			out, e := s.MemoryList(context.Background(), MemoryListInput{ProjectID: a.Project, CollectionID: a.Collection, State: a.State})
@@ -528,6 +564,9 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 		call: func(s *Service, raw json.RawMessage) (string, error) {
 			var a struct{ Statement, Rationale, Project, Collection, Task string }
 			if err := bindArgs(raw, &a); err != nil {
+				return "", err
+			}
+			if err := mcpRequireProjectContext(a.Project, a.Task); err != nil {
 				return "", err
 			}
 			out, e := s.DecisionAdd(context.Background(), DecisionAddInput{Statement: a.Statement, Rationale: a.Rationale, ProjectID: a.Project, CollectionID: a.Collection, TaskID: a.Task})
@@ -642,9 +681,19 @@ func (b *mcpBridge) ListResources() []mcp.Resource {
 			continue
 		}
 		seen[e.resourceURI] = true
-		out = append(out, mcp.Resource{URI: e.resourceURI, Name: e.resourceName, Description: strings.TrimSpace(firstLine(commandHelp[key])), MIMEType: "application/json"})
+		out = append(out, mcp.Resource{URI: e.resourceURI, Name: e.resourceName, Description: strings.TrimSpace(firstLine(commandHelp[key])), MIMEType: resourceMIMEType(e)})
 	}
 	return out
+}
+
+// resourceMIMEType returns the accurate content type for a resource entry: JSON-
+// backed resources (the profile and project listings) advertise application/json,
+// while CLI/help-text resources produced by helpResource advertise text/plain.
+func resourceMIMEType(e mcpSurfaceEntry) string {
+	if e.resourceMIME != "" {
+		return e.resourceMIME
+	}
+	return "text/plain"
 }
 
 // ReadResource implements mcp.ResourceProvider.
@@ -661,7 +710,7 @@ func (b *mcpBridge) ReadResource(uri string) ([]mcp.ResourceContents, error) {
 	if err != nil {
 		return nil, err
 	}
-	return []mcp.ResourceContents{{URI: uri, MIMEType: "application/json", Text: text}}, nil
+	return []mcp.ResourceContents{{URI: uri, MIMEType: resourceMIMEType(e), Text: text}}, nil
 }
 
 // mcpToolToCommand reverse-maps a tool name to its commandHelp key by scanning
@@ -710,6 +759,21 @@ func startMCPServer(svc *Service) (*http.Server, error) {
 		return nil, err
 	}
 	return srv, nil
+}
+
+// mcpRequireProjectContext enforces the MCP no-daemon-cwd rule: a tool whose
+// Service op would otherwise resolve a project through projectFromContext (which
+// falls back to the daemon process working directory) must be handed an explicit
+// durable identifier by the caller — a project id (PRJ-*), or a collection/task id
+// (COL-*/T-*) it can resolve. It never inherits the daemon cwd. This gate lives
+// only in the MCP bridge, so CLI cwd convenience is unchanged.
+func mcpRequireProjectContext(vals ...string) error {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return nil
+		}
+	}
+	return fmt.Errorf("this MCP operation requires an explicit project identifier (PRJ-*) or a durable collection/task id (COL-*/T-*); it never falls back to the daemon working directory")
 }
 
 // bindArgs decodes tool arguments, tolerating an empty body and unknown fields.
