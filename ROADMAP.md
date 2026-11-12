@@ -74,9 +74,10 @@ commandHelp-driven so every command maps to exactly one MCP tool or resource —
 command/surface coverage parity (the surfaces cannot drift in coverage), not
 unrestricted behavioral parity. Read-only tools and pass-through queue writes are
 always exposed, and privileged write tools (explicit-root project
-`init`/registration plus `collection pr`/`accept`/`cleanup`, which only run
-the durable validation, register the requested target, or return the plan and
-never themselves push, merge, or finalize acceptance) sit behind a separate,
+`init`/registration, `collection pr`/`accept` (which only run the durable
+validation or return the plan), and `collection cleanup` (which performs real
+worktree/branch removal) — none of which themselves push, merge, or finalize
+acceptance into the base branch) sit behind a separate,
 default-off `privileged` opt-in. The remaining work below (remote transport +
 auth, richer escalation integration) stays on the roadmap.
 

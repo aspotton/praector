@@ -89,14 +89,23 @@ func (s *Server) serveStreamable(w http.ResponseWriter, r *http.Request) {
 // Host/local-authority must be loopback, and when a browser Origin header is
 // present it must be an http/https origin whose host is loopback and whose port
 // matches the request authority (fail closed). A request with no Origin (a
-// non-browser client) is accepted on the Host check alone.
+// non-browser client) is accepted on the Host check alone. A literal "null" or
+// otherwise-opaque/unparsable Origin names no loopback authority to validate and
+// is therefore refused, exactly like a foreign Origin.
 func requestAuthorized(r *http.Request) bool {
 	if !loopbackAuthority(r.Host) {
 		return false
 	}
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" || origin == "null" {
+	if origin == "" {
 		return true
+	}
+	// An opaque "null" origin (file:// pages, sandboxed/unique-origin contexts,
+	// or a client that sends the literal string "null") carries no host to bind
+	// against the loopback authority; per the 2025-06-18 Transports security
+	// guidance it is rejected before dispatch rather than treated as absent.
+	if origin == "null" {
+		return false
 	}
 	u, err := url.Parse(origin)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {

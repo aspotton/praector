@@ -579,6 +579,28 @@ func (s *Store) GetCollection(id string) (Row, error) {
 	}
 	return rows[0], nil
 }
+
+// ProjectForCollection resolves the project that OWNS a collection directly from
+// the collection's stored project_id (the same `SELECT project_id FROM
+// collections WHERE id=?` pattern used elsewhere in the store). It fails closed:
+// an unknown collection or a collection that references no resolvable project is
+// an error rather than an empty result, so a caller that was handed only a COL-*
+// id can resolve its owning project without ever falling back to an ambient
+// process working directory.
+func (s *Store) ProjectForCollection(collectionID string) (Row, error) {
+	rows, err := s.Query("SELECT project_id FROM collections WHERE id=" + SQLLiteral(collectionID) + " LIMIT 1")
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("collection not found: %s", collectionID)
+	}
+	projectID := S(rows[0], "project_id")
+	if projectID == "" {
+		return nil, fmt.Errorf("collection %s has no owning project", collectionID)
+	}
+	return s.GetProject(projectID)
+}
 func (s *Store) ListCollections(projectID string) (Rows, error) {
 	where := ""
 	if projectID != "" {

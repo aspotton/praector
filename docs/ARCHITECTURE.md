@@ -569,24 +569,32 @@ The design leaves room for later additions without making them current dependenc
   launch-only command) through the shared `serviceOps` registry, giving
   **command/surface coverage parity** (the surfaces cannot drift) rather than a
   claim of unrestricted behavioral parity. Read-only commands and pass-through
-  queue writes reuse the identical gated `Store`/workspace methods; privileged
-  write tools (`collection pr`/`accept`/`cleanup`, which only run the durable
-  acceptance/PR validation and never push, merge, or implicitly accept, plus
-   explicit-root project `init`/registration) sit
-   behind a separate, default-off `privileged` opt-in
-   (decisions DEC-1580dff0e0 / DEC-9997d2394f / DEC-28fcd38435 / DEC-aacb7bfc23).
-   The listener advertises only the single MCP protocol revision it implements
-   and **refuses** any other requested revision (never echoing an unsupported
-   one), requires a matching `MCP-Protocol-Version` header on post-`initialize`
-   requests (HTTP 400 otherwise), and — because it is loopback-only and
-   unauthenticated — validates each request's Host/Origin as a loopback authority
-   before dispatch (HTTP 403 on a foreign authority), as DNS-rebinding defense in
-   depth on top of the socket-bind gate. MCP operations carry no implicit daemon
-   cwd (a tool inferring a project requires an explicit `PRJ-*`/`COL-*`/`T-*`
-   identifier), `init` requires an absolute `root_path`, and resources advertise
-   accurate content types (`application/json` for JSON listings, `text/plain` for
-   CLI/help text); an independent external conformance oracle (`scripts/
-   mcp_conformance.py`) verifies the contract against a live loopback listener;
+   queue writes reuse the identical gated `Store`/workspace methods; privileged
+   write tools (explicit-root project `init`/registration plus the
+   collection-finalizing `collection pr`/`accept`/`cleanup`) sit
+    behind a separate, default-off `privileged` opt-in
+    (decisions DEC-1580dff0e0 / DEC-9997d2394f / DEC-28fcd38435 / DEC-aacb7bfc23).
+    `pr`/`accept` only run the durable acceptance/PR validation and return the plan
+    and never push, merge, or implicitly accept, while `cleanup` performs real
+    worktree/branch removal and `init` performs real project registration.
+    The listener advertises only the single MCP protocol revision it implements
+    and meets a well-formed request for any other revision with a legacy
+    **counter-offer** — a successful result advertising the implemented revision,
+    never echoing an unsupported one (Invalid-params is reserved for a malformed
+    version), requires a matching `MCP-Protocol-Version` header on
+    post-`initialize` requests (HTTP 400 otherwise), and — because it is
+    loopback-only and unauthenticated — validates each request's Host/Origin as a
+    loopback authority before dispatch (HTTP 403 on a foreign, literal `null`, or
+    otherwise-opaque Origin), as DNS-rebinding defense in depth on top of the
+    socket-bind gate. MCP operations carry no implicit daemon cwd (a tool
+    inferring a project requires an explicit `PRJ-*`/`COL-*`/`T-*` identifier, and
+    a collection-only context resolves its owning project via a fail-closed
+    store-backed resolver), `init` requires an absolute `root_path`, and resources
+    advertise accurate content types (`application/json` for JSON listings,
+    `text/plain` for CLI/help text); the authoritative independent conformance
+    oracle is an official MCP client (Inspector CLI / Tier-1 SDK), with the
+    Praector-owned black-box probe `scripts/mcp_conformance.py` as an additional
+    non-authoritative check against a live loopback listener;
 
 - **durable human/executive escalation** above Projects/Collections, with blocked work waiting on recorded decisions rather than live session continuity;
 - **additional harnesses** through the native harness boundary;

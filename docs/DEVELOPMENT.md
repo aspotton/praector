@@ -113,24 +113,32 @@ readable resource for a command namespace or the launch-only `daemon` command â€
 giving command/surface coverage parity (the two surfaces cannot drift, "now and
 always") rather than a claim of unrestricted behavioral parity. Read-only commands and
 pass-through queue writes reuse the identical gated `Store`/workspace methods;
-privileged write tools (`collection pr`/`accept`/`cleanup`,
-which only run the durable validation and return the plan, never push/merge/
-accept, plus explicit-root project `init`/registration) are gated behind a
-separate default-off `privileged` opt-in.
+privileged write tools (explicit-root project `init`/registration, plus the
+collection-finalizing `collection pr`/`accept`/`cleanup`) are gated behind a
+separate default-off `privileged` opt-in. `pr`/`accept` only run the durable
+validation and return the resulting plan (never push/merge/accept), while
+`cleanup` performs real worktree/branch removal and `init` performs real project
+registration/filesystem changes.
 
 Protocol honesty and local security live at deterministic seams: `mcp/server.go`
-advertises only the implemented protocol revision and returns a JSON-RPC
-Invalid-params error for any other requested `initialize` version (never echoes
-an unsupported one); `mcp/transport.go` requires a matching
-`MCP-Protocol-Version` header on post-`initialize` requests and validates the
-request Host/Origin as a loopback authority before dispatch (HTTP 400 / 403
-respectively), layered on the unchanged `IsLoopbackAddr` socket-bind gate. The
+advertises only the implemented protocol revision and answers a well-formed
+`initialize` for any other revision with a legacy counter-offer â€” a successful
+result advertising the implemented revision, never echoing the client's request
+(Invalid-params is reserved for a malformed/non-string `protocolVersion`);
+`mcp/transport.go` requires a matching `MCP-Protocol-Version` header on
+post-`initialize` requests and validates the request Host/Origin as a loopback
+authority before dispatch (HTTP 400 / 403 respectively), rejecting a foreign,
+literal `null`, or otherwise-opaque Origin; a collection-only context resolves its
+owning project through a fail-closed store-backed resolver rather than the daemon
+cwd, layered on the unchanged `IsLoopbackAddr` socket-bind gate. The
 bridge adds no daemon-cwd fallback (an operation inferring a project requires an
 explicit `PRJ-*`/`COL-*`/`T-*` id), `init` requires an absolute `root_path`, and
 resources advertise accurate content types (`application/json` for JSON listings,
-`text/plain` for CLI/help text). An independent external conformance oracle
-(`scripts/mcp_conformance.py`) exercises the live loopback listener from an
-external client.
+`text/plain` for CLI/help text). The authoritative independent conformance oracle
+is an official MCP client (the Inspector CLI via
+`TestMCPOfficialClientInteroperability`, or a Tier-1 SDK); the Praector-owned
+black-box probe `scripts/mcp_conformance.py` exercises the same live loopback
+listener from an external client but is not itself authoritative conformance.
 
 Good place for:
 

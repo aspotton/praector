@@ -540,14 +540,14 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 			}
 			return fmt.Sprintf("Added memory %s", S(out.Memory, "id")), nil
 		}},
-	"memory list": {toolName: "praector_memory_list", desc: "List durable memory for an explicit project.",
+	"memory list": {toolName: "praector_memory_list", desc: "List durable memory for an explicit project or collection (a collection id resolves its owning project; it never inherits the daemon cwd).",
 		schema: objectSchema(map[string]any{"project": stringProp, "collection": stringProp, "state": stringProp}, "project"),
 		call: func(s *Service, raw json.RawMessage) (string, error) {
 			var a struct{ Project, Collection, State string }
 			if err := bindArgs(raw, &a); err != nil {
 				return "", err
 			}
-			if err := mcpRequireProjectContext(a.Project); err != nil {
+			if err := mcpRequireProjectContext(a.Project, a.Collection); err != nil {
 				return "", err
 			}
 			out, e := s.MemoryList(context.Background(), MemoryListInput{ProjectID: a.Project, CollectionID: a.Collection, State: a.State})
@@ -566,7 +566,7 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 			if err := bindArgs(raw, &a); err != nil {
 				return "", err
 			}
-			if err := mcpRequireProjectContext(a.Project, a.Task); err != nil {
+			if err := mcpRequireProjectContext(a.Project, a.Collection, a.Task); err != nil {
 				return "", err
 			}
 			out, e := s.DecisionAdd(context.Background(), DecisionAddInput{Statement: a.Statement, Rationale: a.Rationale, ProjectID: a.Project, CollectionID: a.Collection, TaskID: a.Task})

@@ -257,8 +257,11 @@ operator-side actions.
 ### Protocol and local-security contract
 
 The listener implements a single MCP protocol revision and is honest about it: it
-advertises only the revision it actually implements, and an `initialize` request
-for any other revision is **refused** rather than echoed back as if supported. On
+advertises only the revision it actually implements, and meets an `initialize`
+request for any other well-formed revision with a legacy **counter-offer** — a
+successful result advertising the implemented revision — rather than echoing the
+client's request back as if it were supported (a JSON-RPC Invalid-params error is
+reserved only for a malformed or non-string version). On
 every request after `initialize`, the client must send an `MCP-Protocol-Version`
 HTTP header equal to that revision; a missing or unsupported header is rejected
 with HTTP 400 (Praector does not implement — and therefore does not assume — any
@@ -268,24 +271,36 @@ Because the listener is loopback-only and unauthenticated, it also defends
 against DNS-rebinding and related local-listener attacks: before any tool or
 resource handler runs, the request's Host/local-authority and (when present) its
 `Origin` are validated as a loopback authority (localhost, a `127.0.0.0/8`, or
-`[::1]` address, with a matching port); a foreign authority or Origin is rejected
-with HTTP 403. This is defense in depth on top of the authoritative socket-bind
-gate that already refuses to bind a non-loopback address.
+`[::1]` address, with a matching port); a foreign authority or Origin — or a
+literal `null` / otherwise-opaque Origin that names no host to validate — is
+rejected with HTTP 403. A request with no `Origin` (a non-browser client) is
+accepted on the Host check alone. This is defense in depth on top of the
+authoritative socket-bind gate that already refuses to bind a non-loopback
+address.
 
 MCP operations carry **no implicit daemon cwd**. Any tool whose domain operation
 would otherwise infer a project from the working directory instead requires an
 explicit `PRJ-*` project identifier or a resolvable `COL-*`/`T-*` durable id
 (`praector_run` requires `project`; `status`, `graph`, `doctor`, `task list`,
-`project show`, `memory add`/`list`, and `decision add` follow the same rule). The
+`project show`, `memory add`/`list`, and `decision add` follow the same rule).
+When only a `COL-*` id is supplied for a project-scoped operation such as `memory
+list`/`add` or `decision add`, its owning project is resolved from the
+collection's stored reference through a deterministic, fail-closed resolver — an
+unknown or project-less collection is refused rather than silently inheriting the
+daemon working directory. The
 CLI keeps its cwd-based project discovery unchanged.
 
 Resources advertise an accurate content type: JSON-backed resources (the profile
 and project listings) advertise `application/json`, while CLI/help-text resources
-advertise `text/plain`. An independent external conformance oracle
-(`scripts/mcp_conformance.py`, run against a live loopback listener by
-`TestMCPExternalConformanceOracle`) verifies negotiation, the header/Origin
-contracts, `tools/list`, `resources/list`/`read`, a safe read call, and a safe
-durable queue-write, independently of the in-process protocol tests.
+advertise `text/plain`. The authoritative independent conformance check is an
+official MCP client — the Inspector CLI (driven by
+`TestMCPOfficialClientInteroperability` when `PRAECTOR_MCP_INSPECTOR` is set) or a
+Tier-1 SDK. In addition, the Praector-owned black-box probe
+`scripts/mcp_conformance.py` (run against a live loopback listener by
+`TestMCPExternalConformanceOracle`) exercises the same contract — negotiation, the
+header/Origin contracts, `tools/list`, `resources/list`/`read`, a safe read call,
+and a safe durable queue-write — independently of the in-process protocol tests,
+though this probe is not itself authoritative conformance.
 
 ## Observe work
 
