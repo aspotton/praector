@@ -2,6 +2,7 @@ package praector
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/user"
@@ -86,6 +87,7 @@ var serviceOps = map[string]serviceOp{
 	"daemon":                {name: "daemon-launch", kind: opLaunchOnly},
 	"doctor":                {name: "Doctor", kind: opDomain, call: (*Service).Doctor},
 	"logs":                  {name: "Logs", kind: opDomain, call: (*Service).Logs},
+	"events":                {name: "Events", kind: opDomain, call: (*Service).Events},
 	"collection":            {name: "collection", kind: opGroup},
 	"collection show":       {name: "CollectionShow", kind: opDomain, call: (*Service).CollectionShow},
 	"collection revise":     {name: "CollectionRevise", kind: opDomain, call: (*Service).CollectionRevise},
@@ -456,6 +458,105 @@ func (s *Service) Logs(ctx context.Context, in LogsInput) (LogsOutput, error) {
 func (s *Service) taskLog(t Row) TaskLog {
 	rows, _ := s.store.Query("SELECT * FROM attempts WHERE task_id=" + SQLLiteral(S(t, "id")) + " ORDER BY attempt_no")
 	return TaskLog{ID: S(t, "id"), Status: S(t, "status"), Profile: S(t, "profile"), Title: S(t, "title"), Attempts: rows}
+}
+
+// ---------------------------------------------------------------------------
+// Events op
+// ---------------------------------------------------------------------------
+
+// EventsInput is the input for `praector events [TARGET]`. Target reuses the
+// COL-*/T-*/PRJ-* inference the other read commands use; the flags override it
+// where set. Since is an opaque, exclusive (created_at,id) cursor previously
+// emitted by this command. A non-positive Limit uses DefaultEventLimit so a
+// project-only scan (which has no project_id index) is always bounded.
+type EventsInput struct {
+	Target       string // COL-*/T-*/PRJ-* or empty
+	ProjectID    string // --project override when Target is not a resource id
+	CollectionID string // --collection filter
+	TaskID       string // reserved: task filter when not given as Target
+	Type         string // --type event_type filter
+	Since        string // --since opaque cursor
+	Limit        int    // --limit finite cap
+}
+
+// EventsOutput is the typed result for `praector events`. Rows are the durable
+// event rows in oldest-first created_at,id order; NextCursor is the exclusive
+// cursor to pass back as Since on the next call (empty when no rows are read).
+type EventsOutput struct {
+	Rows       Rows
+	NextCursor string
+}
+
+// Events reads the durable event log directly from the store. It performs store
+// reads only and launches no process, so it works with no daemon running. Scope
+// resolution mirrors the other read commands: an explicit --project/--collection
+// wins, a COL-*/T-*/PRJ-* Target infers the scope, and an otherwise-empty scope
+// falls back to the ambient project context.
+func (s *Service) Events(ctx context.Context, in EventsInput) (EventsOutput, error) {
+	pid, cid, tid := in.ProjectID, in.CollectionID, in.TaskID
+	if t := strings.TrimSpace(in.Target); t != "" {
+		switch {
+		case strings.HasPrefix(t, "COL-"):
+			if cid == "" {
+				cid = t
+			}
+		case strings.HasPrefix(t, "T-"):
+			if tid == "" {
+				tid = t
+			}
+		case strings.HasPrefix(t, "PRJ-"):
+			if pid == "" {
+				pid = t
+			}
+		}
+	}
+	// A scope with no collection/task filter still resolves the ambient project
+	// (CLI cwd convenience), matching MemoryList; the project scan is bounded by
+	// the finite Limit. A durable COL-*/T-* filter never inherits the daemon cwd.
+	if pid == "" && cid == "" && tid == "" {
+		pr, e := s.projectForScope("", "")
+		if e != nil {
+			return EventsOutput{}, e
+		}
+		pid = S(pr, "id")
+	}
+	sinceCreatedAt, sinceID, e := decodeEventCursor(in.Since)
+	if e != nil {
+		return EventsOutput{}, e
+	}
+	rows, e := s.store.ListEvents(pid, cid, tid, in.Type, sinceCreatedAt, sinceID, in.Limit)
+	if e != nil {
+		return EventsOutput{}, e
+	}
+	out := EventsOutput{Rows: rows}
+	if n := len(rows); n > 0 {
+		out.NextCursor = encodeEventCursor(S(rows[n-1], "created_at"), S(rows[n-1], "id"))
+	}
+	return out, nil
+}
+
+// encodeEventCursor packs a (created_at,id) pair into one opaque, URL-safe token
+// the caller passes back unchanged as --since. The unit separator keeps the split
+// unambiguous because neither field contains it.
+func encodeEventCursor(createdAt, id string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(createdAt + "\x1f" + id))
+}
+
+// decodeEventCursor reverses encodeEventCursor, mapping an empty token to no
+// filter and rejecting a malformed one rather than guessing a starting point.
+func decodeEventCursor(token string) (createdAt, id string, err error) {
+	if strings.TrimSpace(token) == "" {
+		return "", "", nil
+	}
+	raw, e := base64.RawURLEncoding.DecodeString(strings.TrimSpace(token))
+	if e != nil {
+		return "", "", fmt.Errorf("invalid --since cursor")
+	}
+	created, part, found := strings.Cut(string(raw), "\x1f")
+	if !found {
+		return "", "", fmt.Errorf("invalid --since cursor")
+	}
+	return created, part, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -2078,6 +2078,53 @@ func (s *Store) EventsForCollection(cid string, limit int) (Rows, error) {
 	return s.Query("SELECT * FROM events WHERE collection_id=" + SQLLiteral(cid) + " ORDER BY created_at DESC LIMIT " + strconv.Itoa(limit))
 }
 
+// DefaultEventLimit bounds a scope scan that has no collection/task index (for
+// example a project-only listing, which has no project_id index). A non-positive
+// limit falls back to this finite cap so a bare event read can never trigger an
+// unbounded scan.
+const DefaultEventLimit = 500
+
+// ListEvents reads the durable event log directly for the resolved scope. It is
+// read-only and needs no running daemon. Ordering is deterministic and
+// oldest-first: created_at then id. (created_at, id) form an EXCLUSIVE composite
+// cursor: only rows strictly after (sinceCreatedAt, sinceID) are returned, so the
+// caller can pass the previously emitted cursor back unchanged. Empty scope
+// arguments impose no filter on that column; limit bounds the scan and a
+// non-positive limit uses DefaultEventLimit. created_at DATETIME(6) is the
+// monotonic ordering key while EVT ids are random hex, hence the (created_at,id)
+// pair rather than the id alone.
+func (s *Store) ListEvents(pid, cid, tid, eventType, sinceCreatedAt, sinceID string, limit int) (Rows, error) {
+	if limit <= 0 {
+		limit = DefaultEventLimit
+	}
+	where := []string{}
+	if pid != "" {
+		where = append(where, "project_id="+SQLLiteral(pid))
+	}
+	if cid != "" {
+		where = append(where, "collection_id="+SQLLiteral(cid))
+	}
+	if tid != "" {
+		where = append(where, "task_id="+SQLLiteral(tid))
+	}
+	if eventType != "" {
+		where = append(where, "event_type="+SQLLiteral(eventType))
+	}
+	if sinceCreatedAt != "" {
+		if sinceID != "" {
+			where = append(where, "(created_at>"+SQLLiteral(sinceCreatedAt)+" OR (created_at="+SQLLiteral(sinceCreatedAt)+" AND id>"+SQLLiteral(sinceID)+"))")
+		} else {
+			where = append(where, "created_at>"+SQLLiteral(sinceCreatedAt))
+		}
+	}
+	q := "SELECT * FROM events"
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
+	}
+	q += " ORDER BY created_at, id LIMIT " + strconv.Itoa(limit)
+	return s.Query(q)
+}
+
 func (s *Store) RepairSupersededReviewLineage(cid string) (int, error) {
 	tasks, err := s.ListTasks(cid)
 	if err != nil {
