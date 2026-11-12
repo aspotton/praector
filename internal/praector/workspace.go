@@ -15,6 +15,16 @@ type GitWorkspace struct {
 	Git   string
 }
 
+// WorkspaceSnapshot captures the Git identity that a read-only attempt must
+// preserve. HeadReflog makes a checkout-away-and-back visible even when HEAD,
+// branch attachment, and status look unchanged again at attempt completion.
+type WorkspaceSnapshot struct {
+	Head       string
+	Branch     string
+	Status     string
+	HeadReflog string
+}
+
 func NewGitWorkspace(store *Store, cfg GlobalConfig) (*GitWorkspace, error) {
 	git, err := RequireBinary("git")
 	if err != nil {
@@ -48,6 +58,82 @@ func exists(path string) bool {
 
 func strptr(v string) *string { return &v }
 
+func (w *GitWorkspace) WorkspaceSnapshot(worktree string) (WorkspaceSnapshot, error) {
+	head, err := w.git(worktree, true, "rev-parse", "HEAD")
+	if err != nil {
+		return WorkspaceSnapshot{}, err
+	}
+	branch, err := w.git(worktree, false, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil {
+		return WorkspaceSnapshot{}, err
+	}
+	if branch.Code != 0 && branch.Code != 1 {
+		return WorkspaceSnapshot{}, fmt.Errorf("cannot resolve worktree branch in %s: %s", worktree, strings.TrimSpace(firstNonEmpty(branch.Stderr, branch.Stdout)))
+	}
+	status, err := w.git(worktree, true, "status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil {
+		return WorkspaceSnapshot{}, err
+	}
+	reflog, err := w.git(worktree, false, "reflog", "show", "--format=%H", "HEAD")
+	if err != nil {
+		return WorkspaceSnapshot{}, err
+	}
+	if reflog.Code != 0 {
+		return WorkspaceSnapshot{}, fmt.Errorf("cannot read worktree HEAD reflog in %s: %s", worktree, strings.TrimSpace(firstNonEmpty(reflog.Stderr, reflog.Stdout)))
+	}
+	return WorkspaceSnapshot{
+		Head:       strings.TrimSpace(head.Stdout),
+		Branch:     strings.TrimSpace(branch.Stdout),
+		Status:     strings.TrimRight(status.Stdout, "\r\n"),
+		HeadReflog: strings.TrimRight(reflog.Stdout, "\r\n"),
+	}, nil
+}
+
+func (w *GitWorkspace) validateAttachedBranch(worktree, expected, label string) (WorkspaceSnapshot, error) {
+	state, err := w.WorkspaceSnapshot(worktree)
+	if err != nil {
+		return WorkspaceSnapshot{}, err
+	}
+	if state.Branch != expected {
+		actual := state.Branch
+		if actual == "" {
+			actual = "detached HEAD"
+		}
+		return WorkspaceSnapshot{}, fmt.Errorf("%s must remain on Praector-assigned branch %s; found %s at %s", label, expected, actual, state.Head)
+	}
+	return state, nil
+}
+
+// ValidateReadOnlyWorkspace proves that a read-only attempt did not mutate
+// files, move HEAD, attach to a branch, or temporarily check out another commit.
+func (w *GitWorkspace) ValidateReadOnlyWorkspace(worktree string, baseline WorkspaceSnapshot) error {
+	current, err := w.WorkspaceSnapshot(worktree)
+	if err != nil {
+		return err
+	}
+	if current.Branch != baseline.Branch {
+		return fmt.Errorf("read-only worktree branch identity changed from %q to %q", baseline.Branch, current.Branch)
+	}
+	if current.Head != baseline.Head {
+		return fmt.Errorf("read-only worktree HEAD changed from %s to %s", baseline.Head, current.Head)
+	}
+	if current.Status != baseline.Status {
+		return fmt.Errorf("read-only worktree file status changed")
+	}
+	if current.HeadReflog != baseline.HeadReflog {
+		return fmt.Errorf("read-only worktree HEAD history changed; checkout, switch, reset, or commit operations are not allowed")
+	}
+	return nil
+}
+
+func (w *GitWorkspace) RestoreReadOnlyWorkspace(worktree string, baseline WorkspaceSnapshot) error {
+	if _, err := w.git(worktree, true, "checkout", "--detach", "--force", baseline.Head); err != nil {
+		return err
+	}
+	_, err := w.git(worktree, true, "clean", "-fd")
+	return err
+}
+
 func (w *GitWorkspace) EnsureCollection(project, collection Row) (string, error) {
 	repo := w.RepoRoot(project)
 	branch := S(collection, "integration_branch")
@@ -80,6 +166,9 @@ func (w *GitWorkspace) EnsureCollection(project, collection Row) (string, error)
 		if _, err := w.git(repo, true, "worktree", "add", path, branch); err != nil {
 			return "", err
 		}
+	}
+	if _, err := w.validateAttachedBranch(path, branch, "Collection integration worktree"); err != nil {
+		return "", err
 	}
 	if err := w.Store.UpdateCollectionWorkspace(S(collection, "id"), path); err != nil {
 		return "", err
@@ -118,7 +207,10 @@ func (w *GitWorkspace) PrepareTask(project, collection, task Row) (string, error
 				return "", err
 			}
 		} else {
-			if _, err := w.git(taskPath, true, "reset", "--hard", baseRef); err != nil {
+			// A prior read-only worker may have attached this worktree to an
+			// unrelated branch. Detach before resetting so recovery never moves
+			// or destroys that branch while restoring the assigned candidate.
+			if _, err := w.git(taskPath, true, "checkout", "--detach", "--force", baseRef); err != nil {
 				return "", err
 			}
 			if _, err := w.git(taskPath, true, "clean", "-fd"); err != nil {
@@ -130,6 +222,13 @@ func (w *GitWorkspace) PrepareTask(project, collection, task Row) (string, error
 			return "", err
 		}
 		head := strings.TrimSpace(h.Stdout)
+		state, err := w.WorkspaceSnapshot(taskPath)
+		if err != nil {
+			return "", err
+		}
+		if state.Branch != "" {
+			return "", fmt.Errorf("Read-only task %s must use detached HEAD; found branch %s", S(task, "id"), state.Branch)
+		}
 		var base *string
 		if S(task, "base_commit") != "" {
 			v := S(task, "base_commit")
@@ -161,11 +260,11 @@ func (w *GitWorkspace) PrepareTask(project, collection, task Row) (string, error
 			return "", err
 		}
 	}
-	h, err := w.git(taskPath, true, "rev-parse", "HEAD")
+	state, err := w.validateAttachedBranch(taskPath, branch, "Implementation task "+S(task, "id"))
 	if err != nil {
 		return "", err
 	}
-	head := strings.TrimSpace(h.Stdout)
+	head := state.Head
 	var base *string
 	if S(task, "base_commit") != "" {
 		v := S(task, "base_commit")
@@ -223,6 +322,13 @@ func (w *GitWorkspace) Checkpoint(task Row, attemptNo int, operation string) (st
 		p, err := w.git(path, true, "rev-parse", "HEAD")
 		return strings.TrimSpace(p.Stdout), err
 	}
+	branch := S(task, "branch_name")
+	if branch == "" {
+		return "", fmt.Errorf("Task %s has no assigned branch to checkpoint", S(task, "id"))
+	}
+	if _, err := w.validateAttachedBranch(path, branch, "Implementation task "+S(task, "id")); err != nil {
+		return "", err
+	}
 	dirty, err := w.IsDirty(path)
 	if err != nil {
 		return "", err
@@ -236,11 +342,11 @@ func (w *GitWorkspace) Checkpoint(task Row, attemptNo int, operation string) (st
 			return "", err
 		}
 	}
-	p, err := w.git(path, true, "rev-parse", "HEAD")
+	state, err := w.validateAttachedBranch(path, branch, "Implementation task "+S(task, "id"))
 	if err != nil {
 		return "", err
 	}
-	head := strings.TrimSpace(p.Stdout)
+	head := state.Head
 	if err := w.Store.SetTaskWorkspace(S(task, "id"), nil, nil, nil, strptr(head)); err != nil {
 		return "", err
 	}
@@ -252,7 +358,15 @@ func (w *GitWorkspace) RollbackReadOnlyChanges(task Row) error {
 	if path == "" || !exists(path) {
 		return nil
 	}
-	if _, err := w.git(path, true, "reset", "--hard", "HEAD"); err != nil {
+	head := S(task, "current_head")
+	if head == "" {
+		p, err := w.git(path, true, "rev-parse", "HEAD")
+		if err != nil {
+			return err
+		}
+		head = strings.TrimSpace(p.Stdout)
+	}
+	if _, err := w.git(path, true, "checkout", "--detach", "--force", head); err != nil {
 		return err
 	}
 	_, err := w.git(path, true, "clean", "-fd")
@@ -272,6 +386,29 @@ func (w *GitWorkspace) IntegrateTask(project, collection, task Row) (string, err
 	if branch == "" {
 		return "", fmt.Errorf("Task %s has no branch to integrate", S(task, "id"))
 	}
+	currentHead := S(task, "current_head")
+	if currentHead == "" {
+		return "", fmt.Errorf("Task %s has no checkpoint commit to integrate", S(task, "id"))
+	}
+	path := S(task, "worktree_path")
+	if path == "" || !exists(path) {
+		return "", fmt.Errorf("Task %s has no available worktree to validate before integration", S(task, "id"))
+	}
+	state, err := w.validateAttachedBranch(path, branch, "Implementation task "+S(task, "id"))
+	if err != nil {
+		return "", err
+	}
+	if state.Head != currentHead {
+		return "", fmt.Errorf("Task %s worktree HEAD %s does not match durable checkpoint %s", S(task, "id"), state.Head, currentHead)
+	}
+	repo := w.RepoRoot(project)
+	branchHead, err := w.git(repo, true, "rev-parse", "refs/heads/"+branch)
+	if err != nil {
+		return "", err
+	}
+	if got := strings.TrimSpace(branchHead.Stdout); got != currentHead {
+		return "", fmt.Errorf("Task %s assigned branch %s points to %s, not durable checkpoint %s", S(task, "id"), branch, got, currentHead)
+	}
 	target, label := "", ""
 	parentID := S(task, "parent_task_id")
 	if S(task, "workspace_mode") == "inherit" && parentID != "" {
@@ -281,6 +418,13 @@ func (w *GitWorkspace) IntegrateTask(project, collection, task Row) (string, err
 		}
 		if S(parent, "profile") == "implement" && S(parent, "worktree_path") != "" {
 			target, label = S(parent, "worktree_path"), parentID
+			parentBranch := S(parent, "branch_name")
+			if parentBranch == "" {
+				return "", fmt.Errorf("Parent implementation task %s has no assigned branch", parentID)
+			}
+			if _, err := w.validateAttachedBranch(target, parentBranch, "Parent implementation task "+parentID); err != nil {
+				return "", err
+			}
 		}
 	}
 	if target == "" {
@@ -291,8 +435,18 @@ func (w *GitWorkspace) IntegrateTask(project, collection, task Row) (string, err
 		}
 		label = S(collection, "id")
 	}
+	dirty, err := w.IsDirty(target)
+	if err != nil {
+		return "", err
+	}
+	if dirty {
+		return "", fmt.Errorf("Integration target %s is dirty; refusing to merge task %s", target, S(task, "id"))
+	}
 	message := taskGitCommitMessage(task, "integration", 0, "Integrate")
-	p, err := w.git(target, false, "-c", "user.name=praector", "-c", "user.email=praector@local", "merge", "--no-ff", branch, "-m", message)
+	// Merge the immutable checkpoint SHA after proving the assigned branch
+	// still names it. This closes the gap where a worker could switch to an
+	// ad-hoc branch while Praector merged a stale managed branch successfully.
+	p, err := w.git(target, false, "-c", "user.name=praector", "-c", "user.email=praector@local", "merge", "--no-ff", currentHead, "-m", message)
 	if err != nil || p.Code != 0 {
 		_, _ = w.git(target, false, "merge", "--abort")
 		detail := strings.TrimSpace(firstNonEmpty(p.Stderr, p.Stdout))
@@ -306,6 +460,13 @@ func (w *GitWorkspace) IntegrateTask(project, collection, task Row) (string, err
 		return "", err
 	}
 	head := strings.TrimSpace(h.Stdout)
+	contained, err := w.IsAncestor(target, currentHead, head)
+	if err != nil {
+		return "", err
+	}
+	if !contained {
+		return "", fmt.Errorf("Integration verification failed for %s: checkpoint %s is not reachable from target HEAD %s", S(task, "id"), currentHead, head)
+	}
 	if label != S(collection, "id") {
 		if err := w.Store.SetTaskWorkspace(label, nil, nil, nil, strptr(head)); err != nil {
 			return "", err

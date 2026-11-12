@@ -126,12 +126,14 @@ def test_read_only_profiles_get_workspace_hygiene_contract_but_implement_does_no
         assert "Treat **no net workspace mutation** as part of the task's completion contract" in prompt
         assert "git status --porcelain=v1 --untracked-files=all" in prompt
         assert "PYTHONDONTWRITEBYTECODE=1" in prompt
+        assert "assigned detached HEAD" in prompt
         assert "final worktree state matches the starting baseline" in prompt
         assert "Never discard pre-existing changes" in prompt
 
     implement = _envelope_for_profile("implement")
     assert "Treat **no net workspace mutation**" not in implement
     assert "write capability within its assigned implementation scope" in implement
+    assert "only Task branch you may mutate" in implement
 
 
 class ResearchConstraintStore(FakeStore):

@@ -67,9 +67,13 @@ def test_role_prompts_reinforce_global_rules_where_enforced():
     assert "Change-impact discipline" in implement
     assert "Durable documentation check" in implement
     assert "Lead with behavior, not code structure" in implement
+    assert "only Task branch you may mutate" in implement
+    assert "Praector owns Git branch/worktree lifecycle" in coordinator
     assert "locally correct" in critic
     assert "Change discipline" in plan_review
+    assert "Workspace coherence" in plan_review
     assert "meaningful impact surface" in review
+    assert "assigned detached HEAD is the integrated candidate" in review
 
 
 def test_profile_show_prints_effective_global_then_role_contract(capsys):

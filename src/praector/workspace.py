@@ -3,12 +3,23 @@ from __future__ import annotations
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .config import GlobalConfig, READ_ONLY_PROFILES
 from .db import DoltStore
 from .util import run
+
+
+@dataclass(frozen=True)
+class WorkspaceSnapshot:
+    """Git identity a read-only attempt must preserve exactly."""
+
+    head: str
+    branch: str
+    status: str
+    head_reflog: str
 
 
 class GitWorkspace:
@@ -21,6 +32,72 @@ class GitWorkspace:
 
     def repo_root(self, project: dict[str, Any]) -> Path:
         return Path(project["root_path"]).resolve()
+
+    def workspace_snapshot(self, worktree: Path) -> WorkspaceSnapshot:
+        branch_proc = self._git(
+            worktree, "symbolic-ref", "--quiet", "--short", "HEAD", check=False
+        )
+        if branch_proc.returncode not in {0, 1}:
+            raise RuntimeError(
+                f"Cannot resolve worktree branch in {worktree}: "
+                f"{branch_proc.stderr.strip() or branch_proc.stdout.strip()}"
+            )
+        reflog_proc = self._git(
+            worktree, "reflog", "show", "--format=%H", "HEAD", check=False
+        )
+        if reflog_proc.returncode != 0:
+            raise RuntimeError(
+                f"Cannot read worktree HEAD reflog in {worktree}: "
+                f"{reflog_proc.stderr.strip() or reflog_proc.stdout.strip()}"
+            )
+        return WorkspaceSnapshot(
+            head=self._git(worktree, "rev-parse", "HEAD").stdout.strip(),
+            branch=branch_proc.stdout.strip(),
+            status=self._git(
+                worktree, "status", "--porcelain=v1", "--untracked-files=all"
+            ).stdout.rstrip("\r\n"),
+            head_reflog=reflog_proc.stdout.rstrip("\r\n"),
+        )
+
+    def _validate_attached_branch(
+        self, worktree: Path, expected: str, label: str
+    ) -> WorkspaceSnapshot:
+        state = self.workspace_snapshot(worktree)
+        if state.branch != expected:
+            actual = state.branch or "detached HEAD"
+            raise RuntimeError(
+                f"{label} must remain on Praector-assigned branch {expected}; "
+                f"found {actual} at {state.head}"
+            )
+        return state
+
+    def validate_read_only_workspace(
+        self, worktree: Path, baseline: WorkspaceSnapshot
+    ) -> None:
+        """Reject file, HEAD, branch, and transient checkout mutations."""
+        current = self.workspace_snapshot(worktree)
+        if current.branch != baseline.branch:
+            raise RuntimeError(
+                f"Read-only worktree branch identity changed from "
+                f"{baseline.branch!r} to {current.branch!r}"
+            )
+        if current.head != baseline.head:
+            raise RuntimeError(
+                f"Read-only worktree HEAD changed from {baseline.head} to {current.head}"
+            )
+        if current.status != baseline.status:
+            raise RuntimeError("Read-only worktree file status changed")
+        if current.head_reflog != baseline.head_reflog:
+            raise RuntimeError(
+                "Read-only worktree HEAD history changed; checkout, switch, reset, "
+                "or commit operations are not allowed"
+            )
+
+    def restore_read_only_workspace(
+        self, worktree: Path, baseline: WorkspaceSnapshot
+    ) -> None:
+        self._git(worktree, "checkout", "--detach", "--force", baseline.head)
+        self._git(worktree, "clean", "-fd")
 
     def ensure_collection(self, project: dict[str, Any], collection: dict[str, Any]) -> Path:
         repo = self.repo_root(project)
@@ -39,6 +116,7 @@ class GitWorkspace:
                 raise RuntimeError(f"Collection worktree path is not empty: {path}")
             path.parent.mkdir(parents=True, exist_ok=True)
             self._git(repo, "worktree", "add", str(path), branch)
+        self._validate_attached_branch(path, branch, "Collection integration worktree")
         self.store.update_collection_workspace(collection["id"], str(path))
         return path
 
@@ -59,9 +137,18 @@ class GitWorkspace:
                 self._git(repo, "worktree", "add", "--detach", str(task_path), ref)
             else:
                 ref = task.get("base_commit") or (project["base_branch"] if task.get("workspace_mode") == "isolated" else collection["integration_branch"])
-                self._git(task_path, "reset", "--hard", ref)
+                # Detach before restoring the candidate. If a prior read-only
+                # worker attached this worktree to another branch, reset --hard
+                # would otherwise move and potentially destroy that branch.
+                self._git(task_path, "checkout", "--detach", "--force", ref)
                 self._git(task_path, "clean", "-fd")
             head = self._git(task_path, "rev-parse", "HEAD").stdout.strip()
+            state = self.workspace_snapshot(task_path)
+            if state.branch:
+                raise RuntimeError(
+                    f"Read-only task {task['id']} must use detached HEAD; "
+                    f"found branch {state.branch}"
+                )
             workspace_update = {"worktree_path": str(task_path), "current_head": head}
             if task.get("base_commit"):
                 workspace_update["base_commit"] = task["base_commit"]
@@ -78,7 +165,10 @@ class GitWorkspace:
                 self._git(repo, "worktree", "add", str(task_path), branch)
             else:
                 self._git(repo, "worktree", "add", "-b", branch, str(task_path), base_ref)
-        head = self._git(task_path, "rev-parse", "HEAD").stdout.strip()
+        state = self._validate_attached_branch(
+            task_path, branch, f"Implementation task {task['id']}"
+        )
+        head = state.head
         workspace_update = {
             "worktree_path": str(task_path),
             "branch_name": branch,
@@ -146,6 +236,12 @@ class GitWorkspace:
             return task.get("current_head")
         if task["profile"] in READ_ONLY_PROFILES:
             return self._git(worktree, "rev-parse", "HEAD").stdout.strip()
+        branch = task.get("branch_name")
+        if not branch:
+            raise RuntimeError(f"Task {task['id']} has no assigned branch to checkpoint")
+        self._validate_attached_branch(
+            worktree, branch, f"Implementation task {task['id']}"
+        )
         if self.is_dirty(worktree):
             self._git(worktree, "add", "-A")
             commit_message = message or self._task_git_commit_message(
@@ -155,7 +251,9 @@ class GitWorkspace:
                 worktree, "-c", "user.name=praector", "-c", "user.email=praector@local",
                 "commit", "-m", commit_message
             )
-        head = self._git(worktree, "rev-parse", "HEAD").stdout.strip()
+        head = self._validate_attached_branch(
+            worktree, branch, f"Implementation task {task['id']}"
+        ).head
         self.store.set_task_workspace(task["id"], current_head=head)
         return head
 
@@ -165,7 +263,10 @@ class GitWorkspace:
             return
         worktree = Path(path_value)
         if worktree.exists():
-            self._git(worktree, "reset", "--hard", "HEAD")
+            head = task.get("current_head") or self._git(
+                worktree, "rev-parse", "HEAD"
+            ).stdout.strip()
+            self._git(worktree, "checkout", "--detach", "--force", head)
             self._git(worktree, "clean", "-fd")
 
     def integrate_task(self, project: dict[str, Any], collection: dict[str, Any], task: dict[str, Any]) -> str:
@@ -175,6 +276,29 @@ class GitWorkspace:
         branch = task.get("branch_name")
         if not branch:
             raise RuntimeError(f"Task {task['id']} has no branch to integrate")
+        current_head = task.get("current_head")
+        if not current_head:
+            raise RuntimeError(f"Task {task['id']} has no checkpoint commit to integrate")
+        worktree_value = task.get("worktree_path")
+        if not worktree_value or not Path(worktree_value).exists():
+            raise RuntimeError(
+                f"Task {task['id']} has no available worktree to validate before integration"
+            )
+        task_state = self._validate_attached_branch(
+            Path(worktree_value), branch, f"Implementation task {task['id']}"
+        )
+        if task_state.head != current_head:
+            raise RuntimeError(
+                f"Task {task['id']} worktree HEAD {task_state.head} does not match "
+                f"durable checkpoint {current_head}"
+            )
+        repo = self.repo_root(project)
+        branch_head = self._git(repo, "rev-parse", f"refs/heads/{branch}").stdout.strip()
+        if branch_head != current_head:
+            raise RuntimeError(
+                f"Task {task['id']} assigned branch {branch} points to {branch_head}, "
+                f"not durable checkpoint {current_head}"
+            )
 
         # An inherited implementation is a contribution to its blocked parent,
         # not an independent collection-level change. Merge it back into the
@@ -187,6 +311,16 @@ class GitWorkspace:
             if parent.get("profile") == "implement" and parent.get("worktree_path"):
                 target_path = Path(parent["worktree_path"])
                 target_label = parent_id
+                parent_branch = parent.get("branch_name")
+                if not parent_branch:
+                    raise RuntimeError(
+                        f"Parent implementation task {parent_id} has no assigned branch"
+                    )
+                self._validate_attached_branch(
+                    target_path,
+                    parent_branch,
+                    f"Parent implementation task {parent_id}",
+                )
             else:
                 target_path = self.ensure_collection(project, collection)
                 target_label = collection["id"]
@@ -194,8 +328,13 @@ class GitWorkspace:
             target_path = self.ensure_collection(project, collection)
             target_label = collection["id"]
 
+        if self.is_dirty(target_path):
+            raise RuntimeError(
+                f"Integration target {target_path} is dirty; refusing to merge task {task['id']}"
+            )
+
         proc = self._git(
-            target_path, "-c", "user.name=praector", "-c", "user.email=praector@local", "merge", "--no-ff", branch,
+            target_path, "-c", "user.name=praector", "-c", "user.email=praector@local", "merge", "--no-ff", current_head,
             "-m", self._task_git_commit_message(
                 task, operation="integration", subject_prefix="Integrate"
             ),
@@ -205,6 +344,11 @@ class GitWorkspace:
             self._git(target_path, "merge", "--abort", check=False)
             raise RuntimeError(f"Integration conflict for {task['id']}: {proc.stderr.strip() or proc.stdout.strip()}")
         head = self._git(target_path, "rev-parse", "HEAD").stdout.strip()
+        if not self._is_ancestor(target_path, current_head, head):
+            raise RuntimeError(
+                f"Integration verification failed for {task['id']}: checkpoint "
+                f"{current_head} is not reachable from target HEAD {head}"
+            )
         if target_label != collection["id"]:
             self.store.set_task_workspace(target_label, current_head=head)
         return head

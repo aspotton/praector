@@ -20,6 +20,145 @@ func gitTest(t *testing.T, repo string, args ...string) string {
 	}
 	return strings.TrimSpace(r.Stdout)
 }
+
+func prepareWorkspaceTask(t *testing.T, profile string) (*Store, *GitWorkspace, Row, Row, Row, string, string) {
+	t.Helper()
+	repo := t.TempDir()
+	git, err := RequireBinary("git")
+	if err != nil {
+		t.Skip("git unavailable")
+	}
+	if _, err = Run(context.Background(), []string{git, "init", "-b", "main", repo}, "", nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, repo, "config", "user.email", "praector@test")
+	gitTest(t, repo, "config", "user.name", "Praector Test")
+	if err = os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, repo, "add", ".")
+	gitTest(t, repo, "commit", "-m", "base")
+	if err = os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\nsecond\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, repo, "add", ".")
+	gitTest(t, repo, "commit", "-m", "second base")
+	baseHead := gitTest(t, repo, "rev-parse", "HEAD")
+
+	store, cfg := newFakeStore(t)
+	project, err := store.RegisterProject(testProjectConfig(repo))
+	if err != nil {
+		t.Fatal(err)
+	}
+	collection, coordinator, err := store.CreateCollectionWithCoordinator(S(project, "id"), "Workspace invariant", "Exercise Git workspace invariants", "Plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, _, err := store.CreateTask(CreateTaskOptions{
+		ProjectID: S(project, "id"), CollectionID: S(collection, "id"), Profile: profile,
+		Title: "Workspace task", Objective: "Exercise workspace", Reason: "test",
+		ParentTaskID: S(coordinator, "id"), RequestedByTaskID: S(coordinator, "id"),
+		WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := NewGitWorkspace(store, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := workspace.PrepareTask(project, collection, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err = store.GetTask(S(task, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	collection, err = store.GetCollection(S(collection, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, workspace, project, collection, task, path, baseHead
+}
+
+func TestImplementationBranchEscapeFailsClosedBeforeIntegration(t *testing.T) {
+	store, workspace, project, collection, task, path, baseHead := prepareWorkspaceTask(t, "implement")
+	assigned := S(task, "branch_name")
+	gitTest(t, path, "checkout", "-b", "fix/escaped-worker-branch")
+	if err := os.WriteFile(filepath.Join(path, "feature.txt"), []byte("candidate\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, path, "add", ".")
+	gitTest(t, path, "commit", "-m", "candidate on escaped branch")
+	escapedHead := gitTest(t, path, "rev-parse", "HEAD")
+
+	if _, err := workspace.Checkpoint(task, 1, "attempt-checkpoint"); err == nil || !strings.Contains(err.Error(), "must remain on Praector-assigned branch") {
+		t.Fatalf("checkpoint must reject escaped branch, got %v", err)
+	}
+	if got := gitTest(t, S(project, "root_path"), "rev-parse", assigned); got != baseHead {
+		t.Fatalf("assigned branch moved despite rejected checkpoint: got %s want %s", got, baseHead)
+	}
+
+	// Reproduce the inconsistent durable row produced by the old implementation:
+	// current_head followed the worktree while branch_name stayed on the base.
+	if err := store.SetTaskWorkspace(S(task, "id"), nil, nil, nil, strptr(escapedHead)); err != nil {
+		t.Fatal(err)
+	}
+	task, _ = store.GetTask(S(task, "id"))
+	if _, err := workspace.IntegrateTask(project, collection, task); err == nil || !strings.Contains(err.Error(), "must remain on Praector-assigned branch") {
+		t.Fatalf("integration must reject escaped branch/current_head mismatch, got %v", err)
+	}
+	if got := gitTest(t, S(project, "root_path"), "rev-parse", S(collection, "integration_branch")); got != baseHead {
+		t.Fatalf("collection advanced after rejected integration: got %s want %s", got, baseHead)
+	}
+}
+
+func TestValidatedCheckpointIsIntegratedByImmutableCommit(t *testing.T) {
+	store, workspace, project, collection, task, path, _ := prepareWorkspaceTask(t, "implement")
+	if err := os.WriteFile(filepath.Join(path, "feature.txt"), []byte("candidate\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	head, err := workspace.Checkpoint(task, 1, "attempt-checkpoint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, _ = store.GetTask(S(task, "id"))
+	integrated, err := workspace.IntegrateTask(project, collection, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := workspace.IsAncestor(S(project, "root_path"), head, integrated)
+	if err != nil || !ok {
+		t.Fatalf("checkpoint %s is not contained in integration head %s: %v", head, integrated, err)
+	}
+	if _, err := os.Stat(filepath.Join(S(collection, "integration_worktree"), "feature.txt")); err != nil {
+		t.Fatalf("integrated file missing: %v", err)
+	}
+}
+
+func TestReadOnlySnapshotDetectsCheckoutAwayAndBack(t *testing.T) {
+	_, workspace, _, _, _, path, baseHead := prepareWorkspaceTask(t, "review")
+	baseline, err := workspace.WorkspaceSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, path, "checkout", "--detach", "HEAD^")
+	gitTest(t, path, "checkout", "--detach", baseHead)
+	if err := workspace.ValidateReadOnlyWorkspace(path, baseline); err == nil || !strings.Contains(err.Error(), "HEAD history changed") {
+		t.Fatalf("transient checkout must violate read-only identity, got %v", err)
+	}
+	if err := workspace.RestoreReadOnlyWorkspace(path, baseline); err != nil {
+		t.Fatal(err)
+	}
+	state, err := workspace.WorkspaceSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Head != baseline.Head || state.Branch != "" || state.Status != "" {
+		t.Fatalf("read-only restore did not return to detached clean baseline: %#v", state)
+	}
+}
 func TestAcceptancePlanAndFastForward(t *testing.T) {
 	repo := t.TempDir()
 	git, e := RequireBinary("git")

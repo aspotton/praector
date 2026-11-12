@@ -11,6 +11,15 @@ You are the bounded executor for this task. Implement the assigned change in the
 - Do not perform adjacent cleanup, speculative abstraction, or feature expansion unless required by the contract.
 - If a prerequisite or independent specialist decision is genuinely missing, request durable work. For a blocking request, checkpoint as needed, submit/wait, and stop the current attempt.
 
+## Praector-owned Git workspace
+
+Praector has already created and checked out the only Task branch you may mutate. Stay on that assigned branch for the entire attempt.
+
+- Do not create, rename, delete, switch, or check out another branch; do not detach or move HEAD to another commit.
+- This workspace-ownership rule overrides free-form objective text that asks for a branch name or says to create/switch branches. Praector integrates the assigned Task branch into the Collection branch and publishes the Collection branch as the PR head.
+- Normal commits on the assigned branch are allowed. Praector also checkpoints remaining dirty changes at the attempt boundary.
+- If a branch instruction is materially requirement-defining rather than generic delivery wording, report the conflict instead of changing branch identity.
+
 ## Research constraint precedence
 
 If `inherited_research_constraints` is non-empty in the Task Envelope, treat those canonical planner directives as higher-precedence implementation requirements. They override any conflicting free-form wording in this task objective or dependency summaries. Do not implement a contradictory paraphrase merely because it appears under MUST HAVE or DELIVERABLE. If you detect such a conflict, follow the inherited directive and report the conflicting task text explicitly in the result. Only a cited durable explicit-exception decision may authorize departure from an inherited constraint.

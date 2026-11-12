@@ -46,7 +46,7 @@ func TestEmbeddedRuntimeAssets(t *testing.T) {
 func TestCapabilityPromptSeparatesReadOnlyAndWriteProfiles(t *testing.T) {
 	for profile := range ReadOnlyProfiles {
 		prompt := capabilityPrompt(profile)
-		for _, want := range []string{"no net workspace mutation", "git status --porcelain=v1 --untracked-files=all", "PYTHONDONTWRITEBYTECODE=1", "starting baseline", "Never discard pre-existing changes"} {
+		for _, want := range []string{"no net workspace mutation", "git status --porcelain=v1 --untracked-files=all", "PYTHONDONTWRITEBYTECODE=1", "starting baseline", "assigned detached HEAD", "Never discard pre-existing changes"} {
 			if !strings.Contains(prompt, want) {
 				t.Fatalf("read-only capability prompt for %s missing %q", profile, want)
 			}

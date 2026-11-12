@@ -36,7 +36,7 @@ func TestBuildTaskEnvelopeInjectsReadOnlyWorkspaceHygieneOnlyForReadOnlyProfiles
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"## Capability discipline", "no net workspace mutation", "PYTHONDONTWRITEBYTECODE=1", "final worktree state matches the starting baseline", "Never discard pre-existing changes"} {
+	for _, want := range []string{"## Capability discipline", "no net workspace mutation", "PYTHONDONTWRITEBYTECODE=1", "assigned detached HEAD", "final worktree state matches the starting baseline", "Never discard pre-existing changes"} {
 		if !strings.Contains(reviewPrompt, want) {
 			t.Fatalf("rendered review envelope missing %q", want)
 		}
@@ -51,6 +51,9 @@ func TestBuildTaskEnvelopeInjectsReadOnlyWorkspaceHygieneOnlyForReadOnlyProfiles
 	}
 	if !strings.Contains(implementPrompt, "write capability within its assigned implementation scope") {
 		t.Fatal("implement envelope missing write-capability contract")
+	}
+	if !strings.Contains(implementPrompt, "Praector has already created and checked out the only Task branch") {
+		t.Fatal("implement envelope missing Praector-owned branch contract")
 	}
 }
 

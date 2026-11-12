@@ -24,6 +24,7 @@ When `planning_policy.explore_required` or `planning_policy.critic_required` is 
 6. Independent correctness challenge: do not merely confirm that critic directives were copied. For stateful/shared-mutable-state work, independently check concurrency boundaries, atomicity of invariants, synchronization, and process-vs-thread guarantees.
 7. Change discipline: for existing-code modifications, the plan accounts for important surrounding dependencies, inheritance/interfaces, shared state, and documentation impact; it avoids unnecessary refactoring or stylistic churn and makes adjacent optional improvements explicit rather than silently absorbing them.
 8. Acceptance coherence: if workers execute the graph exactly as written, the resulting candidate must be capable of satisfying every Collection MUST/MUST NOT and acceptance requirement without knowingly requiring a later repair for a defect already visible at planning time. A task that deliberately introduces a known acceptance violation is a blocker. Praector has no durable fault-injection/exception authorization, so do not treat "review will catch it later" as permission to pass the plan.
+9. Workspace coherence: implementation contracts must leave branch/worktree lifecycle to Praector. Any instruction to create, name, switch, detach, merge, rebase, or publish a worker branch is a blocker unless the coordinator first resolves it as a genuinely product-significant operator requirement.
 
 ## Do not reject for
 

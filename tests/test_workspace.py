@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from praector.config import GlobalConfig
 from praector.workspace import GitWorkspace
 
@@ -77,6 +79,82 @@ def test_inherited_implementation_merges_back_to_parent(tmp_path):
     ws.integrate_task(project, collection, store.get_task("T-PARENT"))
     assert (integration / "parent.txt").read_text() == "parent\n"
     assert (integration / "child.txt").read_text() == "child\n"
+
+
+def test_implementation_branch_escape_fails_closed_before_integration(tmp_path):
+    repo = init_repo(tmp_path)
+    cfg = GlobalConfig(home=tmp_path / "praector-home")
+    cfg.worktrees_dir.mkdir(parents=True)
+    task = {
+        "id": "T-I", "profile": "implement", "parent_task_id": None,
+        "workspace_mode": "collection", "branch_name": None, "base_commit": None,
+        "worktree_path": None, "current_head": None,
+    }
+    store = FakeStore({"T-I": task})
+    ws = GitWorkspace(store, cfg)
+    project = {"id": "PRJ-1", "root_path": str(repo), "base_branch": "main"}
+    collection = {
+        "id": "COL-1", "integration_branch": "praector/collections/col-1",
+        "integration_worktree": None,
+    }
+
+    task_path = ws.prepare_task(project, collection, task)
+    prepared = store.get_task("T-I")
+    assigned = prepared["branch_name"]
+    base_head = git(repo, "rev-parse", "HEAD").stdout.strip()
+    git(task_path, "checkout", "-b", "fix/escaped-worker-branch")
+    (task_path / "feature.txt").write_text("candidate\n")
+    git(task_path, "add", ".")
+    git(task_path, "commit", "-m", "candidate on escaped branch")
+    escaped_head = git(task_path, "rev-parse", "HEAD").stdout.strip()
+
+    with pytest.raises(RuntimeError, match="must remain on Praector-assigned branch"):
+        ws.checkpoint(prepared, message="old runtime would accept this")
+    assert git(repo, "rev-parse", assigned).stdout.strip() == base_head
+
+    # Reproduce the old inconsistent durable state: current_head followed the
+    # escaped worktree while branch_name remained on the untouched task branch.
+    store.set_task_workspace("T-I", current_head=escaped_head)
+    with pytest.raises(RuntimeError, match="must remain on Praector-assigned branch"):
+        ws.integrate_task(project, collection, store.get_task("T-I"))
+    assert (
+        git(repo, "rev-parse", collection["integration_branch"]).stdout.strip()
+        == base_head
+    )
+
+
+def test_read_only_snapshot_detects_checkout_away_and_back(tmp_path):
+    repo = init_repo(tmp_path)
+    (repo / "base.txt").write_text("base\nsecond\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "second base")
+    cfg = GlobalConfig(home=tmp_path / "praector-home")
+    cfg.worktrees_dir.mkdir(parents=True)
+    task = {
+        "id": "T-R", "profile": "review", "parent_task_id": None,
+        "workspace_mode": "collection", "base_commit": None,
+        "worktree_path": None, "current_head": None,
+    }
+    store = FakeStore({"T-R": task})
+    ws = GitWorkspace(store, cfg)
+    project = {"id": "PRJ-1", "root_path": str(repo), "base_branch": "main"}
+    collection = {
+        "id": "COL-1", "integration_branch": "praector/collections/col-1",
+        "integration_worktree": None,
+    }
+
+    path = ws.prepare_task(project, collection, task)
+    baseline = ws.workspace_snapshot(path)
+    git(path, "checkout", "--detach", "HEAD^")
+    git(path, "checkout", "--detach", baseline.head)
+
+    with pytest.raises(RuntimeError, match="HEAD history changed"):
+        ws.validate_read_only_workspace(path, baseline)
+    ws.restore_read_only_workspace(path, baseline)
+    restored = ws.workspace_snapshot(path)
+    assert restored.head == baseline.head
+    assert restored.branch == ""
+    assert restored.status == ""
 
 
 def test_read_only_changes_can_be_rolled_back(tmp_path):

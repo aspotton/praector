@@ -1095,10 +1095,16 @@ class Scheduler:
         return message
 
     def _handle_read_only_capability_violation(
-        self, project_cfg: Any, task: dict[str, Any], attempt: dict[str, Any]
+        self,
+        project_cfg: Any,
+        task: dict[str, Any],
+        attempt: dict[str, Any],
+        detail: str | None = None,
     ) -> str:
         """Retry read-only capability violations before graph-level escalation."""
-        message = "Read-only task mutated its workspace; changes were discarded."
+        message = "Read-only task mutated its workspace identity or files; changes were discarded."
+        if detail:
+            message = f"{message} {detail.strip()}"
         if int(attempt["attempt_no"]) < project_cfg.limits.max_attempts_per_task:
             self.store.set_task_status(
                 task["id"], TaskStatus.READY.value,
@@ -1375,11 +1381,14 @@ class Scheduler:
         self.store.set_attempt_log_path(attempt["id"], str(log_path))
         session_row: dict[str, Any] | None = None
         protocol_failure: str | None = None
+        read_only_baseline = None
 
         try:
             self._record_task_input_lineage(task, attempt)
             workdir = self.workspace.prepare_task(project, collection, task)
             task = self.store.get_task(task_id)
+            if task["profile"] in READ_ONLY_PROFILES:
+                read_only_baseline = self.workspace.workspace_snapshot(workdir)
             session_row = self.store.create_session(attempt["id"], project_cfg.harness, str(workdir))
             prompt = build_task_envelope(self.store, project, collection, task, attempt)
             harness = create_harness(project_cfg.harness, opencode_command=project_cfg.opencode_command)
@@ -1411,13 +1420,25 @@ class Scheduler:
             )
 
             current = self.store.get_task(task_id)
-            # Read-only profiles get a second, deterministic enforcement layer.
-            if task["profile"] in READ_ONLY_PROFILES and self.workspace.is_dirty(workdir):
-                self.workspace.rollback_read_only_changes(current)
-                protocol_failure = self._handle_read_only_capability_violation(
-                    project_cfg, task, attempt
-                )
-                current = self.store.get_task(task_id)
+            # Read-only profiles preserve files and Git identity. Comparing the
+            # worktree-specific HEAD reflog also catches checkout-away-and-back.
+            if task["profile"] in READ_ONLY_PROFILES and read_only_baseline is not None:
+                try:
+                    self.workspace.validate_read_only_workspace(
+                        workdir, read_only_baseline
+                    )
+                except Exception as exc:
+                    detail = str(exc)
+                    try:
+                        self.workspace.restore_read_only_workspace(
+                            workdir, read_only_baseline
+                        )
+                    except Exception as restore_exc:
+                        detail = f"{detail}; restore failed: {restore_exc}"
+                    protocol_failure = self._handle_read_only_capability_violation(
+                        project_cfg, task, attempt, detail
+                    )
+                    current = self.store.get_task(task_id)
 
             # If the agent did not submit a durable result, preserve its final
             # response as a fallback result. Process failures are retried.
@@ -1458,36 +1479,58 @@ class Scheduler:
 
             if task["profile"] == "implement":
                 # Preserve physical workspace state at every attempt boundary.
-                head = self.workspace.checkpoint(
-                    current,
-                    attempt_no=int(attempt["attempt_no"]),
-                    operation="attempt-checkpoint",
-                )
-                if head:
-                    self.store.set_task_workspace(task_id, current_head=head)
-                current = self.store.get_task(task_id)
-                if current["status"] == TaskStatus.VERIFYING.value:
-                    try:
-                        integrated_head = self.workspace.integrate_task(project, collection, current)
-                        self.store.event(
-                            current["project_id"], current["collection_id"], task_id, attempt["id"],
-                            "TASK_INTEGRATED", {"head": integrated_head}
-                        )
-                        self._ensure_review(project, collection, current)
-                        self.store.set_task_status(task_id, TaskStatus.COMPLETE.value, message=f"task {task_id}: integration complete")
-                    except Exception as exc:
-                        self.store.submit_result(task_id, {
-                            "status": "failed",
-                            "summary": f"Implementation completed but integration failed: {exc}",
-                            "risks": ["Git integration conflict"],
-                        })
+                try:
+                    head = self.workspace.checkpoint(
+                        current,
+                        attempt_no=int(attempt["attempt_no"]),
+                        operation="attempt-checkpoint",
+                    )
+                except Exception as exc:
+                    protocol_failure = (
+                        f"Implementation workspace checkpoint failed: {exc}"
+                    )
+                    self.store.submit_result(task_id, {
+                        "status": "failed",
+                        "summary": protocol_failure,
+                        "risks": [
+                            "Git workspace identity or checkpoint validation failed; "
+                            "no integration was attempted"
+                        ],
+                    })
+                    self.store.event(
+                        current["project_id"], current["collection_id"], task_id,
+                        attempt["id"], "IMPLEMENTATION_WORKSPACE_VIOLATION",
+                        {"error": str(exc)},
+                    )
+                else:
+                    if head:
+                        self.store.set_task_workspace(task_id, current_head=head)
+                    current = self.store.get_task(task_id)
+                    if current["status"] == TaskStatus.VERIFYING.value:
                         try:
-                            self.store.request_coordinator_attention(
-                                task_id, f"Integration failed for {task_id}: {exc}", blocking=False,
-                                limits=self._limits_dict(project),
+                            integrated_head = self.workspace.integrate_task(project, collection, current)
+                            self.store.event(
+                                current["project_id"], current["collection_id"], task_id, attempt["id"],
+                                "TASK_INTEGRATED", {
+                                    "head": integrated_head,
+                                    "checkpoint": current.get("current_head"),
+                                }
                             )
-                        except Exception:
-                            pass
+                            self._ensure_review(project, collection, current)
+                            self.store.set_task_status(task_id, TaskStatus.COMPLETE.value, message=f"task {task_id}: integration complete")
+                        except Exception as exc:
+                            self.store.submit_result(task_id, {
+                                "status": "failed",
+                                "summary": f"Implementation completed but integration failed: {exc}",
+                                "risks": ["Git integration or workspace identity validation failed"],
+                            })
+                            try:
+                                self.store.request_coordinator_attention(
+                                    task_id, f"Integration failed for {task_id}: {exc}", blocking=False,
+                                    limits=self._limits_dict(project),
+                                )
+                            except Exception:
+                                pass
             elif task["profile"] == "review":
                 self._handle_failed_review(project, current)
                 current = self.store.get_task(task_id)

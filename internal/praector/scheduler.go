@@ -1051,8 +1051,11 @@ func (s *Scheduler) handleMissingReviewVerdict(cfg ProjectConfig, task, attempt 
 	return msg
 }
 
-func (s *Scheduler) handleReadOnlyCapabilityViolation(cfg ProjectConfig, task, attempt Row) string {
-	msg := "Read-only task mutated its workspace; changes were discarded."
+func (s *Scheduler) handleReadOnlyCapabilityViolation(cfg ProjectConfig, task, attempt Row, detail ...string) string {
+	msg := "Read-only task mutated its workspace identity or files; changes were discarded."
+	if len(detail) > 0 && strings.TrimSpace(detail[0]) != "" {
+		msg += " " + strings.TrimSpace(detail[0])
+	}
 	if I(attempt, "attempt_no") < cfg.Limits.MaxAttemptsPerTask {
 		_ = s.Store.SetTaskStatus(S(task, "id"), TaskReady, "task "+S(task, "id")+": retry after read-only capability violation")
 		_ = s.Store.Event(S(task, "project_id"), S(task, "collection_id"), S(task, "id"), S(attempt, "id"), "READ_ONLY_CAPABILITY_RETRY", Row{"attempt_no": I(attempt, "attempt_no"), "reason": msg})
@@ -1349,6 +1352,8 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 	var session Row
 	protocolFailure := ""
 	workdir := ""
+	var readOnlyBaseline WorkspaceSnapshot
+	haveReadOnlyBaseline := false
 	var harnessResult HarnessResult
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -1387,6 +1392,14 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 		handleErr(err)
 		return
 	}
+	if ReadOnlyProfiles[S(task, "profile")] {
+		readOnlyBaseline, err = s.Workspace.WorkspaceSnapshot(workdir)
+		if err != nil {
+			handleErr(fmt.Errorf("capture read-only workspace identity: %w", err))
+			return
+		}
+		haveReadOnlyBaseline = true
+	}
 	session, err = s.Store.CreateSession(S(attempt, "id"), projectCfg.Harness, workdir)
 	if err != nil {
 		handleErr(err)
@@ -1423,11 +1436,13 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 		handleErr(err)
 		return
 	}
-	if ReadOnlyProfiles[S(task, "profile")] {
-		dirty, e := s.Workspace.IsDirty(workdir)
-		if e == nil && dirty {
-			_ = s.Workspace.RollbackReadOnlyChanges(current)
-			protocolFailure = s.handleReadOnlyCapabilityViolation(projectCfg, task, attempt)
+	if ReadOnlyProfiles[S(task, "profile")] && haveReadOnlyBaseline {
+		if e := s.Workspace.ValidateReadOnlyWorkspace(workdir, readOnlyBaseline); e != nil {
+			detail := e.Error()
+			if restoreErr := s.Workspace.RestoreReadOnlyWorkspace(workdir, readOnlyBaseline); restoreErr != nil {
+				detail += "; restore failed: " + restoreErr.Error()
+			}
+			protocolFailure = s.handleReadOnlyCapabilityViolation(projectCfg, task, attempt, detail)
 			current, _ = s.Store.GetTask(taskID)
 		}
 	}
@@ -1462,24 +1477,26 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 	if profile == "implement" {
 		head, e := s.Workspace.Checkpoint(current, I(attempt, "attempt_no"), "attempt-checkpoint")
 		if e != nil {
-			handleErr(e)
-			return
-		}
-		if head != "" {
-			_ = s.Store.SetTaskWorkspace(taskID, nil, nil, nil, strptr(head))
-		}
-		current, _ = s.Store.GetTask(taskID)
-		if S(current, "status") == TaskVerifying {
-			integrated, e := s.Workspace.IntegrateTask(project, collection, current)
-			if e == nil {
-				_ = s.Store.Event(S(current, "project_id"), S(current, "collection_id"), taskID, S(attempt, "id"), "TASK_INTEGRATED", Row{"head": integrated})
-				e = s.ensureReview(project, collection, current)
+			protocolFailure = "Implementation workspace checkpoint failed: " + e.Error()
+			_, _ = s.Store.SubmitResult(taskID, Row{"status": "failed", "summary": protocolFailure, "risks": []any{"Git workspace identity or checkpoint validation failed; no integration was attempted"}})
+			_ = s.Store.Event(S(current, "project_id"), S(current, "collection_id"), taskID, S(attempt, "id"), "IMPLEMENTATION_WORKSPACE_VIOLATION", Row{"error": e.Error()})
+		} else {
+			if head != "" {
+				_ = s.Store.SetTaskWorkspace(taskID, nil, nil, nil, strptr(head))
 			}
-			if e == nil {
-				_ = s.Store.SetTaskStatus(taskID, TaskComplete, "task "+taskID+": integration complete")
-			} else {
-				_, _ = s.Store.SubmitResult(taskID, Row{"status": "failed", "summary": "Implementation completed but integration failed: " + e.Error(), "risks": []any{"Git integration conflict"}})
-				_, _, _ = s.Store.RequestCoordinatorAttention(taskID, "Integration failed for "+taskID+": "+e.Error(), false, s.limits(project))
+			current, _ = s.Store.GetTask(taskID)
+			if S(current, "status") == TaskVerifying {
+				integrated, e := s.Workspace.IntegrateTask(project, collection, current)
+				if e == nil {
+					_ = s.Store.Event(S(current, "project_id"), S(current, "collection_id"), taskID, S(attempt, "id"), "TASK_INTEGRATED", Row{"head": integrated, "checkpoint": S(current, "current_head")})
+					e = s.ensureReview(project, collection, current)
+				}
+				if e == nil {
+					_ = s.Store.SetTaskStatus(taskID, TaskComplete, "task "+taskID+": integration complete")
+				} else {
+					_, _ = s.Store.SubmitResult(taskID, Row{"status": "failed", "summary": "Implementation completed but integration failed: " + e.Error(), "risks": []any{"Git integration or workspace identity validation failed"}})
+					_, _, _ = s.Store.RequestCoordinatorAttention(taskID, "Integration failed for "+taskID+": "+e.Error(), false, s.limits(project))
+				}
 			}
 		}
 	} else if profile == "review" {

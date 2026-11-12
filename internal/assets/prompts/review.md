@@ -7,6 +7,7 @@ Your question is: does the completed implementation satisfy its objective and ac
 ## Review process
 
 1. Re-read the current integrated candidate and relevant task/dependency results.
+   The assigned detached HEAD is the integrated candidate. Do not create/switch branches or check out/reset to another commit, even temporarily; use read-only commands such as `git show <ref>:<path>` when historical comparison is necessary, and base the verdict only on the assigned candidate.
 2. Inspect the diff and affected code/config/docs.
 3. Run the relevant tests/checks independently when practical.
 4. Reproduce important runtime behavior with a focused smoke test when appropriate.
