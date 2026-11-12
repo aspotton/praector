@@ -91,6 +91,16 @@ The directive-traceability / sibling-effect / review-carry-over / oracle-probe c
 - any new CLI command/flag/output or MCP read surface for the traceability ledger — the existing gates were wired so `commandHelp`→`serviceOps`→`mcpSurface` parity stays untouched;
 - richer operator tooling around the `Legacy gate-traceability exception` decision (e.g. a first-class waiver command instead of `praector decision add`).
 
+### Deferred from the gate-traceability enforcement hardening
+
+The derived-knob / scoped-legacy / live-seam / evidence-floor change deliberately stopped short of:
+
+- machine-proof of the derived candidate list's completeness: `DeriveConfigCandidates` is a narrow, human-falsifiable heuristic (flag literals, env-var names, config/table keys, setting-like keys, with documented git-flag and common-env exemptions), not a static-analysis knob inventory;
+- a machine-proof of sibling-effect enumeration completeness and coverage instrumentation behind it (unchanged from the list above);
+- per-collection measurement gates: code-coverage thresholds, `-race` in a Collection gate, goroutine-leak detection, and mutation testing;
+- an actor/origin column on `decisions`: the legacy escape's operator ownership is enforced by the schema-free discriminator (collection-scoped + names-collection + `task_id IS NULL`) instead of a real actor attribution;
+- the follow-on (durable decision **DEC-cada832e82**): replacing the objective-regex intent classifier with a persisted, declared, and diff-derived classification so a phrasing choice cannot silently remove a security or external-conformance gate — this change deliberately kept classification call sites readable and did not touch the regex verb lists.
+
 ## 4. MCP interface
 
 MCP is a first-class Praector interface for coding agents and human-facing agents. It must expose the same durable **domain operations** as the CLI rather than invoking CLI subprocesses or maintaining a second orchestration implementation. The normal user experience should be that a human talks to an MCP-capable agent, and that agent can inspect and operate Praector with the same authority/policy boundaries as an equivalent CLI caller.

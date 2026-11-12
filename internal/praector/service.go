@@ -653,7 +653,11 @@ func (s *Service) CollectionPRPlan(ctx context.Context, in CollectionPRPlanInput
 	if e != nil {
 		return CollectionPRPlanOutput{}, e
 	}
-	c, tasks, e := validateCollectionForAcceptance(s.store, c)
+	acceptanceCandidates, e := s.deriveConfigCandidates(project, c)
+	if e != nil {
+		return CollectionPRPlanOutput{}, e
+	}
+	c, tasks, e := validateCollectionForAcceptance(s.store, c, acceptanceCandidates...)
 	if e != nil {
 		return CollectionPRPlanOutput{}, e
 	}
@@ -732,7 +736,11 @@ func (s *Service) CollectionAccept(ctx context.Context, in CollectionAcceptInput
 	if e != nil {
 		return CollectionAcceptOutput{}, e
 	}
-	if _, _, e = validateCollectionForAcceptance(s.store, c); e != nil {
+	acceptanceCandidates, e := s.deriveConfigCandidates(project, c)
+	if e != nil {
+		return CollectionAcceptOutput{}, e
+	}
+	if _, _, e = validateCollectionForAcceptance(s.store, c, acceptanceCandidates...); e != nil {
 		return CollectionAcceptOutput{}, e
 	}
 	target := in.Target
@@ -1181,11 +1189,40 @@ func (s *Service) ResultSubmit(ctx context.Context, in ResultSubmitInput) (Resul
 		}
 		in.Result["verdict"] = v
 	}
-	t, e := s.store.SubmitResult(tid, in.Result)
+	var candidates []DerivedConfigCandidate
+	if S(before, "profile") == "review" && (st == "complete" || st == "completed") && strings.ToLower(strings.TrimSpace(S(in.Result, "verdict"))) == "pass" {
+		c, e := s.store.GetCollection(S(before, "collection_id"))
+		if e != nil {
+			return ResultSubmitOutput{}, e
+		}
+		project, e := s.store.GetProject(S(c, "project_id"))
+		if e != nil {
+			return ResultSubmitOutput{}, e
+		}
+		candidates, e = s.deriveConfigCandidates(project, c)
+		if e != nil {
+			return ResultSubmitOutput{}, e
+		}
+	}
+	t, e := s.store.SubmitResult(tid, in.Result, candidates...)
 	if e != nil {
 		return ResultSubmitOutput{}, e
 	}
 	return ResultSubmitOutput{Status: S(t, "status")}, nil
+}
+
+// deriveConfigCandidates computes the diff-derived configuration-knob
+// candidate list (base...collection integration branch at the moment of the
+// check) that the submit and acceptance seams thread into the pure policy
+// validators. Git access lives here, at the seam, never inside the Store or
+// policy.go. A project root or branch that does not exist yields no
+// candidates; a git failure against an existing basis is returned loudly.
+func (s *Service) deriveConfigCandidates(project, collection Row) ([]DerivedConfigCandidate, error) {
+	w, e := NewGitWorkspace(s.store, s.cfg)
+	if e != nil {
+		return nil, e
+	}
+	return w.DeriveConfigCandidates(project, collection)
 }
 
 // projectForScope resolves the owning project for a memory/decision scope. An

@@ -822,7 +822,15 @@ func cmdDecision(args []string) int {
 	return 0
 }
 
-func validateCollectionForAcceptance(store *Store, c Row) (Row, Rows, error) {
+// validateCollectionForAcceptance applies every durable precondition of
+// acceptance. derivedCandidates is the seam-computed diff-derived config-knob
+// candidate list (base...collection integration branch at the moment of the
+// check); callers that can reach the Git workspace compute it and callers
+// without Git access pass nil, which preserves the historical behavior. If
+// integration introduces a NEW candidate after a review already passed at
+// submit, acceptance recomputes the list and correctly requires it: that is a
+// genuine new knob, not spurious diff drift.
+func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...DerivedConfigCandidate) (Row, Rows, error) {
 	state, e := store.UpdateCollectionTerminalState(S(c, "id"))
 	if e != nil {
 		return nil, nil, e
@@ -873,7 +881,7 @@ func validateCollectionForAcceptance(store *Store, c Row) (Row, Rows, error) {
 	if e != nil {
 		return nil, nil, e
 	}
-	legacyIDs := LegacyGateTraceabilityExceptionIDs(legacyDecisions)
+	legacyIDs := LegacyGateTraceabilityExceptionIDs(legacyDecisions, S(c, "id"))
 	for _, t := range tasks {
 		if S(t, "profile") != "review" && S(t, "profile") != "plan_review" {
 			continue
@@ -891,8 +899,19 @@ func validateCollectionForAcceptance(store *Store, c Row) (Row, Rows, error) {
 			return nil, nil, e
 		}
 		if S(t, "profile") == "review" {
-			if e := ValidateReviewImpactEnumeration(M(t, "result"), legacyIDs); e != nil {
+			if e := ValidateReviewImpactEnumeration(M(t, "result"), legacyIDs, derivedCandidates); e != nil {
 				return nil, nil, fmt.Errorf("Collection %s cannot be accepted: %w", S(c, "id"), e)
+			}
+			if decisionIDs := CandidateDecisionIDs(M(t, "result")); len(decisionIDs) > 0 {
+				known := map[string]bool{}
+				for _, decision := range legacyDecisions {
+					known[S(decision, "id")] = true
+				}
+				for _, decisionID := range decisionIDs {
+					if !known[decisionID] {
+						return nil, nil, fmt.Errorf("Collection %s cannot be accepted: candidate disposition decision_id %s is not a durable decision in this Collection", S(c, "id"), decisionID)
+					}
+				}
 			}
 		}
 	}

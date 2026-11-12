@@ -21,7 +21,7 @@ func criticDirectiveResult() Row {
 func directiveDispositions(directives []InheritedDirective, disposition string, decisionID string) []any {
 	out := []any{}
 	for _, directive := range directives {
-		item := Row{"directive_id": directive.ID, "disposition": disposition, "evidence": []any{"inspected the integrated candidate"}}
+		item := Row{"directive_id": directive.ID, "disposition": disposition, "evidence": []any{"inspected internal/praector/policy.go for the directive's effect"}}
 		if disposition != "satisfied" && decisionID != "" {
 			item["decision_id"] = decisionID
 		}
@@ -136,8 +136,15 @@ func TestDirectiveDispositionRequiresDurableDecisionID(t *testing.T) {
 		"status": "complete", "verdict": "pass", "summary": "looks good",
 		"impact_enumeration":     passingImpactEnumeration(),
 		"directive_dispositions": directiveDispositions(directives, "deferred", S(decision, "id")),
+	}); err == nil || !strings.Contains(err.Error(), "MUST-level") {
+		t.Fatalf("deferring a structured MUST-level directive must be rejected even with a decision id: %v", err)
+	}
+	if _, err = s.SubmitResult(S(review, "id"), Row{
+		"status": "complete", "verdict": "pass", "summary": "looks good",
+		"impact_enumeration":     passingImpactEnumeration(),
+		"directive_dispositions": directiveDispositions(directives, "explicit_exception", S(decision, "id")),
 	}); err != nil {
-		t.Fatalf("deferred disposition with a durable decision id rejected: %v", err)
+		t.Fatalf("explicit_exception disposition with a durable decision id rejected: %v", err)
 	}
 }
 
@@ -197,31 +204,31 @@ func envelopeContextRow(t *testing.T, envelope string) Row {
 
 func TestImpactEnumerationRequiredAndDeadKnobBlocking(t *testing.T) {
 	base := Row{"verdict": "pass", "summary": "s"}
-	if err := ValidateReviewImpactEnumeration(base, nil); err == nil {
+	if err := ValidateReviewImpactEnumeration(base, nil, nil); err == nil {
 		t.Fatal("missing impact_enumeration must be rejected on pass")
 	}
-	if err := ValidateReviewImpactEnumeration(Row{"verdict": "pass", "impact_enumeration": Row{"method": "grep", "sites": []any{}}}, nil); err == nil {
+	if err := ValidateReviewImpactEnumeration(Row{"verdict": "pass", "impact_enumeration": Row{"method": "grep", "sites": []any{}}}, nil, nil); err == nil {
 		t.Fatal("empty impact_enumeration must be rejected on pass")
 	}
-	if err := ValidateReviewImpactEnumeration(Row{"verdict": "pass", "impact_enumeration": Row{"sites": []any{Row{"site": "x", "disposition": "affected", "evidence": "e"}}}}, nil); err == nil {
+	if err := ValidateReviewImpactEnumeration(Row{"verdict": "pass", "impact_enumeration": Row{"sites": []any{Row{"site": "x", "disposition": "affected", "evidence": "e"}}}}, nil, nil); err == nil {
 		t.Fatal("impact_enumeration without a named method must be rejected")
 	}
-	if err := ValidateReviewImpactEnumeration(Row{"verdict": "pass", "impact_enumeration": passingImpactEnumeration()}, nil); err != nil {
+	if err := ValidateReviewImpactEnumeration(Row{"verdict": "pass", "impact_enumeration": passingImpactEnumeration()}, nil, nil); err != nil {
 		t.Fatalf("method + per-site disposition + evidence must be accepted: %v", err)
 	}
-	if err := ValidateReviewImpactEnumeration(Row{"verdict": "fail", "summary": "s"}, nil); err != nil {
+	if err := ValidateReviewImpactEnumeration(Row{"verdict": "fail", "summary": "s"}, nil, nil); err != nil {
 		t.Fatalf("failed reviews are not gated on impact_enumeration: %v", err)
 	}
 	knob := Row{"verdict": "pass", "impact_enumeration": Row{"method": "config sweep", "sites": []any{
-		Row{"site": "config.go:MCPEnabled", "disposition": "affected", "evidence": "new flag", "introduced_knob": true},
+		Row{"site": "config.go:MCPEnabled", "disposition": "affected", "evidence": "grep -n MCPEnabled internal/praector/config.go shows the new flag", "introduced_knob": true},
 	}}}
-	if err := ValidateReviewImpactEnumeration(knob, nil); err == nil || !strings.Contains(err.Error(), "introduced-but-never-read") {
+	if err := ValidateReviewImpactEnumeration(knob, nil, nil); err == nil || !strings.Contains(err.Error(), "introduced-but-never-read") {
 		t.Fatalf("introduced-but-never-read knob must be blocking: %v", err)
 	}
 	knob["impact_enumeration"] = Row{"method": "config sweep", "sites": []any{
-		Row{"site": "config.go:MCPEnabled", "disposition": "affected", "evidence": "new flag", "introduced_knob": true, "reader_paths": []any{"mcp_server.go:serve"}},
+		Row{"site": "config.go:MCPEnabled", "disposition": "affected", "evidence": "grep -n MCPEnabled internal/praector/config.go shows the new flag", "introduced_knob": true, "reader_paths": []any{"mcp_server.go:serve"}},
 	}}
-	if err := ValidateReviewImpactEnumeration(knob, nil); err != nil {
+	if err := ValidateReviewImpactEnumeration(knob, nil, nil); err != nil {
 		t.Fatalf("introduced knob with a named reader must not be flagged: %v", err)
 	}
 }
@@ -358,7 +365,7 @@ func TestLegacyReviewReachesAcceptanceViaDocumentedException(t *testing.T) {
 	if _, _, err = validateCollectionForAcceptance(s, collection); err == nil || !strings.Contains(err.Error(), "directive_dispositions") {
 		t.Fatalf("legacy review without dispositions must block acceptance before the exception: %v", err)
 	}
-	decision, err := s.AddDecision(S(p, "id"), S(c, "id"), "", LegacyGateTraceabilityMarker+" pre-traceability review results accepted as-is for COL history", "Validators postdate this collection's reviews", []any{}, []any{})
+	decision, err := s.AddDecision(S(p, "id"), S(c, "id"), "", LegacyGateTraceabilityMarker+" pre-traceability review results accepted as-is for "+S(c, "id"), "Validators postdate this collection's reviews", []any{}, []any{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,6 +373,314 @@ func TestLegacyReviewReachesAcceptanceViaDocumentedException(t *testing.T) {
 		t.Fatalf("documented single-decision legacy exception must clear acceptance: %v", err)
 	}
 	_ = decision
+}
+
+func derivedKnobCandidates() []DerivedConfigCandidate {
+	return []DerivedConfigCandidate{{Token: "--derive-test-knob", Path: "cmd.go"}}
+}
+
+func TestDerivedCandidateRuleFiresWithoutIntroducedKnobFlag(t *testing.T) {
+	candidates := derivedKnobCandidates()
+	base := Row{"verdict": "pass", "impact_enumeration": Row{"method": "call-graph walk", "sites": []any{
+		Row{"site": "internal/praector/store.go", "disposition": "unaffected", "evidence": "go test ./internal/praector/ -run TestDirective"},
+	}}}
+	if err := ValidateReviewImpactEnumeration(base, nil, candidates); err == nil || !strings.Contains(err.Error(), "--derive-test-knob") {
+		t.Fatalf("a review omitting a derived candidate without introduced_knob set must be rejected naming it: %v", err)
+	}
+	named := cloneRow(base)
+	named["impact_enumeration"] = Row{"method": "call-graph walk", "sites": []any{
+		Row{"site": "internal/praector/store.go", "disposition": "affected", "evidence": "go test ./internal/praector/ -run TestDirective", "reader_paths": []any{"internal/praector/config.go reads --derive-test-knob"}},
+	}}
+	if err := ValidateReviewImpactEnumeration(named, nil, candidates); err != nil {
+		t.Fatalf("candidate named by a site reader_paths must pass: %v", err)
+	}
+	disposed := cloneRow(base)
+	disposed["impact_enumeration"] = Row{"method": "call-graph walk", "sites": base["impact_enumeration"].(Row)["sites"], "candidate_dispositions": []any{
+		Row{"candidate": "--derive-test-knob", "disposition": "not-introduced", "evidence": "predates this collection per git log internal/praector/config.go"},
+	}}
+	if err := ValidateReviewImpactEnumeration(disposed, nil, candidates); err != nil {
+		t.Fatalf("candidate dispositioned not-introduced must pass: %v", err)
+	}
+	unread := cloneRow(disposed)
+	unread["impact_enumeration"] = Row{"method": "call-graph walk", "sites": base["impact_enumeration"].(Row)["sites"], "candidate_dispositions": []any{
+		Row{"candidate": "--derive-test-knob", "disposition": "deliberately-unread", "evidence": "run make test-go documents the unread decision"},
+	}}
+	if err := ValidateReviewImpactEnumeration(unread, nil, candidates); err == nil || !strings.Contains(err.Error(), "decision_id") {
+		t.Fatalf("deliberately-unread without a durable decision id must be rejected: %v", err)
+	}
+	if err := ValidateReviewImpactEnumeration(base, []string{"DEC-legacy"}, nil); err != nil {
+		t.Fatalf("nil derived candidates must keep byte-identical legacy behavior: %v", err)
+	}
+}
+
+func TestSubmitResultRejectsUnaccountedDerivedCandidate(t *testing.T) {
+	s, p, c, critic := traceabilityCollection(t)
+	ancestors, err := s.DirectiveAncestors(S(critic, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ancestors
+	impl, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "implement", Title: "Implement",
+		Objective: "implement", Reason: "plan", ParentTaskID: S(critic, "id"), DependsOn: []string{S(critic, "id")}, WorkspaceMode: "collection", Depth: 2, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	review, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "review", Title: "Review",
+		Objective: "review", Reason: "policy", ParentTaskID: S(impl, "id"), DependsOn: []string{S(impl, "id"), S(critic, "id")}, WorkspaceMode: "collection", Depth: 3, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directiveAncestors, err := s.DirectiveAncestors(S(review, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	directives := InheritedDirectives(directiveAncestors)
+	if _, err = s.SubmitResult(S(review, "id"), Row{
+		"status": "complete", "verdict": "pass", "summary": "looks good",
+		"impact_enumeration":     passingImpactEnumeration(),
+		"directive_dispositions": directiveDispositions(directives, "satisfied", ""),
+	}, derivedKnobCandidates()...); err == nil || !strings.Contains(err.Error(), "--derive-test-knob") {
+		t.Fatalf("submit seam with an unaccounted derived candidate must be rejected naming it: %v", err)
+	}
+	accounted := cloneRow(Row{"impact_enumeration": passingImpactEnumeration()})
+	accounted["impact_enumeration"] = Row{"method": "literal-column grep set", "sites": []any{
+		Row{"site": "internal/praector/config.go reads --derive-test-knob", "disposition": "affected", "evidence": "go test ./internal/praector/ -run TestDirective", "reader_paths": []any{"internal/praector/config.go"}},
+	}}
+	if _, err = s.SubmitResult(S(review, "id"), Row{
+		"status": "complete", "verdict": "pass", "summary": "looks good",
+		"impact_enumeration":     accounted["impact_enumeration"],
+		"directive_dispositions": directiveDispositions(directives, "satisfied", ""),
+	}, derivedKnobCandidates()...); err != nil {
+		t.Fatalf("submit seam with the derived candidate accounted for must pass: %v", err)
+	}
+}
+
+func TestLegacyMarkerMustBeCollectionScopedAndNameTheCollection(t *testing.T) {
+	s, _ := newFakeStore(t)
+	p, err := s.RegisterProject(testProjectConfig(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, coord, err := s.CreateCollectionWithCoordinator(S(p, "id"), "Scoped legacy", "Add authenticated endpoint with durable events", "Plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	critic, _, _ := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "critic", Title: "Preflight",
+		Objective: "preflight", Reason: "plan", ParentTaskID: S(coord, "id"), WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	_, _ = s.SubmitResult(S(critic, "id"), criticDirectiveResult())
+	if err = s.SetTaskStatus(S(critic, "id"), TaskComplete, "critic complete"); err != nil {
+		t.Fatal(err)
+	}
+	impl, _, _ := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "implement", Title: "Implement",
+		Objective: "implement", Reason: "plan", ParentTaskID: S(critic, "id"), DependsOn: []string{S(critic, "id")}, WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	review, _, _ := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "review", Title: "Review",
+		Objective: "review", Reason: "policy", ParentTaskID: S(impl, "id"), DependsOn: []string{S(impl, "id"), S(critic, "id")}, WorkspaceMode: "collection", Depth: 2, AllowDedupe: false,
+	})
+	_ = s.AddEdge(S(impl, "id"), S(review, "id"), S(c, "id"), "verifies")
+	_ = s.SetTaskStatus(S(impl, "id"), TaskComplete, "complete")
+	if err := s.Mutate("UPDATE tasks SET status='COMPLETE',result_json="+SQLLiteral(JSONDumps(Row{"status": "complete", "summary": "pass", "verdict": "pass"}))+" WHERE id="+SQLLiteral(S(review, "id")), "plant legacy review result"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitResult(S(coord, "id"), Row{"status": "complete", "summary": "planned"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskStatus(S(coord, "id"), TaskComplete, "planning complete"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := validateCollectionForAcceptance(s, c); err == nil || !strings.Contains(err.Error(), "directive_dispositions") {
+		t.Fatalf("undispositioned legacy review must block acceptance: %v", err)
+	}
+	if _, err := s.AddDecision(S(p, "id"), "", "", LegacyGateTraceabilityMarker+" pre-traceability review results accepted as-is for "+S(c, "id"), "project-wide marker", []any{}, []any{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := validateCollectionForAcceptance(s, c); err == nil || !strings.Contains(err.Error(), "directive_dispositions") {
+		t.Fatalf("a project-scoped marker decision must NOT exempt a collection: %v", err)
+	}
+	if _, err := s.AddDecision(S(p, "id"), "COL-other", "", LegacyGateTraceabilityMarker+" pre-traceability review results accepted as-is for COL-other", "foreign collection marker", []any{}, []any{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := validateCollectionForAcceptance(s, c); err == nil || !strings.Contains(err.Error(), "directive_dispositions") {
+		t.Fatalf("a marker decision scoped to a different collection must NOT exempt: %v", err)
+	}
+	if _, err := s.AddDecision(S(p, "id"), S(c, "id"), S(critic, "id"), LegacyGateTraceabilityMarker+" pre-traceability review results accepted as-is for "+S(c, "id"), "worker-created marker", []any{}, []any{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := validateCollectionForAcceptance(s, c); err == nil || !strings.Contains(err.Error(), "directive_dispositions") {
+		t.Fatalf("a task-scoped (worker-created) marker decision must NOT arm the operator escape: %v", err)
+	}
+	if _, err := s.AddDecision(S(p, "id"), S(c, "id"), "", LegacyGateTraceabilityMarker+" pre-traceability review results accepted as-is without naming anything", "names no collection", []any{}, []any{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := validateCollectionForAcceptance(s, c); err == nil || !strings.Contains(err.Error(), "directive_dispositions") {
+		t.Fatalf("a collection-scoped marker that does not name the collection must NOT exempt: %v", err)
+	}
+	if _, err := s.AddDecision(S(p, "id"), S(c, "id"), "", LegacyGateTraceabilityMarker+" pre-traceability review results accepted as-is for "+S(c, "id"), "properly scoped operator marker", []any{}, []any{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := validateCollectionForAcceptance(s, c); err != nil {
+		t.Fatalf("a collection-scoped, task-NULL marker naming the collection must exempt acceptance: %v", err)
+	}
+}
+
+func TestLiveDirectiveClaimGateBlocksImplementationClaim(t *testing.T) {
+	s, _ := newFakeStore(t)
+	p, err := s.RegisterProject(testProjectConfig(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, coord, err := s.CreateCollectionWithCoordinator(S(p, "id"), "Claim gate", "Add authenticated endpoint with durable events", "Plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	critic, _, _ := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "critic", Title: "Preflight",
+		Objective: "preflight", Reason: "plan", ParentTaskID: S(coord, "id"), WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	_, _ = s.SubmitResult(S(critic, "id"), criticDirectiveResult())
+	if err = s.SetTaskStatus(S(critic, "id"), TaskComplete, "critic complete"); err != nil {
+		t.Fatal(err)
+	}
+	planReview, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "plan_review", Title: "Plan review",
+		Objective: "review the plan", Reason: "policy", ParentTaskID: S(coord, "id"), DependsOn: []string{S(critic, "id")}, WorkspaceMode: "collection", Depth: 2, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	impl, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "implement", Title: "Implement",
+		Objective: "implement the authenticated endpoint", Reason: "plan", ParentTaskID: S(coord, "id"), DependsOn: []string{S(planReview, "id"), S(critic, "id")}, WorkspaceMode: "collection", Depth: 2, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The plan review is COMPLETE with verdict=pass but carries NO directive
+	// dispositions. The LIVE claim-time directive gate must refuse the
+	// implementation claim; removing the directiveTraceabilityGateLocked call
+	// in planningGateAllowsClaimLocked makes this assertion fail.
+	if err = s.Mutate("UPDATE tasks SET status='COMPLETE',result_json="+SQLLiteral(JSONDumps(Row{"status": "complete", "summary": "pass", "verdict": "pass"}))+",updated_at="+SQLLiteral(UTCNow())+" WHERE id="+SQLLiteral(S(planReview, "id")), "plant undispositioned plan review"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, _, err := s.ClaimTask(S(impl, "id"), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed != nil && S(claimed, "id") == S(impl, "id") {
+		t.Fatal("the live claim-time directive gate must block claiming an implement gated on an undispositioned plan review")
+	}
+	current, err := s.GetTask(S(impl, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ok bool
+	if err = s.withLock(func() error {
+		var e error
+		ok, e = s.planningGateAllowsClaimLocked(current)
+		return e
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("the live claim-time directive gate must refuse the planning gate for an undispositioned plan review")
+	}
+}
+
+func TestEvidenceContentFloorRejectsGenericProse(t *testing.T) {
+	for _, weak := range []any{"verified in code", "n/a", "n/a.", []any{"verified in code"}, []any{"n/a"}} {
+		if citableEvidence(weak) {
+			t.Fatalf("generic prose evidence %v must be rejected by the content floor", weak)
+		}
+	}
+	for _, strong := range []any{
+		"inspected internal/praector/policy.go for the reader",
+		"TestImpactEnumerationRequiredAndDeadKnobBlocking covers the failure path",
+		"run go test ./internal/praector/ -run TestDirective -count=1",
+		"run make test-go",
+	} {
+		if !citableEvidence(strong) {
+			t.Fatalf("citable evidence form %v must be accepted", strong)
+		}
+	}
+	directives := []InheritedDirective{{TaskID: "T-c", SourceProfile: "critic", Kind: "planner_directive", ID: "T-c:planner_directive:0", Text: "keep the seam strict"}}
+	for _, weak := range []any{"verified in code", "n/a"} {
+		result := Row{"verdict": "pass", "directive_dispositions": []any{Row{"directive_id": "T-c:planner_directive:0", "disposition": "satisfied", "evidence": weak}}}
+		if err := ValidateDirectiveTraceability(result, directives, true, nil); err == nil || !strings.Contains(err.Error(), "citable evidence") {
+			t.Fatalf("generic disposition evidence %v must be rejected: %v", weak, err)
+		}
+	}
+	result := Row{"verdict": "pass", "directive_dispositions": []any{Row{"directive_id": "T-c:planner_directive:0", "disposition": "satisfied", "evidence": "inspected internal/praector/policy.go"}}}
+	if err := ValidateDirectiveTraceability(result, directives, true, nil); err != nil {
+		t.Fatalf("path-citing disposition evidence must be accepted: %v", err)
+	}
+	siteProse := Row{"verdict": "pass", "impact_enumeration": Row{"method": "grep", "sites": []any{Row{"site": "config.go", "disposition": "unaffected", "evidence": "verified in code"}}}}
+	if err := ValidateReviewImpactEnumeration(siteProse, nil, nil); err == nil || !strings.Contains(err.Error(), "citable evidence") {
+		t.Fatalf("generic impact-site evidence must be rejected: %v", err)
+	}
+	sitePath := Row{"verdict": "pass", "impact_enumeration": Row{"method": "grep", "sites": []any{Row{"site": "config.go", "disposition": "unaffected", "evidence": "grep -n MCPEnabled internal/praector/config.go shows the reader"}}}}
+	if err := ValidateReviewImpactEnumeration(sitePath, nil, nil); err != nil {
+		t.Fatalf("path-citing site evidence must be accepted: %v", err)
+	}
+}
+
+func TestPlainStringMustDirectiveIsNonDeferrable(t *testing.T) {
+	directives := Rows{{
+		"id": "T-criticstr", "profile": "critic", "status": TaskComplete,
+		"result_json": JSONDumps(Row{"planner_directives": []any{"MUST: keep the loopback bind gate strict.", "SHOULD: prefer narrow heuristics.", "An unlevelled suggestion."}}),
+	}}
+	harvested := InheritedDirectives(directives)
+	if len(harvested) != 3 {
+		t.Fatalf("expected three harvested directives, got %#v", harvested)
+	}
+	byID := map[string]InheritedDirective{}
+	for _, directive := range harvested {
+		byID[directive.ID] = directive
+	}
+	if byID["T-criticstr:planner_directive:0"].NormativeLevel != "MUST" {
+		t.Fatalf("a plain-string `MUST: ...` critic directive must harvest as MUST-level: %#v", byID)
+	}
+	if byID["T-criticstr:planner_directive:1"].NormativeLevel != "SHOULD" {
+		t.Fatalf("a plain-string `SHOULD: ...` critic directive must harvest as SHOULD-level: %#v", byID)
+	}
+	if byID["T-criticstr:planner_directive:2"].NormativeLevel != "" {
+		t.Fatalf("an unlevelled string directive must stay unlevelled: %#v", byID)
+	}
+	if err := ValidateDirectiveTraceability(Row{"verdict": "pass", "directive_dispositions": stringDispositions(harvested, "deferred", "DEC-x")}, harvested, true, nil); err == nil || !strings.Contains(err.Error(), "MUST-level") {
+		t.Fatalf("a MUST string directive must not be deferrable: %v", err)
+	}
+	if err := ValidateDirectiveTraceability(Row{"verdict": "pass", "directive_dispositions": stringDispositions(harvested, "satisfied", "")}, harvested, true, nil); err != nil {
+		t.Fatalf("a MUST string directive must be satisfiable: %v", err)
+	}
+	if err := ValidateDirectiveTraceability(Row{"verdict": "pass", "directive_dispositions": stringDispositions(harvested, "explicit_exception", "DEC-x")}, harvested, true, nil); err != nil {
+		t.Fatalf("a MUST string directive must accept explicit_exception with a decision id: %v", err)
+	}
+	mustOnly := []InheritedDirective{byID["T-criticstr:planner_directive:0"]}
+	if err := ValidateDirectiveTraceability(Row{"verdict": "pass"}, mustOnly, true, nil); err == nil || !strings.Contains(err.Error(), "did not disposition") {
+		t.Fatalf("unknown/missing directive rejection must stay intact: %v", err)
+	}
+	if err := ValidateDirectiveTraceability(Row{"verdict": "pass"}, nil, true, nil); err != nil {
+		t.Fatalf("the zero-directive clean pass must stay intact: %v", err)
+	}
+}
+
+func stringDispositions(directives []InheritedDirective, disposition, decisionID string) []any {
+	out := []any{}
+	for _, directive := range directives {
+		item := Row{"directive_id": directive.ID, "disposition": disposition, "evidence": []any{"inspected internal/praector/policy.go"}}
+		if disposition != "satisfied" && decisionID != "" {
+			item["decision_id"] = decisionID
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func TestDirectiveIDDerivationIsStableAndDistinctFromResearchRefs(t *testing.T) {
