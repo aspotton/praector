@@ -547,6 +547,30 @@ The JSON includes `planning_policy` with `critic_required`, `plan_review_require
 
 For required-critic work, the first critic is sealed when the coordinator reaches its first final plan-review handoff. If a later coordinator repair/revision changes implementation/research/advice contracts or meaningful dependencies, Praector blocks plan review and write claims, creates `Revalidate materially changed plan`, then creates `Apply critic revalidation` coordinator work. If that coordinator makes another material change, another critic round is expected. Status changes, timestamps, coordinator/reviewer bookkeeping, and orchestration-only edges do not trigger revalidation.
 
+## Gate traceability: reading a rejected submit and clearing a legacy exception
+
+Directive traceability and sibling-effect enumeration are enforced deterministically at three points: the reviewer's `praector result submit`, the claim-time planning barrier, and collection acceptance. No CLI command, flag, or output is involved.
+
+A rejected review/plan-review submit names exactly what is missing, deterministically:
+
+- `directive_dispositions did not disposition directive ids: T-…,T-…` — the result must add one disposition object per listed stable directive id (`<source-task-id>:<kind>:<ordinal>`), each with `disposition` (`satisfied`/`deferred`/`explicit_exception`) and concrete `evidence`. Rerun guidance: the reviewer simply resubmits with the dispositions; the ids come verbatim from the Envelope's `inherited_directives`.
+- `directive_dispositions <id> deferred requires a durable decision_id` — record the decision first (`praector decision add --statement ... --collection COL-...`) and resubmit citing it.
+- `references unknown directive ids (report genuinely new directives under additions, not dispositions)` — move the new directive into `additions` with a `reason`.
+- `passing review requires impact_enumeration …` / `impact_enumeration.sites[N] …` — the passing review must name its enumeration method and dispose every listed sibling-effect site with evidence; an introduced configuration knob with no `reader_paths` is reported as the blocking introduced-but-never-read defect.
+- `oracle-exception review requires a non-empty probes list …` — the conformance-exception result must add probes with `scenario`, `command_or_test`, and `observed_outcome`.
+
+If a completed review's gap is only discovered later, Praector records a `DIRECTIVE_TRACEABILITY_GAP` event on that task (visible via `praector collection show` / events) instead of silently passing.
+
+Collections whose reviews completed before this contract have results without the new fields. New submissions are always strict, but the retroactive claim-time and acceptance gates honor one documented escape hatch so history is not rewritten or retroactively failed:
+
+```bash
+praector decision add --collection COL-... \
+  --statement "Legacy gate-traceability exception: <why this pre-contract history is accepted as-is>" \
+  --rationale "<evidence>"
+```
+
+A durable decision whose statement begins with `Legacy gate-traceability exception:` clears the retroactive gates for that Collection; deleting or superseding it re-enables them. It has no effect on new submissions, and it should be recorded deliberately by the operator, not reflexively — the honest default is to let the reviewer resubmit with real dispositions.
+
 ## Troubleshooting
 
 ### `Required executable not found on PATH: dolt`
