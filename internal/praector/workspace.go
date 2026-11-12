@@ -539,6 +539,20 @@ var (
 	derivationSkipExt = map[string]bool{".md": true, ".txt": true, ".rst": true, ".license": true, ".lock": true, ".sum": true}
 )
 
+// ConfigCandidateOutcome pairs a diff-derived candidate list with an explicit
+// basis-availability outcome so a submit or acceptance seam can distinguish
+// "this change introduced no knobs" from "no diff basis could be derived".
+// BasisUnavailable is empty whenever a derivable three-dot diff basis existed
+// (regardless of whether any candidates were found) and non-empty — naming the
+// missing ref or state — when the project root is not a Git repository or the
+// base/integration branch is absent. A git invocation error against an EXISTING
+// basis is returned as a non-nil error and is never folded into this field, so
+// a hard git failure can never masquerade as an empty candidate list.
+type ConfigCandidateOutcome struct {
+	Candidates       []DerivedConfigCandidate
+	BasisUnavailable string
+}
+
 // DeriveConfigCandidates heuristically derives candidate configuration knobs
 // introduced between the project base branch and the collection integration
 // branch. The diff basis is deliberately the same three-dot merge-base form
@@ -554,42 +568,64 @@ var (
 // account for — NOT a completeness proof: the extraction is narrow
 // (flag/key literals, environment-variable names, config/table keys, and
 // setting-like struct/map keys) and human-falsifiable in both directions.
-// If the repo or either branch simply does not exist (e.g. a collection that
-// never created Git state), it returns no candidates with no error; a git
-// invocation failure against an existing basis is returned loudly rather
-// than silently degraded to an empty list.
+// When the repo or either branch simply does not exist (e.g. a collection that
+// never created Git state) it returns no candidates with no error; that is an
+// ABSENT basis rather than a genuine no-knob diff, so callers that must tell
+// the two apart use DeriveConfigCandidatesWithBasis. A git invocation failure
+// against an existing basis is returned loudly rather than degraded to an
+// empty list.
 func (w *GitWorkspace) DeriveConfigCandidates(project, collection Row) ([]DerivedConfigCandidate, error) {
+	outcome, err := w.DeriveConfigCandidatesWithBasis(project, collection)
+	return outcome.Candidates, err
+}
+
+// DeriveConfigCandidatesWithBasis is DeriveConfigCandidates plus an explicit
+// absent-basis outcome. An absent basis (a non-Git project root or an absent
+// base/integration branch) yields no candidates AND a named
+// ConfigCandidateOutcome.BasisUnavailable so a seam can record it as auditable
+// state instead of letting it read as a clean no-knob diff. The three-dot
+// `base...integration` basis, the `-z` path listing, and the `--no-renames`
+// added-side scan are used unchanged on every path that DOES compute
+// candidates. A git invocation error against an existing basis is a hard error,
+// never an absent-basis outcome.
+func (w *GitWorkspace) DeriveConfigCandidatesWithBasis(project, collection Row) (ConfigCandidateOutcome, error) {
 	repo := w.RepoRoot(project)
 	base := S(project, "base_branch")
 	branch := S(collection, "integration_branch")
-	// A project root that is simply not a Git repository (or a collection
-	// that never created its branches) has no derivable diff basis: that is
-	// an absent basis, not a git error, and yields no candidates. Once the
-	// basis exists, any git failure below is returned loudly.
+	// Distinguish the three states explicitly: a git invocation error at the
+	// rev-parse gate is a hard error; a git run that reports "not a repository"
+	// (non-zero exit, no run error) is an absent basis; and a repository whose
+	// base or integration branch is missing is an absent basis naming the ref.
 	repoCheck, err := w.git(repo, false, "rev-parse", "--git-dir")
-	if err != nil || repoCheck.Code != 0 {
-		return nil, nil
+	if err != nil {
+		return ConfigCandidateOutcome{}, err
+	}
+	if repoCheck.Code != 0 {
+		return ConfigCandidateOutcome{BasisUnavailable: fmt.Sprintf("project root %s is not a git repository", repo)}, nil
 	}
 	baseOK, err := w.BranchExists(repo, base)
 	if err != nil {
-		return nil, err
+		return ConfigCandidateOutcome{}, err
+	}
+	if !baseOK {
+		return ConfigCandidateOutcome{BasisUnavailable: fmt.Sprintf("base branch %q does not exist", base)}, nil
 	}
 	branchOK, err := w.BranchExists(repo, branch)
 	if err != nil {
-		return nil, err
+		return ConfigCandidateOutcome{}, err
 	}
-	if !baseOK || !branchOK {
-		return nil, nil
+	if !branchOK {
+		return ConfigCandidateOutcome{BasisUnavailable: fmt.Sprintf("integration branch %q does not exist", branch)}, nil
 	}
 	paths, err := w.ChangedPaths(repo, base, branch)
 	if err != nil {
-		return nil, err
+		return ConfigCandidateOutcome{}, err
 	}
 	p, err := w.git(repo, true, "diff", "-z", "--unified=0", "--no-renames", base+"..."+branch)
 	if err != nil {
-		return nil, err
+		return ConfigCandidateOutcome{}, err
 	}
-	return extractConfigCandidates(paths, p.Stdout), nil
+	return ConfigCandidateOutcome{Candidates: extractConfigCandidates(paths, p.Stdout)}, nil
 }
 
 // ChangedPaths lists the files changed between base and head using the

@@ -274,20 +274,31 @@ func TestDeriveConfigCandidatesIsDeterministicAndFailsLoudly(t *testing.T) {
 			t.Fatalf("a base-branch-only token must not be derived as introduced (two-dot drift): %v", after)
 		}
 	}
-	// A missing branch is an absent basis (no candidates, no error); a broken
-	// repository path must fail loudly rather than return an empty list.
+	// An absent diff basis (a missing branch, or a non-repository root) is an
+	// explicitly surfaced basis-unavailable outcome, not a silent empty
+	// candidate list, so it cannot be mistaken for a genuine no-knob diff; a
+	// git error against an existing basis still fails loudly.
 	missingBranch := Row{"id": "COL-missing", "integration_branch": "praector/collections/col-missing"}
-	none, err := w.DeriveConfigCandidates(project, missingBranch)
-	if err != nil || len(none) != 0 {
-		t.Fatalf("an absent integration branch must yield no candidates with no error: %v %v", none, err)
+	none, err := w.DeriveConfigCandidatesWithBasis(project, missingBranch)
+	if err != nil || len(none.Candidates) != 0 || none.BasisUnavailable == "" {
+		t.Fatalf("an absent integration branch must be a named basis-unavailable outcome with no candidates: %#v %v", none, err)
+	}
+	if !strings.Contains(none.BasisUnavailable, "praector/collections/col-missing") {
+		t.Fatalf("the absent-basis outcome must name the missing ref: %#v", none)
 	}
 	if _, err = w.ChangedPaths(filepath.Join(t.TempDir(), "not-a-repo"), "main", "main"); err == nil {
 		t.Fatal("ChangedPaths must fail loudly on a git error, never return an empty list silently")
 	}
 	broken := Row{"id": "PRJ-broken", "root_path": filepath.Join(t.TempDir(), "not-a-repo"), "base_branch": "main"}
-	quiet, err := w.DeriveConfigCandidates(broken, collection)
-	if err != nil || len(quiet) != 0 {
-		t.Fatalf("a non-repository root is an absent basis, not a git error: %v %v", quiet, err)
+	quiet, err := w.DeriveConfigCandidatesWithBasis(broken, collection)
+	if err != nil || len(quiet.Candidates) != 0 || quiet.BasisUnavailable == "" {
+		t.Fatalf("a non-repository root must be a named basis-unavailable outcome, not a git error: %#v %v", quiet, err)
+	}
+	// A derivable basis with a real diff is NOT basis-unavailable, so the new
+	// visible state stays distinct from a genuine candidate-bearing diff.
+	present, err := w.DeriveConfigCandidatesWithBasis(project, collection)
+	if err != nil || present.BasisUnavailable != "" {
+		t.Fatalf("a derivable diff basis must not report a basis-unavailable outcome: %#v %v", present, err)
 	}
 }
 

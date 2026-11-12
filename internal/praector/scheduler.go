@@ -1141,9 +1141,13 @@ func (s *Scheduler) observeDirectiveTraceabilityGaps(collectionID string, consum
 		return
 	}
 	observed := map[string]bool{}
+	harvested := map[string]bool{}
 	for _, ev := range seenEvents {
-		if S(ev, "event_type") == "DIRECTIVE_TRACEABILITY_GAP" {
+		switch S(ev, "event_type") {
+		case "DIRECTIVE_TRACEABILITY_GAP":
 			observed[S(ev, "task_id")] = true
+		case "DIRECTIVE_TRACEABILITY_EMPTY_HARVEST":
+			harvested[S(ev, "task_id")] = true
 		}
 	}
 	for _, consumer := range consumers {
@@ -1157,6 +1161,21 @@ func (s *Scheduler) observeDirectiveTraceabilityGaps(collectionID string, consum
 		}
 		directives := InheritedDirectives(ancestors)
 		if len(directives) == 0 {
+			// A directive-bearing ancestor (a completed critic/plan_review/
+			// advise) that yields zero harvestable directives is recorded, once
+			// per consumer, so a silently-empty ancestor is not mistaken for no
+			// ancestor at all. A genuinely directive-free lineage (no such
+			// ancestor) stays a silent clean pass. This seam is outside the
+			// store lock, so Store.Event is safe; it is observability only and
+			// never blocks.
+			if len(ancestors) > 0 && !harvested[S(consumer, "id")] {
+				ids := []string{}
+				for _, ancestor := range ancestors {
+					ids = append(ids, S(ancestor, "id"))
+				}
+				_ = s.Store.RecordEmptyDirectiveHarvest(S(consumer, "project_id"), collectionID, S(consumer, "id"), ids)
+				harvested[S(consumer, "id")] = true
+			}
 			continue
 		}
 		result := M(consumer, "result")

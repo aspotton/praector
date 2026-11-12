@@ -1215,14 +1215,47 @@ func (s *Service) ResultSubmit(ctx context.Context, in ResultSubmitInput) (Resul
 // candidate list (base...collection integration branch at the moment of the
 // check) that the submit and acceptance seams thread into the pure policy
 // validators. Git access lives here, at the seam, never inside the Store or
-// policy.go. A project root or branch that does not exist yields no
-// candidates; a git failure against an existing basis is returned loudly.
+// policy.go. A git failure against an existing basis is returned loudly. When
+// the diff basis cannot be derived at all (a non-Git project root or an absent
+// base/integration branch) it yields no candidates AND records the absent
+// basis as one deduped durable event so it is not mistaken for a genuine
+// no-knob diff.
 func (s *Service) deriveConfigCandidates(project, collection Row) ([]DerivedConfigCandidate, error) {
 	w, e := NewGitWorkspace(s.store, s.cfg)
 	if e != nil {
 		return nil, e
 	}
-	return w.DeriveConfigCandidates(project, collection)
+	outcome, e := w.DeriveConfigCandidatesWithBasis(project, collection)
+	if e != nil {
+		return nil, e
+	}
+	if outcome.BasisUnavailable != "" {
+		s.recordAbsentConfigBasis(project, collection, outcome.BasisUnavailable)
+	}
+	return outcome.Candidates, nil
+}
+
+// recordAbsentConfigBasis surfaces an absent diff basis as at most one durable
+// CONFIG_BASIS_UNAVAILABLE event per collection, naming the collection and the
+// reason the three-dot candidate derivation could not proceed (which ref or
+// state is missing). This makes an absent/never-created integration branch (or
+// a non-Git root) auditable and distinguishable from a change that genuinely
+// introduced no knobs. It is observability only — the caller continues with an
+// empty candidate list — and never blocks or rejects. These seams hold the Git
+// workspace outside the store lock, so Store.Event is safe, and the existing
+// per-collection event scan keeps retries and repeated sweeps from spamming.
+func (s *Service) recordAbsentConfigBasis(project, collection Row, reason string) {
+	if s.store == nil {
+		return
+	}
+	if events, e := s.store.EventsForCollection(S(collection, "id"), 200); e == nil {
+		for _, ev := range events {
+			if S(ev, "event_type") == "CONFIG_BASIS_UNAVAILABLE" {
+				return
+			}
+		}
+	}
+	_ = s.store.Event(S(project, "id"), S(collection, "id"), "", "", "CONFIG_BASIS_UNAVAILABLE", Row{"reason": reason})
 }
 
 // projectForScope resolves the owning project for a memory/decision scope. An
