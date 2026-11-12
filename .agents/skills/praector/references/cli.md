@@ -2,27 +2,81 @@
 
 Use this reference when driving Praector with the local `praector` binary instead of the MCP tools. The CLI and the MCP server are two adapters over the same typed `Service`/`Store` paths, so every durable concept, gate, state, and authorization rule in [concepts.md](concepts.md) applies unchanged. Only the mechanics below differ.
 
+This page answers CLI usage questions **in place**: the command/usage table below is derived from the `commandHelp` registry (`internal/praector/help.go`) and is kept in sync by a drift-guard test (`TestSkillCLICommandHelpCoversCommandHelp`), so you normally do **not** need `praector <command> --help` to discover flags. For deeper prose on any command, follow the linked [repository `docs/CLI.md`](../../../../docs/CLI.md) section (that path resolves from the **repository root**, not this skill directory — `docs/CLI.md` lives outside the skill package).
+
 ## Establish the boundary
 
 1. Check the binary: `command -v praector && praector --version`.
 2. Check dependencies when something behaves oddly: `praector doctor`.
-3. `praector <command> --help` is authoritative for exact parser behavior on the installed version.
+3. Prefer the usage table below. `praector <command> --help` remains **authoritative for exact parser behavior on the installed version**, so treat it as a **fallback** — reach for it only when the installed binary's version differs from this checkout, or when a flag is genuinely absent from the table. It is not the default discovery step, and a stale table must still defer to the binary.
 4. If neither the CLI nor MCP tools are available, say so; never simulate a durable action with raw `git`/`dolt` commands.
 
-## Execution model difference that matters most
+## Command and usage table
 
-The MCP surface is enqueue-only; the CLI can also **run** the graph itself.
+Every `praector` command and its exact usage line (copied verbatim from `commandHelp`). `<NAME>` is a required positional argument; `[--flag X]` is optional; a `[TARGET]`-style bracketed positional is optional and defaults to context (see Managed worker IDs below).
 
-- `praector run OBJECTIVE` (attached) starts a scheduler in that process and blocks until the Collection is `COMPLETE` or `BLOCKED`. For an agent this can be a very long block.
-- `praector run --detach OBJECTIVE` creates durable work without executing it; the running `praector daemon` (or a later attached command) does the work. This is the CLI equivalent of an MCP `praector_run`.
+| Command | Exact usage line | Positional args | Gotcha / required flags | Prose |
+| --- | --- | --- | --- | --- |
+| `init` | `Usage: praector init [--name NAME] [--base-branch BRANCH] [--opencode PATH]` | none (registers cwd) | Real write: registers the current repo; needs explicit authorization. | [Initialize](../../../../docs/CLI.md#initialize) |
+| `run` | `Usage: praector run OBJECTIVE [--title TITLE] [--project ID] [--detach] [--max-workers N]` | `OBJECTIVE` | Attached `run` **blocks**; `--detach` only enqueues for a daemon. | [Run an objective](../../../../docs/CLI.md#run-an-objective) |
+| `status` | `Usage: praector status [TARGET] [--project ID]` | `[TARGET]` optional | No target → project-level status; pass a `COL-*`/`T-*` for that scope. | [Status](../../../../docs/CLI.md#status) |
+| `graph` | `Usage: praector graph [COLLECTION] [--project ID]` | `[COLLECTION]` optional | Defaults to the latest collection. | [Graph](../../../../docs/CLI.md#graph) |
+| `daemon` | `Usage: praector daemon [--once] [--max-workers N]` | none | Only one scheduler owner per `PRAECTOR_HOME`; `--once` reconciles and exits. | [Scheduler / daemon](../../../../docs/CLI.md#scheduler--daemon) |
+| `doctor` | `Usage: praector doctor` | none | Validates dependencies and registration; no args. | [Doctor](../../../../docs/CLI.md#doctor) |
+| `logs` | `Usage: praector logs TARGET [--tail N]` | `TARGET` (required) | `--tail N` streams a running Attempt's real output. | [Logs](../../../../docs/CLI.md#logs) |
+| `collection show` | `Usage: praector collection show COL-ID` | `COL-ID` | JSON output (policy, revisions, acceptance). | [Collection lifecycle](../../../../docs/CLI.md#collection-lifecycle) |
+| `collection revise` | `Usage: praector collection revise COL-ID --reason TEXT [--detach] [--max-workers N]` | `COL-ID` | `--reason` is **required**; reopens a COMPLETE, unaccepted collection. | [Revise](../../../../docs/CLI.md#revise) |
+| `collection diff` | `Usage: praector collection diff COL-ID [--target BRANCH] [--stat]` | `COL-ID` | `--stat` is the safe preview before accept/pr. | [Diff](../../../../docs/CLI.md#diff) |
+| `collection pr` | `Usage: praector collection pr COL-ID [--draft] [--title TITLE] [--base BRANCH] [--remote REMOTE] [--dry-run] [--refresh-copy] [--open]` | `COL-ID` | **Real push/PR** — needs explicit authorization; preview with `--dry-run`. | [Pull request](../../../../docs/CLI.md#pull-request) |
+| `collection accept` | `Usage: praector collection accept COL-ID [--target BRANCH] [--no-ff] [--dry-run] [--cleanup] [--delete-branches]` | `COL-ID` | **Real fast-forward accept** — explicit authorization; `--no-ff`/`--delete-branches` are opt-ins. | [Accept](../../../../docs/CLI.md#accept) |
+| `collection cleanup` | `Usage: praector collection cleanup COL-ID [--delete-branches] [--force]` | `COL-ID` | **Really removes worktrees**; never deletes unaccepted branches. | [Cleanup](../../../../docs/CLI.md#cleanup) |
+| `profile list` | `Usage: praector profile list` | none | Lists profiles and capability mode. | [Profile](../../../../docs/CLI.md#profile) |
+| `profile show` | `Usage: praector profile show PROFILE` | `PROFILE` | Prints inherited global + role contracts. | [Profile](../../../../docs/CLI.md#profile) |
+| `project list` | `Usage: praector project list` | none | Start here when the Project is unknown. | [Project](../../../../docs/CLI.md#project) |
+| `project show` | `Usage: praector project show [--project ID]` | none (flag-only) | Project selected via `--project`, not positional. | [Project — Show](../../../../docs/CLI.md#project) |
+| `task show` | `Usage: praector task show TASK` | `TASK` | Shows one task. | [Task — Show](../../../../docs/CLI.md#task) |
+| `task list` | `Usage: praector task list [--collection COL-ID] [--project ID]` | none | Defaults to the latest collection. | [Task — List](../../../../docs/CLI.md#task) |
+| `task retry` | `Usage: praector task retry TASK [--reason TEXT] [--detach] [--max-workers N]` | `TASK` | Resumes immediately by default; `--detach` queues. | [Retry a failed task](../../../../docs/CLI.md#retry-a-failed-task) |
+| `task request` | `Usage: praector task request --profile PROFILE --title TITLE --objective TEXT --reason TEXT [--task TASK] [--blocking] [--depends-on TASK]... [--workspace MODE]` | none (all flags) | `--profile`, `--title`, `--objective`, `--reason` all **required**; `--depends-on` may repeat. | [Request](../../../../docs/CLI.md#request) |
+| `task add-dependency` | `Usage: praector task add-dependency TASK --on DEPENDENCY [--caller TASK]` | `TASK` | Coordinator-only; `--on` names the prerequisite. | [Add dependency](../../../../docs/CLI.md#add-dependency) |
+| `task supersede` | `Usage: praector task supersede OLD --with NEW --reason TEXT [--caller TASK]` | `OLD` | Coordinator-only; `--with` and `--reason` required. | [Supersede](../../../../docs/CLI.md#supersede) |
+| `context show` | `Usage: praector context show [--task TASK]` | none | Inside a worker no `--task` is needed. | [Context](../../../../docs/CLI.md#context) |
+| `coordinator attention` | `Usage: praector coordinator attention --reason TEXT [--task TASK] [--blocking]` | none (flag-only) | `--reason` is **required**. | [Coordinator escalation](../../../../docs/CLI.md#coordinator-escalation) |
+| `result show` | `Usage: praector result show [TASK]` | `[TASK]` optional | Defaults to the current task. | [Result — Show](../../../../docs/CLI.md#result) |
+| `result submit` | `Usage: praector result submit [--task TASK] [--stdin] [--file PATH] [--summary TEXT] [--status STATUS]` | none | Structured results use `--stdin` (mandatory for `review`/`plan_review`). | [Submit](../../../../docs/CLI.md#submit) |
+| `memory add` | `Usage: praector memory add --text TEXT [--project ID] [--collection COL-ID] [--task TASK] [--scope SCOPE] [--state STATE] [--kind KIND]` | none (flag-only) | `--text` is **required**. | [Memory — Add](../../../../docs/CLI.md#memory) |
+| `memory list` | `Usage: praector memory list [--project ID] [--collection COL-ID] [--state STATE]` | none | Filter by project/collection/state. | [Memory](../../../../docs/CLI.md#memory) |
+| `decision add` | `Usage: praector decision add --statement TEXT [--rationale TEXT] [--project ID] [--collection COL-ID] [--task TASK]` | none (flag-only) | `--statement` is **required**. | [Decision](../../../../docs/CLI.md#decision) |
+
+### Namespace / group usage lines
+
+A namespace `--help` prints its subcommand names but **zero flags**, so do not spend a call on it — the flags are on the per-leaf commands above. The group forms are:
+
+```text
+Usage: praector collection {show|revise|diff|pr|accept|cleanup} ...
+Usage: praector profile {list|show} ...
+Usage: praector project {list|show} ...
+Usage: praector task {show|list|retry|request|add-dependency|supersede} ...
+Usage: praector context {show} ...
+Usage: praector coordinator {attention} ...
+Usage: praector result {show|submit} ...
+Usage: praector memory {add|list} ...
+Usage: praector decision {add} ...
+```
+
+## Mandatory flags for a useful call
+
+These flags are required and are the usual cause of a wrong invocation: `task request` (`--profile` `--title` `--objective` `--reason`), `coordinator attention` (`--reason`), `memory add` (`--text`), `decision add` (`--statement`), `collection revise` (`--reason`). Arguments such as `run OBJECTIVE`, `logs TARGET`, and the `COL-ID`/`TASK` targets are **positional**, whereas `project show` is **flag-only** (`--project ID`) with no positional argument.
+
+## Managed worker IDs and run semantics
+
+- `praector run OBJECTIVE` (attached) starts a scheduler in that process and **blocks** until the Collection is `COMPLETE` or `BLOCKED` — potentially a very long block for an agent.
+- `praector run --detach OBJECTIVE` **only enqueues** durable work; the running `praector daemon` (or a later attached command) does the work. This is the CLI equivalent of an MCP `praector_run`.
 - `praector task retry` and `praector collection revise` resume the Collection immediately by default; pass `--detach` to queue them for an existing daemon instead.
 - Only one scheduler owner may execute for a given `PRAECTOR_HOME`. If a daemon is already running, prefer `--detach` rather than starting a competing scheduler. `praector daemon --once` reconciles available work and exits.
-
-## Context resolution difference
+- Inside a managed worker, `PRAECTOR_TASK_ID` (and friends) make IDs **implicit**, so `praector task request`, `praector context show`, `praector result show`, and `praector result submit --stdin` work with no IDs. Outside a worker, always pass explicit IDs.
 
 The CLI resolves project context in this order: explicit `--project`/ID, then `PRAECTOR_PROJECT_ID`, then the nearest ancestor `.praector/project.toml` marker. Inside the target checkout no ID is needed; outside it, pass `--project PRJ-*` or a `COL-*`/`T-*` target explicitly rather than trusting the current directory.
-
-Inside a managed worker, `PRAECTOR_TASK_ID` and friends make IDs implicit, so `praector task request`, `praector context show`, `praector result show`, and `praector result submit --stdin` work with no IDs. Outside a worker, always pass explicit IDs.
 
 ## Command surface equivalence
 
