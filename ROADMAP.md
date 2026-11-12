@@ -69,6 +69,14 @@ The goal is full Windows support, not a permanently experimental port.
 
 MCP should expose the same durable control plane that the CLI uses, not create a second orchestration implementation.
 
+**Status:** the local loopback listener is live, and the CLI/MCP surface is now
+commandHelp-driven so every command maps to exactly one MCP tool or resource.
+Read-only tools and pass-through queue writes are always exposed, and privileged
+collection-finalizing tools (`collection pr`/`accept`/`cleanup`, which only run
+the durable validation and return the plan) sit behind a separate, default-off
+`privileged` opt-in. The remaining work below (remote transport + auth, richer
+escalation integration) stays on the roadmap.
+
 ### Architecture principles
 
 - CLI and MCP share the same store/service/domain operations.
