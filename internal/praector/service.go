@@ -491,7 +491,9 @@ type EventsOutput struct {
 // reads only and launches no process, so it works with no daemon running. Scope
 // resolution mirrors the other read commands: an explicit --project/--collection
 // wins, a COL-*/T-*/PRJ-* Target infers the scope, and an otherwise-empty scope
-// falls back to the ambient project context.
+// falls back to the ambient project context. A supplied scope id must resolve,
+// so a mistyped id is the same not-found error the sibling read commands raise,
+// while a valid scope that simply has no events stays an empty successful result.
 func (s *Service) Events(ctx context.Context, in EventsInput) (EventsOutput, error) {
 	pid, cid, tid := in.ProjectID, in.CollectionID, in.TaskID
 	if t := strings.TrimSpace(in.Target); t != "" {
@@ -510,19 +512,70 @@ func (s *Service) Events(ctx context.Context, in EventsInput) (EventsOutput, err
 			}
 		}
 	}
+	// The project token as the operator expressed it, kept for the contradictory
+	// scope message after pid is canonicalized to the resolved row id.
+	suppliedProject := pid
 	// A scope with no collection/task filter still resolves the ambient project
 	// (CLI cwd convenience), matching MemoryList; the project scan is bounded by
 	// the finite Limit. A durable COL-*/T-* filter never inherits the daemon cwd.
+	ambient := false
 	if pid == "" && cid == "" && tid == "" {
 		pr, e := s.projectForScope("", "")
 		if e != nil {
 			return EventsOutput{}, e
 		}
 		pid = S(pr, "id")
+		ambient = true
 	}
 	sinceCreatedAt, sinceID, e := decodeEventCursor(in.Since)
 	if e != nil {
 		return EventsOutput{}, e
+	}
+	// An explicitly supplied scope id must resolve, so a mistyped target is the
+	// same error the sibling read commands raise; the wording comes from the
+	// store getters themselves rather than from new events-path text. This runs
+	// after the cursor check so a malformed --since keeps error precedence, and
+	// on the merged post-inference filters so a TARGET and a flag naming one
+	// entity resolve exactly once. The ambient project resolved above is already
+	// a durable row id and stays outside these checks.
+	if pid != "" && !ambient {
+		pr, e := s.store.GetProject(pid)
+		if e != nil {
+			return EventsOutput{}, e
+		}
+		// Canonicalize to the row id: GetProject also matches name and
+		// root_path, and filtering on the resolved id is what makes a project
+		// named on the command line return its rows (the MemoryList and
+		// DecisionAdd precedent) instead of a silently empty page.
+		pid = S(pr, "id")
+	}
+	if cid != "" {
+		c, e := s.store.GetCollection(cid)
+		if e != nil {
+			return EventsOutput{}, e
+		}
+		cid = S(c, "id")
+	}
+	if tid != "" {
+		tk, e := s.store.GetTask(tid)
+		if e != nil {
+			return EventsOutput{}, e
+		}
+		tid = S(tk, "id")
+	}
+	// A project and a collection that do not belong to each other is a wrong
+	// scope, not an empty one. ProjectForCollection is the same fail-closed
+	// collection-to-project resolver the memory/decision paths use;
+	// projectForScope(pid, cid) cannot prove it because a supplied project
+	// short-circuits before the collection is ever read.
+	if pid != "" && cid != "" {
+		owner, e := s.store.ProjectForCollection(cid)
+		if e != nil {
+			return EventsOutput{}, e
+		}
+		if S(owner, "id") != pid {
+			return EventsOutput{}, fmt.Errorf("collection %s does not belong to project %s", cid, suppliedProject)
+		}
 	}
 	rows, e := s.store.ListEvents(pid, cid, tid, in.Type, sinceCreatedAt, sinceID, in.Limit)
 	if e != nil {

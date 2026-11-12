@@ -132,6 +132,17 @@ Reads the durable `events` log **directly from the store**, so it works with **n
 
 Rows are returned deterministically **oldest-first** ordered by `created_at` then `id`, each showing the `EVT`/`COL`/`T`/`ATTEMPT` ids, the `event_type`, and the payload. The final line prints a `next_cursor` token; pass it back unchanged as `--since CURSOR` to page forward. `--since` is an **exclusive** composite `(created_at, id)` cursor, so paging never repeats or skips a row. A project-scoped listing (no collection/task filter) is permitted but always bounded by `--limit` (finite default) because the `events` table has no `project_id` index.
 
+A supplied scope id must **exist**: like `collection show`, `graph`, and `task show`, `events` **fails closed** on a mistyped target with the same not-found message the store itself produces, whether the scope was given as the positional `TARGET` or as the equivalent flag:
+
+```bash
+praector events COL-DEADBEEF        # praector: collection not found: COL-DEADBEEF   (exit 1)
+praector events --collection COL-DEADBEEF
+praector events T-deadbeef          # praector: task not found: T-deadbeef            (exit 1)
+praector events --project PRJ-nope  # praector: project not found: PRJ-nope           (exit 1)
+```
+
+A `--project` whose project is not the owner of the supplied `--collection` is rejected the same way rather than returning an empty page. A `--project` given as a project **name** or **root path** resolves to that project's id and returns its rows. None of this changes the empty-but-valid case: an existing scope that simply has no matching events is still a successful, empty page with **no** `next_cursor`, so a `--since` paging loop over a quiet scope still terminates cleanly. A malformed `--since` token keeps reporting the invalid-cursor error ahead of any scope resolution.
+
 ```bash
 praector events COL-abc --type TASK_CREATED
 praector events COL-abc --since CURSOR --limit 50

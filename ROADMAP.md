@@ -101,6 +101,15 @@ The derived-knob / scoped-legacy / live-seam / evidence-floor change deliberatel
 - an actor/origin column on `decisions`: the legacy escape's operator ownership is enforced by the schema-free discriminator (collection-scoped + names-collection + `task_id IS NULL`) instead of a real actor attribution;
 - the follow-on (durable decision **DEC-cada832e82**): replacing the objective-regex intent classifier with a persisted, declared, and diff-derived classification so a phrasing choice cannot silently remove a security or external-conformance gate — this change deliberately kept classification call sites readable and did not touch the regex verb lists.
 
+### Deferred from the events fail-closed read surface
+
+Making `praector events` reject unresolvable scope ids deliberately stopped short of the same defect class elsewhere:
+
+- `--type` registry validation: there is no registry of known `event_type` values today and the set is open-ended, so filtering on a misspelled type still returns an empty page. Inventing a registry is a new maintenance invariant rather than a fix to this defect class; a machine-proof of event-type naming is likewise out of scope;
+- an unbounded `--type`-only filter is still not project-scoped: with no `--project`/`--collection`/`TARGET` it scans across projects (bounded only by `--limit`) instead of being confined to the ambient project the way the other read surfaces are;
+- `praector memory list` keeps the identical contradictory-pair silence (`Service.MemoryList` passes the raw `--collection` value alongside the resolved project id, so a mismatched project/collection pair yields an empty list rather than an error). It is the same fix shape as the events pair check and is worth doing as its own change;
+- a `T-*` target is not cross-checked against a simultaneously supplied `--project`/`--collection` (task-to-collection membership pairing), which is a separate semantic question from resolving the ids themselves.
+
 ## 4. MCP interface
 
 MCP is a first-class Praector interface for coding agents and human-facing agents. It must expose the same durable **domain operations** as the CLI rather than invoking CLI subprocesses or maintaining a second orchestration implementation. The normal user experience should be that a human talks to an MCP-capable agent, and that agent can inspect and operate Praector with the same authority/policy boundaries as an equivalent CLI caller.
