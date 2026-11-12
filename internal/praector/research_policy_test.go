@@ -5,6 +5,14 @@ import (
 	"testing"
 )
 
+// passingImpactEnumeration is the minimal durable sibling-effect enumeration
+// a passing review result must carry under the gate-traceability contract.
+func passingImpactEnumeration() Row {
+	return Row{"method": "literal-column grep set", "sites": []any{
+		Row{"site": "internal/praector/store.go", "disposition": "unaffected", "evidence": "grep of internal/praector/store.go for the mutated column shows no other writer"},
+	}}
+}
+
 func validFreshResearchResult() Row {
 	return Row{
 		"status":  "complete",
@@ -440,6 +448,7 @@ func TestSubmitResultEnforcesResearchTraceAndExternalReviewOracle(t *testing.T) 
 	}
 	blackBoxPass := Row{
 		"status": "complete", "verdict": "pass", "summary": "looks good",
+		"impact_enumeration":   passingImpactEnumeration(),
 		"verification_oracles": []any{Row{"kind": "black_box_test", "name": "same-team client", "used": true}},
 	}
 	if _, err = s.SubmitResult(S(review, "id"), blackBoxPass); err == nil {
@@ -451,9 +460,21 @@ func TestSubmitResultEnforcesResearchTraceAndExternalReviewOracle(t *testing.T) 
 	}
 	blackBoxPass["authoritative_oracle_unavailable_reason"] = "No official SDK or provider sandbox is available."
 	blackBoxPass["oracle_exception_decision_id"] = S(decision, "id")
+	if _, err = s.SubmitResult(S(review, "id"), cloneRow(blackBoxPass)); err == nil {
+		t.Fatal("oracle exception without a replacement probes list must be rejected")
+	}
+	blackBoxPass["probes"] = []any{Row{"scenario": "initialize then tools/list over loopback", "command_or_test": "go test ./internal/praector/ -run TestMCPConformance", "observed_outcome": "server counter-offered the implemented revision and served tools/list"}}
 	if _, err = s.SubmitResult(S(review, "id"), blackBoxPass); err != nil {
 		t.Fatalf("durably authorized oracle exception rejected: %v", err)
 	}
+}
+
+func cloneRow(r Row) Row {
+	out := Row{}
+	for k, v := range r {
+		out[k] = v
+	}
+	return out
 }
 
 func freshResearchResultWithID(id string) Row {
@@ -597,6 +618,7 @@ func TestExternalProtocolImplementationReviewDependsOnCurrentResearch(t *testing
 	}
 	if _, err = s.SubmitResult(S(review, "id"), Row{
 		"status": "complete", "verdict": "pass", "summary": "verified",
+		"impact_enumeration":   passingImpactEnumeration(),
 		"research_consistency": researchConsistencyFor(Rows{completedResearch}),
 		"verification_oracles": []any{Row{"kind": "official_reference_oracle", "name": "official SDK", "used": true}},
 	}); err != nil {

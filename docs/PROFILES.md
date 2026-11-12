@@ -102,7 +102,7 @@ The critic is deliberately pre-planning. It does not judge code quality or imple
 - research without exit criteria;
 - vague or human-only acceptance/QA.
 
-It returns actionable planner directives and clearly separates observed facts, assumptions, and unresolved choices.
+It returns actionable planner directives and clearly separates observed facts, assumptions, and unresolved choices. When the change touches shared state, a schema/column, a durable event emitter, a state transition, or a widely-called contract, the critic should emit a sibling-effect sweep as a planner directive (name the effect to enumerate and require per-site dispositions with the enumeration method). Every planner directive, QA directive, and risk mitigation becomes an inherited directive with a stable id that downstream reviews and plan reviews must disposition, so directives are phrased as checkable obligations; non-directive commentary belongs in `unresolved`.
 
 For required-critic collections, the initial critic is a preflight, not a permanent approval. Praector seals it to the first critic-informed material plan at final plan-review handoff. Later changes to implementation/research/advice contracts or their meaningful dependencies require a revalidation critic. A fresh coordinator consumes that revalidation; if incorporation changes the material plan again, another critic round is required before plan review. Completed fresh-research result digests are part of the material fingerprint, so materially refreshed external evidence can stale that seal as well.
 
@@ -117,7 +117,7 @@ The plan reviewer is approval-biased and blocker-focused. It asks whether a capa
 - scope boundaries prevent obvious overreach;
 - executing the graph exactly as written can satisfy all Collection MUST/MUST NOT and acceptance requirements without knowingly relying on a later repair for a defect already visible in the plan.
 
-It does not reject for style or because it prefers another architecture. A known acceptance violation is a true blocker; Praector has no implicit fault-injection exception. A failed verdict stays blocking and causes Praector to wake a coordinator for graph repair; after that coordinator completes, the same durable plan-review Task runs again in a fresh Attempt. A non-failed nonterminal final plan-review gate is single-flight: later coordinators reuse that gate rather than creating a parallel final-review generation.
+It does not reject for style or because it prefers another architecture. A known acceptance violation is a true blocker; Praector has no implicit fault-injection exception. A failed verdict stays blocking and causes Praector to wake a coordinator for graph repair; after that coordinator completes, the same durable plan-review Task runs again in a fresh Attempt. A non-failed nonterminal final plan-review gate is single-flight: later coordinators reuse that gate rather than creating a parallel final-review generation. When `inherited_directives` are present, a passing verdict additionally requires `directive_dispositions` covering every inherited directive (satisfied/deferred/explicit_exception with evidence; deferred/exception require a durable decision id): a graph that leaves an inherited directive unchecked in every downstream contract is not executable.
 
 ## Strategic advisor
 
@@ -130,7 +130,7 @@ The advisor is the deep judgment lane. Its prompt emphasizes:
 - concrete evidence;
 - a trigger for when the recommendation should be revisited.
 
-It also signals confidence and coarse implementation investment when those factors affect the decision, and identifies the condition that would justify revisiting the recommendation. It advises; it does not implement.
+It also signals confidence and coarse implementation investment when those factors affect the decision, and identifies the condition that would justify revisiting the recommendation. It advises; it does not implement. Its `recommendations` and risk `mitigation` entries become inherited directives that downstream reviews and plan reviews must disposition, so they are phrased as concrete checkable obligations; tradeoffs, revisit triggers, and unresolved items remain context and are not harvested as directives.
 
 ## Researcher
 
@@ -144,7 +144,7 @@ The implementation worker treats its Task and completed dependencies as the cont
 
 ## Implementation reviewer
 
-The implementation reviewer re-reads the integrated candidate rather than trusting the implementer result. It independently inspects the diff and meaningful impact surface, reruns appropriate tests, verifies relevant durable documentation when applicable, reproduces important behavior when practical, and submits `verdict: pass|fail` with evidence. It records optional adjacent improvements as non-blocking recommendations/risks rather than failing for preference.
+The implementation reviewer re-reads the integrated candidate rather than trusting the implementer result. It independently inspects the diff and meaningful impact surface, reruns appropriate tests, verifies relevant durable documentation when applicable, reproduces important behavior when practical, and submits `verdict: pass|fail` with evidence. It records optional adjacent improvements as non-blocking recommendations/risks rather than failing for preference. A passing review must also record the sibling-effect sweep in `impact_enumeration`: the enumeration method and an affected/unaffected disposition with evidence for every site performing the same effect (same column/state write, event emitter, state transition, or contract caller). This makes the sweep auditable and falsifiable by a human, not provably complete. Configuration keys/flags introduced by the change must name their reader path — an introduced-but-never-read knob is a blocking defect, not a style preference — while everything the change did not introduce keeps the ordinary style-is-non-blocking discipline. When `inherited_directives` are present, each must be dispositioned in `directive_dispositions` with evidence. On a post-repair review, the previously failed review is a carried dependency: the reviewer re-checks or explicitly refutes each carried finding and says which, without treating the earlier verdict as authoritative.
 
 ## Prompt composition
 

@@ -98,7 +98,7 @@ func TestSemanticReviewFailureCreatesRepairThenFreshIndependentReview(t *testing
 	if !verifiesOriginal || !verifiesRepair {
 		t.Fatalf("fresh post-repair review must verify original and repair implementations: original=%v repair=%v edges=%v", verifiesOriginal, verifiesRepair, edges)
 	}
-	_, _ = s.SubmitResult(S(review2, "id"), Row{"status": "complete", "summary": "repair verified", "verdict": "pass"})
+	_, _ = s.SubmitResult(S(review2, "id"), Row{"status": "complete", "summary": "repair verified", "verdict": "pass", "impact_enumeration": passingImpactEnumeration()})
 	_ = s.SetTaskStatus(S(review2, "id"), TaskComplete, "fresh review passed")
 	missing, err := s.ImplementationsMissingPassingReview(S(c, "id"))
 	if err != nil {

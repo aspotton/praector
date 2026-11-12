@@ -626,6 +626,8 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		active = activeTasks(tasks)
 	}
 
+	s.observeDirectiveTraceabilityGaps(collectionID, active, latestCritic)
+
 	writeTasks := Rows{}
 	for _, t := range active {
 		if S(t, "profile") == "implement" && (S(t, "status") == TaskPending || S(t, "status") == TaskReady) {
@@ -1124,6 +1126,77 @@ func (s *Scheduler) processResultMetadata(task Row) {
 	}
 }
 
+// observeDirectiveTraceabilityGaps surfaces completed dispositioning
+// consumers (review/plan_review) whose inherited planning directives are not
+// dispositioned. The durable gates live at SubmitResult and at the claim-time
+// planning gates; this observation is operator-visible only and never rewrites
+// history or strands an already-accepted collection. Legacy collections are
+// exempted only through the documented single-decision exception.
+func (s *Scheduler) observeDirectiveTraceabilityGaps(collectionID string, consumers Rows, latestCritic Row) {
+	if s.Store == nil {
+		return
+	}
+	seenEvents, err := s.Store.EventsForCollection(collectionID, 200)
+	if err != nil {
+		return
+	}
+	observed := map[string]bool{}
+	harvested := map[string]bool{}
+	for _, ev := range seenEvents {
+		switch S(ev, "event_type") {
+		case "DIRECTIVE_TRACEABILITY_GAP":
+			observed[S(ev, "task_id")] = true
+		case "DIRECTIVE_TRACEABILITY_EMPTY_HARVEST":
+			harvested[S(ev, "task_id")] = true
+		}
+	}
+	for _, consumer := range consumers {
+		profile := S(consumer, "profile")
+		if (profile != "review" && profile != "plan_review") || S(consumer, "status") != TaskComplete || observed[S(consumer, "id")] {
+			continue
+		}
+		ancestors, e := s.Store.DirectiveAncestors(S(consumer, "id"))
+		if e != nil {
+			return
+		}
+		directives := InheritedDirectives(ancestors)
+		if len(directives) == 0 {
+			// A directive-bearing ancestor (a completed critic/plan_review/
+			// advise) that yields zero harvestable directives is recorded, once
+			// per consumer, so a silently-empty ancestor is not mistaken for no
+			// ancestor at all. A genuinely directive-free lineage (no such
+			// ancestor) stays a silent clean pass. This seam is outside the
+			// store lock, so Store.Event is safe; it is observability only and
+			// never blocks.
+			if len(ancestors) > 0 && !harvested[S(consumer, "id")] {
+				ids := []string{}
+				for _, ancestor := range ancestors {
+					ids = append(ids, S(ancestor, "id"))
+				}
+				_ = s.Store.RecordEmptyDirectiveHarvest(S(consumer, "project_id"), collectionID, S(consumer, "id"), ids)
+				harvested[S(consumer, "id")] = true
+			}
+			continue
+		}
+		result := M(consumer, "result")
+		if len(result) == 0 {
+			result = JSONMap(S(consumer, "result_json"))
+		}
+		gapErr := ValidateDirectiveTraceability(result, directives, true, nil)
+		if gapErr == nil {
+			continue
+		}
+		decisions, e := s.Store.ListDecisions(S(consumer, "project_id"), S(consumer, "collection_id"))
+		if e != nil {
+			return
+		}
+		if len(LegacyGateTraceabilityExceptionIDs(decisions, S(consumer, "collection_id"))) > 0 {
+			continue
+		}
+		_ = s.Store.Event(S(consumer, "project_id"), collectionID, S(consumer, "id"), "", "DIRECTIVE_TRACEABILITY_GAP", Row{"reason": gapErr.Error()})
+	}
+}
+
 func (s *Scheduler) ensureReview(project, collection, impl Row) error {
 	var failedParentReview Row
 	if parentID := S(impl, "parent_task_id"); parentID != "" {
@@ -1174,9 +1247,17 @@ func (s *Scheduler) ensureReview(project, collection, impl Row) error {
 				}
 			}
 		}
+		// The failed review is a durable verification source of the fresh
+		// review, not just a one-line summary in an objective: completed
+		// dependencies project findings/evidence through the envelope. The
+		// repair already depends_on the failed review, so this direct edge
+		// is transitively redundant and cannot create a cycle.
+		if !containsString(deps, S(failedParentReview, "id")) {
+			deps = append(deps, S(failedParentReview, "id"))
+		}
 		title = "Fresh review after repair " + S(impl, "title")
-		objective = fmt.Sprintf("Perform a fresh independent post-repair review. Repair implementation %s was created because review %s returned verdict=fail. Re-evaluate the repaired integrated candidate from scratch against the original acceptance intent and the repair objective; do not rely on the prior review's conclusions. Return verdict pass/fail.", S(impl, "id"), S(failedParentReview, "id"))
-		reason = "A semantic review failure was repaired; policy requires a fresh independent review task/context."
+		objective = fmt.Sprintf("Perform a fresh independent post-repair review. Repair implementation %s was created because review %s returned verdict=fail. Its findings and evidence are part of your completed dependencies: independently re-run the relevant checks against the repaired integrated candidate and re-check or explicitly refute each carried finding, stating which; the prior verdict itself is not authoritative and must not be adopted as your conclusion. Re-evaluate the repaired candidate against the original acceptance intent and the repair objective. Return verdict pass/fail.", S(impl, "id"), S(failedParentReview, "id"))
+		reason = "A semantic review failure was repaired; policy requires a fresh independent review task/context that carries the failed review's findings."
 	}
 	if reconciliationRequired {
 		baseTitle := title

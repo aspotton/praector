@@ -823,7 +823,15 @@ func cmdDecision(args []string) int {
 	return 0
 }
 
-func validateCollectionForAcceptance(store *Store, c Row) (Row, Rows, error) {
+// validateCollectionForAcceptance applies every durable precondition of
+// acceptance. derivedCandidates is the seam-computed diff-derived config-knob
+// candidate list (base...collection integration branch at the moment of the
+// check); callers that can reach the Git workspace compute it and callers
+// without Git access pass nil, which preserves the historical behavior. If
+// integration introduces a NEW candidate after a review already passed at
+// submit, acceptance recomputes the list and correctly requires it: that is a
+// genuine new knob, not spurious diff drift.
+func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...DerivedConfigCandidate) (Row, Rows, error) {
 	state, e := store.UpdateCollectionTerminalState(S(c, "id"))
 	if e != nil {
 		return nil, nil, e
@@ -868,6 +876,68 @@ func validateCollectionForAcceptance(store *Store, c Row) (Row, Rows, error) {
 	for _, ed := range edges {
 		if S(ed, "relation") == "verifies" {
 			verifies[S(ed, "from_task_id")] = append(verifies[S(ed, "from_task_id")], S(ed, "to_task_id"))
+		}
+	}
+	legacyDecisions, e := store.ListDecisions(S(c, "project_id"), S(c, "id"))
+	if e != nil {
+		return nil, nil, e
+	}
+	legacyIDs := LegacyGateTraceabilityExceptionIDs(legacyDecisions, S(c, "id"))
+	// Per-consumer dedup for the empty-harvest event so repeated acceptance
+	// checks do not record the same consumer more than once. The scheduler
+	// observer emits it during sweeps; this seam covers consumers that reached
+	// acceptance without a sweep having observed them.
+	harvestedConsumers := map[string]bool{}
+	if harvestEvents, evErr := store.EventsForCollection(S(c, "id"), 200); evErr == nil {
+		for _, ev := range harvestEvents {
+			if S(ev, "event_type") == "DIRECTIVE_TRACEABILITY_EMPTY_HARVEST" {
+				harvestedConsumers[S(ev, "task_id")] = true
+			}
+		}
+	}
+	for _, t := range tasks {
+		if S(t, "profile") != "review" && S(t, "profile") != "plan_review" {
+			continue
+		}
+		if S(t, "status") != TaskComplete || strings.ToLower(strings.TrimSpace(S(M(t, "result"), "verdict"))) != "pass" {
+			continue
+		}
+		if ancestors, e := store.DirectiveAncestors(S(t, "id")); e == nil {
+			if directives := InheritedDirectives(ancestors); len(directives) > 0 {
+				if e := ValidateDirectiveTraceability(M(t, "result"), directives, true, legacyIDs); e != nil {
+					return nil, nil, fmt.Errorf("Collection %s cannot be accepted: %w", S(c, "id"), e)
+				}
+			} else if len(ancestors) > 0 && !harvestedConsumers[S(t, "id")] {
+				// A directive-bearing ancestor that yielded zero harvestable
+				// directives is recorded here (outside the store lock) so the
+				// empty harvest is auditable rather than silent. Observability
+				// only: acceptance is neither blocked nor newly gated. A
+				// genuinely directive-free lineage (no ancestor) stays silent.
+				ids := []string{}
+				for _, ancestor := range ancestors {
+					ids = append(ids, S(ancestor, "id"))
+				}
+				_ = store.RecordEmptyDirectiveHarvest(S(c, "project_id"), S(c, "id"), S(t, "id"), ids)
+				harvestedConsumers[S(t, "id")] = true
+			}
+		} else {
+			return nil, nil, e
+		}
+		if S(t, "profile") == "review" {
+			if e := ValidateReviewImpactEnumeration(M(t, "result"), legacyIDs, derivedCandidates); e != nil {
+				return nil, nil, fmt.Errorf("Collection %s cannot be accepted: %w", S(c, "id"), e)
+			}
+			if decisionIDs := CandidateDecisionIDs(M(t, "result")); len(decisionIDs) > 0 {
+				known := map[string]bool{}
+				for _, decision := range legacyDecisions {
+					known[S(decision, "id")] = true
+				}
+				for _, decisionID := range decisionIDs {
+					if !known[decisionID] {
+						return nil, nil, fmt.Errorf("Collection %s cannot be accepted: candidate disposition decision_id %s is not a durable decision in this Collection", S(c, "id"), decisionID)
+					}
+				}
+			}
 		}
 	}
 	for _, t := range tasks {

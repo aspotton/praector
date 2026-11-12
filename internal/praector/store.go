@@ -1291,6 +1291,95 @@ func (s *Store) researchAncestorsLocked(tid string) (Rows, error) {
 	})
 	return out, nil
 }
+
+// DirectiveAncestors returns every completed critic/plan_review/advise Task
+// reachable through the hard dependency DAG. Like research constraints,
+// planning directives are lineage properties: a review that depends on a plan
+// review which depends on a critic inherits that critic's directives even
+// when the critic Task is not a direct dependency. The traversal intentionally
+// mirrors ResearchAncestors so both mechanisms behave identically.
+func (s *Store) DirectiveAncestors(tid string) (Rows, error) {
+	seen := map[string]bool{tid: true}
+	queue := []string{tid}
+	byID := map[string]Row{}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		deps, err := s.Dependencies(cur)
+		if err != nil {
+			return nil, err
+		}
+		for _, dep := range deps {
+			id := S(dep, "id")
+			if id == "" {
+				continue
+			}
+			if directiveSourceProfiles[S(dep, "profile")] && S(dep, "status") == TaskComplete {
+				dep["result"] = JSONMap(S(dep, "result_json"))
+				byID[id] = dep
+			}
+			if !seen[id] {
+				seen[id] = true
+				queue = append(queue, id)
+			}
+		}
+	}
+	out := make(Rows, 0, len(byID))
+	for _, row := range byID {
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := S(out[i], "created_at"), S(out[j], "created_at")
+		if a == b {
+			return S(out[i], "id") < S(out[j], "id")
+		}
+		return a < b
+	})
+	return out, nil
+}
+
+// directiveAncestorsLocked is the claim-time variant used while the Store lock
+// is already held. It mirrors DirectiveAncestors without recursively acquiring
+// the filesystem lock, matching the researchAncestorsLocked convention.
+func (s *Store) directiveAncestorsLocked(tid string) (Rows, error) {
+	seen := map[string]bool{tid: true}
+	queue := []string{tid}
+	byID := map[string]Row{}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		deps, err := s.queryLocked("SELECT t.* FROM task_edges e JOIN tasks t ON t.id=e.from_task_id WHERE e.to_task_id=" + SQLLiteral(cur) + " AND e.relation='depends_on' ORDER BY e.created_at")
+		if err != nil {
+			return nil, err
+		}
+		for _, dep := range deps {
+			id := S(dep, "id")
+			if id == "" {
+				continue
+			}
+			if directiveSourceProfiles[S(dep, "profile")] && S(dep, "status") == TaskComplete {
+				dep["result"] = JSONMap(S(dep, "result_json"))
+				byID[id] = dep
+			}
+			if !seen[id] {
+				seen[id] = true
+				queue = append(queue, id)
+			}
+		}
+	}
+	out := make(Rows, 0, len(byID))
+	for _, row := range byID {
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := S(out[i], "created_at"), S(out[j], "created_at")
+		if a == b {
+			return S(out[i], "id") < S(out[j], "id")
+		}
+		return a < b
+	})
+	return out, nil
+}
 func (s *Store) Dependents(tid string) (Rows, error) {
 	return s.Query("SELECT t.* FROM task_edges e JOIN tasks t ON t.id=e.to_task_id WHERE e.from_task_id=" + SQLLiteral(tid) + " AND e.relation='depends_on' ORDER BY e.created_at")
 }
@@ -1594,7 +1683,15 @@ func (s *Store) SetTaskStatus(tid, status, msg string) error {
 	}
 	return nil
 }
-func (s *Store) SubmitResult(tid string, result Row) (Row, error) {
+
+// SubmitResult records a worker result. derivedConfigCandidates is an
+// optional, seam-computed diff-derived configuration-knob candidate list
+// (base...collection integration branch) that a passing review's impact
+// enumeration must account for. Callers without Git workspace access pass
+// nothing and get exactly the historical behavior; the submit seam in the
+// service layer computes the list so no git access enters the Store or the
+// pure policy validators.
+func (s *Store) SubmitResult(tid string, result Row, derivedConfigCandidates ...DerivedConfigCandidate) (Row, error) {
 	before, err := s.GetTask(tid)
 	if err != nil {
 		return nil, err
@@ -1648,8 +1745,8 @@ func (s *Store) SubmitResult(tid string, result Row) (Row, error) {
 			if e != nil {
 				return nil, e
 			}
+			requirePass := (profile == "plan_review" || profile == "review") && strings.ToLower(strings.TrimSpace(S(result, "verdict"))) == "pass"
 			if len(researchDeps) > 0 {
-				requirePass := (profile == "plan_review" || profile == "review") && strings.ToLower(strings.TrimSpace(S(result, "verdict"))) == "pass"
 				if e := ValidateResearchConsumerResult(result, researchDeps, requirePass); e != nil {
 					return nil, e
 				}
@@ -1665,6 +1762,67 @@ func (s *Store) SubmitResult(tid string, result Row) (Row, error) {
 					for _, decisionID := range exceptionIDs {
 						if !known[decisionID] {
 							return nil, fmt.Errorf("research consistency exception_decision_id %s is not a durable decision in this Collection", decisionID)
+						}
+					}
+				}
+			}
+			if profile == "plan_review" || profile == "review" {
+				directiveAncestors, e := s.DirectiveAncestors(tid)
+				if e != nil {
+					return nil, e
+				}
+				if directives := InheritedDirectives(directiveAncestors); len(directives) > 0 {
+					if e := ValidateDirectiveTraceability(result, directives, requirePass, nil); e != nil {
+						return nil, e
+					}
+					decisionIDs := []string{}
+					for _, raw := range Slice(result, "directive_dispositions") {
+						var item Row
+						switch x := raw.(type) {
+						case map[string]any:
+							item = Row(x)
+						case Row:
+							item = x
+						default:
+							continue
+						}
+						if decisionID := strings.TrimSpace(S(item, "decision_id")); decisionID != "" {
+							decisionIDs = append(decisionIDs, decisionID)
+						}
+					}
+					if len(decisionIDs) > 0 {
+						decisions, e := s.ListDecisions(S(before, "project_id"), S(before, "collection_id"))
+						if e != nil {
+							return nil, e
+						}
+						known := map[string]bool{}
+						for _, decision := range decisions {
+							known[S(decision, "id")] = true
+						}
+						for _, decisionID := range decisionIDs {
+							if !known[decisionID] {
+								return nil, fmt.Errorf("directive disposition decision_id %s is not a durable decision in this Collection", decisionID)
+							}
+						}
+					}
+				}
+				if profile == "review" {
+					if e := ValidateReviewImpactEnumeration(result, nil, derivedConfigCandidates); e != nil {
+						return nil, e
+					}
+					if decisionIDs := CandidateDecisionIDs(result); len(decisionIDs) > 0 {
+						decisions, e := s.ListDecisions(S(before, "project_id"), S(before, "collection_id"))
+						if e != nil {
+							return nil, e
+						}
+						known := map[string]bool{}
+						for _, decision := range decisions {
+							known[S(decision, "id")] = true
+						}
+						for _, decisionID := range decisionIDs {
+							if !known[decisionID] {
+								return nil, fmt.Errorf("candidate disposition decision_id %s is not a durable decision in this Collection", decisionID)
+							}
 						}
 					}
 				}
@@ -1959,6 +2117,9 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 				return false, nil
 			}
 		}
+		if ok, e := s.directiveTraceabilityGateLocked(S(c, "id"), c, true); e != nil || !ok {
+			return ok, e
+		}
 		ed, err := s.queryLocked("SELECT 1 AS ok FROM task_edges WHERE from_task_id=" + SQLLiteral(S(c, "id")) + " AND to_task_id=" + SQLLiteral(S(task, "id")) + " AND relation='depends_on' LIMIT 1")
 		if err != nil || len(ed) == 0 {
 			return false, err
@@ -2008,6 +2169,9 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 			return false, nil
 		}
 	}
+	if ok, e := s.directiveTraceabilityGateLocked(S(review, "id"), review, true); e != nil || !ok {
+		return ok, e
+	}
 	edge, err := s.queryLocked("SELECT 1 AS ok FROM task_edges WHERE from_task_id=" + SQLLiteral(S(review, "id")) + " AND to_task_id=" + SQLLiteral(S(task, "id")) + " AND relation='depends_on' LIMIT 1")
 	if err != nil || len(edge) == 0 {
 		return false, err
@@ -2035,6 +2199,9 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 			if er := ValidateResearchConsumerResult(JSONMap(S(c, "result_json")), research, false); er != nil {
 				return false, nil
 			}
+		}
+		if ok, e := s.directiveTraceabilityGateLocked(S(review, "id"), review, true); e != nil || !ok {
+			return ok, e
 		}
 		base, er := s.criticPlanBaselineLocked(S(c, "id"))
 		if er != nil || base == nil || S(base, "fingerprint") == "" {
@@ -2065,6 +2232,47 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 		return false, err
 	}
 	return len(ac) == 0 || I(ac[0], "n") == 0, nil
+}
+
+// directiveTraceabilityGateLocked is the claim/read-time gate mirroring the
+// research-consistency claim gates: a completed dispositioning consumer
+// (review or plan_review) must have dispositioned every inherited planning
+// directive. Consumer producers (critic) are not gated on their own output.
+// Pre-existing history that predates the validator is exempted only through
+// the documented, collection-scoped single-decision legacy exception, never
+// silently. This is the LIVE claim-time seam; impact enumeration by contrast
+// is enforced only at submit and acceptance, so there is deliberately no
+// claim-time impact-enumeration gate here.
+func (s *Store) directiveTraceabilityGateLocked(ancestorID string, consumer Row, requirePass bool) (bool, error) {
+	if S(consumer, "status") != TaskComplete {
+		return true, nil
+	}
+	ancestors, err := s.directiveAncestorsLocked(ancestorID)
+	if err != nil {
+		return false, err
+	}
+	directives := InheritedDirectives(ancestors)
+	if len(directives) == 0 {
+		return true, nil
+	}
+	result := M(consumer, "result")
+	if len(result) == 0 {
+		result = JSONMap(S(consumer, "result_json"))
+	}
+	if ValidateDirectiveTraceability(result, directives, requirePass, nil) == nil {
+		return true, nil
+	}
+	decisions, err := s.decisionsLocked(S(consumer, "project_id"), S(consumer, "collection_id"))
+	if err != nil {
+		return false, err
+	}
+	return len(LegacyGateTraceabilityExceptionIDs(decisions, S(consumer, "collection_id"))) > 0, nil
+}
+
+// decisionsLocked returns durable decisions scoped to the project or the
+// given collection that have not been retired via superseded_by.
+func (s *Store) decisionsLocked(projectID, collectionID string) (Rows, error) {
+	return s.queryLocked("SELECT * FROM decisions WHERE (project_id=" + SQLLiteral(projectID) + " AND (collection_id IS NULL OR collection_id=" + SQLLiteral(collectionID) + ")) AND superseded_by IS NULL ORDER BY created_at")
 }
 
 func (s *Store) ClaimTask(tid string, maxAttempts int) (Row, Row, error) {
@@ -2253,6 +2461,21 @@ func (s *Store) Event(pid, cid, tid, aid, eventType string, payload any) error {
 	// holds the Dolt lock across a stream publish.
 	s.emitEvent(eventRecord{ID: id, ProjectID: pid, CollectionID: cid, TaskID: tid, AttemptID: aid, EventType: eventType, CreatedAt: now})
 	return nil
+}
+
+// RecordEmptyDirectiveHarvest emits the DIRECTIVE_TRACEABILITY_EMPTY_HARVEST
+// event naming the consumer task (in the task_id column) and the directive-
+// bearing source ancestors that were checked but yielded zero harvestable
+// directives (in the payload). It is observability, not a block, and the
+// consumer-side dedup is the caller's responsibility; this is the single
+// INSERT site so both emitting seams produce an identically-shaped event. It
+// goes through Store.Event, which re-enters the lock via Mutate, so it MUST
+// only be called OUTSIDE the store lock (the scheduler observer and the
+// acceptance CLI seam) and NEVER from a *Locked claim context.
+func (s *Store) RecordEmptyDirectiveHarvest(projectID, collectionID, consumerID string, sourceIDs []string) error {
+	ids := append([]string{}, sourceIDs...)
+	sort.Strings(ids)
+	return s.Event(projectID, collectionID, consumerID, "", "DIRECTIVE_TRACEABILITY_EMPTY_HARVEST", Row{"source_task_ids": ids})
 }
 func (s *Store) TaskInputLineage(tid string) (Row, error) {
 	r, err := s.Query("SELECT payload_json,attempt_id,created_at FROM events WHERE task_id=" + SQLLiteral(tid) + " AND event_type='TASK_INPUT_LINEAGE' ORDER BY created_at DESC LIMIT 1")

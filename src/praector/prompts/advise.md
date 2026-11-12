@@ -32,4 +32,6 @@ Make the recommendation directly usable by the caller. Include:
 - estimated effort/investment when decision-relevant;
 - revisit/escalation trigger.
 
+Your `recommendations` entries and each risk `mitigation` become inherited directives that downstream reviews and plan reviews must disposition, so phrase them as concrete checkable obligations, not background commentary. Tradeoffs, revisit triggers, and unresolved items are context and are not harvested as directives.
+
 Do not implement, patch, or create write tasks. Advice is your deliverable.

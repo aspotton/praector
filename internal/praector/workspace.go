@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -500,6 +501,225 @@ func (w *GitWorkspace) CollectionDiff(project, collection Row, stat bool, target
 	args = append(args, base+"..."+branch)
 	p, err := w.git(repo, true, args...)
 	return p.Stdout, err
+}
+
+// gitCLIFlags are CLI flags and subcommand names of git itself that the
+// candidate extraction must never report as introduced configuration knobs:
+// Praector's own diff plumbing (including this helper) adds them in added
+// lines constantly, and they are tool invocations, not project settings.
+var gitCLIFlags = map[string]bool{
+	"-z": true, "--name-only": true, "--stat": true, "--no-ff": true, "-m": true,
+	"--abort": true, "--is-ancestor": true, "--porcelain": true, "--verify": true,
+	"--quiet": true, "-b": true, "-C": true, "-e": true, "-U0": true, "--unified=0": true,
+	"-c": true, "--full-name": true, "--no-color": true, "--abbrev-commit": true,
+	"--no-renames": true, "--git-dir": true, "--name-status": true, "--shortstat": true,
+	"merge": true, "diff": true, "status": true, "log": true, "show": true, "add": true,
+	"commit": true, "init": true, "checkout": true, "branch": true, "worktree": true,
+	"rev-parse": true, "show-ref": true, "merge-base": true, "ls-files": true,
+	"update-ref": true, "symbolic-ref": true, "stash": true, "reset": true, "rm": true,
+}
+
+// commonEnvVars are environment names so ubiquitous that reporting them as
+// introduced knobs would be pure noise; the extraction skips them. The
+// PRAECTOR_* set is the documented, pre-existing worker environment contract.
+var commonEnvVars = map[string]bool{
+	"PATH": true, "HOME": true, "USER": true, "SHELL": true, "TERM": true, "TMPDIR": true,
+	"TEMP": true, "TMP": true, "LANG": true, "LC_ALL": true, "EDITOR": true, "PWD": true,
+	"VIRTUAL_ENV": true, "GOPATH": true, "GOROOT": true, "PYTHONPATH": true, "CI": true,
+	"PRAECTOR_HOME": true, "PRAECTOR_PROJECT_ID": true, "PRAECTOR_COLLECTION_ID": true,
+	"PRAECTOR_TASK_ID": true, "PRAECTOR_ATTEMPT_ID": true, "PRAECTOR_SESSION_ID": true,
+	"PRAECTOR_PROFILE": true, "PRAECTOR_WORKTREE": true, "PRAECTOR_CLI": true,
+}
+
+var (
+	flagLiteralRe     = regexp.MustCompile(`"(-{1,2}[a-z][a-z0-9]+(?:-[a-z0-9]+)+)"`)
+	envNameRe         = regexp.MustCompile(`\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+){1,})\b`)
+	quotedKeyRe       = regexp.MustCompile(`"([a-z][a-z0-9]*(?:[_-][a-z0-9]+)+)"`)
+	settingWordRe     = regexp.MustCompile(`(?i)(config|setting|flag|option|enabled|disabled|toggle|mode)`)
+	derivationSkipExt = map[string]bool{".md": true, ".txt": true, ".rst": true, ".license": true, ".lock": true, ".sum": true}
+)
+
+// ConfigCandidateOutcome pairs a diff-derived candidate list with an explicit
+// basis-availability outcome so a submit or acceptance seam can distinguish
+// "this change introduced no knobs" from "no diff basis could be derived".
+// BasisUnavailable is empty whenever a derivable three-dot diff basis existed
+// (regardless of whether any candidates were found) and non-empty — naming the
+// missing ref or state — when the project root is not a Git repository or the
+// base/integration branch is absent. A git invocation error against an EXISTING
+// basis is returned as a non-nil error and is never folded into this field, so
+// a hard git failure can never masquerade as an empty candidate list.
+type ConfigCandidateOutcome struct {
+	Candidates       []DerivedConfigCandidate
+	BasisUnavailable string
+}
+
+// DeriveConfigCandidates heuristically derives candidate configuration knobs
+// introduced between the project base branch and the collection integration
+// branch. The diff basis is deliberately the same three-dot merge-base form
+// used by CollectionDiff (`base...integration_branch`, never a two-dot diff,
+// which would also count base-branch-side changes as introduced), and the
+// changed-path listing uses `-z --name-only` so core.quotePath quoting,
+// spaces, or unusual characters cannot silently drop a changed file. The
+// added-line scan runs against the added side of the diff regardless of
+// rename-detection setting, so a knob introduced via a move/clone is still
+// enumerated.
+//
+// The result is a deterministic, sorted candidate list a passing review must
+// account for — NOT a completeness proof: the extraction is narrow
+// (flag/key literals, environment-variable names, config/table keys, and
+// setting-like struct/map keys) and human-falsifiable in both directions.
+// When the repo or either branch simply does not exist (e.g. a collection that
+// never created Git state) it returns no candidates with no error; that is an
+// ABSENT basis rather than a genuine no-knob diff, so callers that must tell
+// the two apart use DeriveConfigCandidatesWithBasis. A git invocation failure
+// against an existing basis is returned loudly rather than degraded to an
+// empty list.
+func (w *GitWorkspace) DeriveConfigCandidates(project, collection Row) ([]DerivedConfigCandidate, error) {
+	outcome, err := w.DeriveConfigCandidatesWithBasis(project, collection)
+	return outcome.Candidates, err
+}
+
+// DeriveConfigCandidatesWithBasis is DeriveConfigCandidates plus an explicit
+// absent-basis outcome. An absent basis (a non-Git project root or an absent
+// base/integration branch) yields no candidates AND a named
+// ConfigCandidateOutcome.BasisUnavailable so a seam can record it as auditable
+// state instead of letting it read as a clean no-knob diff. The three-dot
+// `base...integration` basis, the `-z` path listing, and the `--no-renames`
+// added-side scan are used unchanged on every path that DOES compute
+// candidates. A git invocation error against an existing basis is a hard error,
+// never an absent-basis outcome.
+func (w *GitWorkspace) DeriveConfigCandidatesWithBasis(project, collection Row) (ConfigCandidateOutcome, error) {
+	repo := w.RepoRoot(project)
+	base := S(project, "base_branch")
+	branch := S(collection, "integration_branch")
+	// Distinguish the three states explicitly: a git invocation error at the
+	// rev-parse gate is a hard error; a git run that reports "not a repository"
+	// (non-zero exit, no run error) is an absent basis; and a repository whose
+	// base or integration branch is missing is an absent basis naming the ref.
+	repoCheck, err := w.git(repo, false, "rev-parse", "--git-dir")
+	if err != nil {
+		return ConfigCandidateOutcome{}, err
+	}
+	if repoCheck.Code != 0 {
+		return ConfigCandidateOutcome{BasisUnavailable: fmt.Sprintf("project root %s is not a git repository", repo)}, nil
+	}
+	baseOK, err := w.BranchExists(repo, base)
+	if err != nil {
+		return ConfigCandidateOutcome{}, err
+	}
+	if !baseOK {
+		return ConfigCandidateOutcome{BasisUnavailable: fmt.Sprintf("base branch %q does not exist", base)}, nil
+	}
+	branchOK, err := w.BranchExists(repo, branch)
+	if err != nil {
+		return ConfigCandidateOutcome{}, err
+	}
+	if !branchOK {
+		return ConfigCandidateOutcome{BasisUnavailable: fmt.Sprintf("integration branch %q does not exist", branch)}, nil
+	}
+	paths, err := w.ChangedPaths(repo, base, branch)
+	if err != nil {
+		return ConfigCandidateOutcome{}, err
+	}
+	p, err := w.git(repo, true, "diff", "-z", "--unified=0", "--no-renames", base+"..."+branch)
+	if err != nil {
+		return ConfigCandidateOutcome{}, err
+	}
+	return ConfigCandidateOutcome{Candidates: extractConfigCandidates(paths, p.Stdout)}, nil
+}
+
+// ChangedPaths lists the files changed between base and head using the
+// same three-dot basis as CollectionDiff, NUL-separated on the git side so
+// quoting cannot drop a path (CLM-NAMEONLY-Z).
+func (w *GitWorkspace) ChangedPaths(repo, base, head string) ([]string, error) {
+	p, err := w.git(repo, true, "diff", "-z", "--name-only", base+"..."+head)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, path := range strings.Split(p.Stdout, "\x00") {
+		if path = strings.TrimSpace(path); path != "" {
+			out = append(out, path)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// extractConfigCandidates is the pure, deterministic token extraction over
+// the added lines of a unified diff, restricted to the changed paths whose
+// extension can plausibly carry a setting. It is separate from the Git call
+// so determinism is directly testable.
+func extractConfigCandidates(paths []string, diffText string) []DerivedConfigCandidate {
+	scannable := map[string]bool{}
+	for _, path := range paths {
+		if ext := strings.ToLower(filepath.Ext(path)); ext != "" && derivationSkipExt[ext] {
+			continue
+		}
+		scannable[path] = true
+	}
+	seen := map[string]bool{}
+	out := []DerivedConfigCandidate{}
+	current := ""
+	for _, line := range strings.Split(diffText, "\n") {
+		if strings.HasPrefix(line, "diff --git") || strings.HasPrefix(line, "index ") || strings.HasPrefix(line, "@@") {
+			continue
+		}
+		if strings.HasPrefix(line, "+++ ") {
+			current = strings.TrimPrefix(strings.TrimSpace(strings.SplitN(line[4:], "\t", 2)[0]), "b/")
+			continue
+		}
+		if strings.HasPrefix(line, "--- ") || !strings.HasPrefix(line, "+") {
+			continue
+		}
+		if current != "" && !scannable[current] {
+			continue
+		}
+		for _, c := range candidateTokensFromLine(current, line[1:]) {
+			key := strings.ToLower(c.Token) + "\x00" + c.Path
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Token != out[j].Token {
+			return out[i].Token < out[j].Token
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out
+}
+
+// candidateTokensFromLine applies the narrow per-line heuristics: dashed
+// flag literals, SCREAMING_SNAKE environment-variable names, and quoted
+// snake_case key literals whose name suggests a setting (or whose file is a
+// configuration format rather than Go source).
+func candidateTokensFromLine(path, line string) []DerivedConfigCandidate {
+	tokens := [][2]string{}
+	isGo := strings.HasSuffix(strings.ToLower(path), ".go")
+	for _, lit := range flagLiteralRe.FindAllStringSubmatch(line, -1) {
+		if flag := lit[1]; !gitCLIFlags[flag] {
+			tokens = append(tokens, [2]string{flag, path})
+		}
+	}
+	for _, lit := range envNameRe.FindAllStringSubmatch(line, -1) {
+		if name := lit[1]; !commonEnvVars[name] {
+			tokens = append(tokens, [2]string{name, path})
+		}
+	}
+	for _, lit := range quotedKeyRe.FindAllStringSubmatch(line, -1) {
+		if key := lit[1]; settingWordRe.MatchString(key) || !isGo {
+			tokens = append(tokens, [2]string{key, path})
+		}
+	}
+	out := []DerivedConfigCandidate{}
+	for _, t := range tokens {
+		out = append(out, DerivedConfigCandidate{Token: t[0], Path: t[1]})
+	}
+	return out
 }
 
 func (w *GitWorkspace) BranchWorktree(repo, branch string) (string, error) {

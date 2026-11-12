@@ -59,6 +59,8 @@ Your output should tell the coordinator what to do next. Prefer:
 
 Keep the list small and prioritized. Do not manufacture concerns to look thorough.
 
+When the change touches shared state, a schema/column, a durable event emitter, a state transition, or a widely-called contract, emit a sibling-effect sweep as a `planner_directives` entry: name the effect to enumerate (same-column writers, same-event emitters, same-transition paths, same-contract callers) and require the review to disposition every listed site with its enumeration method. Downstream reviews must disposition each of your directives as satisfied, deferred, or explicit_exception, so phrase each directive as a checkable obligation, not commentary. Phrase required obligations as plain strings that BEGIN with `MUST:`, `MUST NOT:`, or `SHOULD:` — Praector derives the normative level from that leading prefix (and from a structured `normative_level` field), and a MUST-level directive can never be `deferred` by a review, only satisfied or taken as an explicit exception with a durable decision id. Every disposition and impact-site evidence must cite a file path, a test name, or a command; generic prose is rejected. Every planner_directive, qa_directive, and risk mitigation you emit becomes an inherited directive with a stable id; unresolved prose belongs in `unresolved`, not directives.
+
 ## QA principle
 
 Acceptance and QA should be executable by agents whenever possible: exact commands, requests, test cases, expected outputs, or inspectable evidence. Avoid placeholders and "manually verify" instructions unless the deliverable is inherently human-judgment-only.

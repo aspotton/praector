@@ -711,7 +711,581 @@ func ValidateExternalConformanceReviewResult(result Row) error {
 		}
 	}
 	if strings.TrimSpace(S(result, "authoritative_oracle_unavailable_reason")) != "" && strings.TrimSpace(S(result, "oracle_exception_decision_id")) != "" {
+		if err := validateOracleExceptionProbes(result); err != nil {
+			return err
+		}
 		return nil
 	}
 	return fmt.Errorf("passing external-conformance review requires an authoritative oracle actually used, or a durable oracle exception decision")
+}
+
+// validateOracleExceptionProbes requires a durable oracle-exception decision
+// to name the concrete probes that replace the missing authoritative oracle.
+// A documented exception may discharge the oracle requirement only when each
+// probe records the scenario, the command or test that exercised it, and the
+// observed outcome. An internal live-loopback regression is an acceptable
+// probe; an out-of-process same-interpretation client must not be relabelled
+// as authoritative conformance.
+func validateOracleExceptionProbes(result Row) error {
+	probes := Slice(result, "probes")
+	if len(probes) == 0 {
+		return fmt.Errorf("oracle-exception review requires a non-empty probes list naming the scenario, command_or_test, and observed outcome that replace the missing authoritative oracle")
+	}
+	for i, raw := range probes {
+		var probe Row
+		switch x := raw.(type) {
+		case map[string]any:
+			probe = Row(x)
+		case Row:
+			probe = x
+		default:
+			return fmt.Errorf("probes[%d] must be an object", i)
+		}
+		if strings.TrimSpace(researchFieldString(probe["scenario"])) == "" {
+			return fmt.Errorf("probes[%d] requires a non-empty scenario", i)
+		}
+		if strings.TrimSpace(researchFieldString(probe["command_or_test"])) == "" {
+			return fmt.Errorf("probes[%d] requires a non-empty command_or_test", i)
+		}
+		if strings.TrimSpace(researchFieldString(probe["observed_outcome"])) == "" {
+			return fmt.Errorf("probes[%d] requires a non-empty observed_outcome", i)
+		}
+	}
+	return nil
+}
+
+// InheritedDirective is one normative directive harvested from a completed
+// planning-stage ancestor (critic, plan_review, or advise). Directives stay
+// inside the source task's result_json; there is no directive table. The
+// stable ID is <source-task-id>:<kind>:<ordinal-in-source-array>, derived
+// purely from persisted result order so repeated reads re-match prior
+// dispositions and cannot collide with research claim references.
+type InheritedDirective struct {
+	TaskID         string
+	SourceProfile  string
+	Kind           string
+	ID             string
+	Text           string
+	NormativeLevel string
+}
+
+// directiveSourceProfiles are the completed planning-stage profiles whose
+// results are harvested for directives. Research-claim planner directives are
+// NOT harvested here because they are already governed by the
+// research_consistency mechanism.
+var directiveSourceProfiles = map[string]bool{"critic": true, "plan_review": true, "advise": true}
+
+// InheritedDirectives harvests directives from completed planning-stage
+// ancestor results: critic planner_directives, critic/advise qa_directives,
+// critic/advise risks[].mitigation, and advise recommendations. Advise
+// tradeoffs, revisit_triggers, and unresolved items are intentionally not
+// harvested.
+func InheritedDirectives(tasks Rows) []InheritedDirective {
+	out := []InheritedDirective{}
+	for _, task := range tasks {
+		profile := S(task, "profile")
+		if !directiveSourceProfiles[profile] || S(task, "status") != TaskComplete {
+			continue
+		}
+		result := M(task, "result")
+		if len(result) == 0 && strings.TrimSpace(S(task, "result_json")) != "" {
+			result = JSONMap(S(task, "result_json"))
+		}
+		if len(result) == 0 {
+			continue
+		}
+		appendDirective := func(kind string, ordinal int, raw any) {
+			text, level := directiveTextAndLevel(raw)
+			if strings.TrimSpace(text) == "" {
+				return
+			}
+			out = append(out, InheritedDirective{
+				TaskID: S(task, "id"), SourceProfile: profile, Kind: kind,
+				ID:             fmt.Sprintf("%s:%s:%d", S(task, "id"), kind, ordinal),
+				Text:           strings.TrimSpace(text),
+				NormativeLevel: strings.ToUpper(strings.TrimSpace(level)),
+			})
+		}
+		if profile == "critic" || profile == "plan_review" {
+			for i, raw := range Slice(result, "planner_directives") {
+				appendDirective("planner_directive", i, raw)
+			}
+		}
+		for i, raw := range Slice(result, "qa_directives") {
+			appendDirective("qa_directive", i, raw)
+		}
+		for i, raw := range Slice(result, "risks") {
+			var risk Row
+			switch x := raw.(type) {
+			case map[string]any:
+				risk = Row(x)
+			case Row:
+				risk = x
+			default:
+				continue
+			}
+			appendDirective("risk_mitigation", i, risk["mitigation"])
+		}
+		if profile == "advise" {
+			for i, raw := range Slice(result, "recommendations") {
+				appendDirective("recommendation", i, raw)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func directiveTextAndLevel(raw any) (string, string) {
+	switch x := raw.(type) {
+	case string:
+		return x, directiveLevelFromText(x)
+	case map[string]any:
+		return directiveFieldRow(Row(x)), directiveFieldRowLevel(Row(x))
+	case Row:
+		return directiveFieldRow(x), directiveFieldRowLevel(x)
+	default:
+		return researchFieldString(raw), ""
+	}
+}
+
+// directiveLevelFromText derives a normative level from the plain-string form
+// critics actually emit, recognizing only a leading `MUST NOT:`/`MUST:`/
+// `SHOULD:` prefix (never a mid-sentence occurrence) and matching
+// `MUST NOT` before `MUST`. It is scoped to the inherited-directive harvest
+// path; research-claim normative levels keep their separate structured path.
+func directiveLevelFromText(text string) string {
+	t := strings.ToUpper(strings.TrimSpace(text))
+	for _, p := range []string{"MUST NOT", "MUST", "SHOULD"} {
+		if strings.HasPrefix(t, p) {
+			if rest := strings.TrimSpace(t[len(p):]); strings.HasPrefix(rest, ":") {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+// mustLevel reports whether a normative level belongs to the MUST family,
+// which is never deferrable.
+func mustLevel(level string) bool {
+	switch strings.ToUpper(strings.TrimSpace(level)) {
+	case "MUST", "MUST NOT":
+		return true
+	}
+	return false
+}
+
+func directiveFieldRow(r Row) string {
+	for _, key := range []string{"text", "directive", "mitigation", "statement", "recommendation"} {
+		if v := strings.TrimSpace(researchFieldString(r[key])); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func directiveFieldRowLevel(r Row) string {
+	return strings.TrimSpace(researchFieldString(r["normative_level"]))
+}
+
+// LegacyGateTraceabilityMarker is the leading text a durable decision
+// statement must carry to exempt a pre-existing collection from retroactive
+// directive-traceability and impact-enumeration enforcement at the collection
+// read/acceptance seams. It is the documented single-decision escape hatch
+// for history that predates these validators; it never applies to a new
+// result submission.
+const LegacyGateTraceabilityMarker = "Legacy gate-traceability exception:"
+
+// LegacyGateTraceabilityExceptionIDs returns durable decision ids that
+// qualify as the documented legacy gate-traceability escape hatch. A decision
+// qualifies only when it is collection-scoped (its collection_id is exactly
+// this collection), it is a standing operator exception rather than a
+// worker/task-scoped one (task_id is NULL), and its statement both begins with
+// the legacy marker and names this collection so the exemption cannot be reused
+// across collections.
+func LegacyGateTraceabilityExceptionIDs(decisions Rows, collectionID string) []string {
+	out := []string{}
+	for _, d := range decisions {
+		statement := strings.TrimSpace(S(d, "statement"))
+		if !strings.HasPrefix(statement, LegacyGateTraceabilityMarker) {
+			continue
+		}
+		// A standing operator exception is collection-scoped and never tied to
+		// a single task: task_id must be NULL and collection_id must be exactly
+		// this collection, so a project-wide or foreign-collection or worker-
+		// authored marker cannot arm the escape.
+		if strings.TrimSpace(S(d, "task_id")) != "" {
+			continue
+		}
+		if collectionID == "" || strings.TrimSpace(S(d, "collection_id")) != collectionID {
+			continue
+		}
+		// Belt and braces: the statement must itself name this collection so a
+		// mis-scoped row cannot silently exempt it.
+		if !strings.Contains(statement, collectionID) {
+			continue
+		}
+		out = append(out, S(d, "id"))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ValidateDirectiveTraceability makes inherited planning directives enforced
+// rather than advisory. It is shaped like ValidateResearchConsumerResult:
+// a passing review or plan_review must disposition every inherited directive
+// as satisfied, deferred, or explicit_exception with concrete evidence.
+// deferred and explicit_exception require a durable decision id from the
+// decisions table. Directives the result reports that are not in the
+// inherited set (additions) must be reported explicitly and are never
+// silently accepted as satisfied. When the inherited set is empty the result
+// passes cleanly. legacyExceptionIDs enable the documented single-decision
+// escape hatch for pre-existing history at the read/acceptance seams.
+func ValidateDirectiveTraceability(result Row, directives []InheritedDirective, requirePass bool, legacyExceptionIDs []string) error {
+	if len(directives) == 0 {
+		return nil
+	}
+	if requirePass && strings.ToLower(strings.TrimSpace(S(result, "verdict"))) != "pass" {
+		return nil
+	}
+	if len(legacyExceptionIDs) > 0 {
+		return nil
+	}
+	entries := Slice(result, "directive_dispositions")
+	byID := map[string]Row{}
+	for i, raw := range entries {
+		var item Row
+		switch x := raw.(type) {
+		case map[string]any:
+			item = Row(x)
+		case Row:
+			item = x
+		default:
+			return fmt.Errorf("directive_dispositions[%d] must be an object", i)
+		}
+		id := strings.TrimSpace(S(item, "directive_id"))
+		if id == "" {
+			return fmt.Errorf("directive_dispositions[%d] requires directive_id", i)
+		}
+		if byID[id] != nil {
+			return fmt.Errorf("directive_dispositions directive_id %q is duplicated", id)
+		}
+		byID[id] = item
+	}
+	expected := map[string]InheritedDirective{}
+	for _, directive := range directives {
+		expected[directive.ID] = directive
+	}
+	missing := []string{}
+	for id := range expected {
+		if byID[id] == nil {
+			missing = append(missing, id)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		return fmt.Errorf("directive_dispositions did not disposition directive ids: %s", strings.Join(missing, ","))
+	}
+	unknown := []string{}
+	for id := range byID {
+		if _, ok := expected[id]; !ok {
+			unknown = append(unknown, id)
+		}
+	}
+	sort.Strings(unknown)
+	if len(unknown) > 0 {
+		return fmt.Errorf("directive_dispositions references unknown directive ids (report genuinely new directives under additions, not dispositions): %s", strings.Join(unknown, ","))
+	}
+	allowedDisposition := map[string]bool{"satisfied": true, "deferred": true, "explicit_exception": true}
+	for _, id := range sortedDirectiveKeys(byID) {
+		item := byID[id]
+		disposition := strings.ToLower(strings.TrimSpace(S(item, "disposition")))
+		if !allowedDisposition[disposition] {
+			return fmt.Errorf("directive_dispositions %s disposition must be satisfied, deferred, or explicit_exception", id)
+		}
+		if !nonempty(item["evidence"]) {
+			return fmt.Errorf("directive_dispositions %s requires concrete evidence", id)
+		}
+		if e := citableEvidenceText(item["evidence"]); e != "" {
+			return fmt.Errorf("directive_dispositions %s requires citable evidence (a changed file path, a test name, or a command run); %s", id, e)
+		}
+		decisionID := strings.TrimSpace(S(item, "decision_id"))
+		if (disposition == "deferred" || disposition == "explicit_exception") && decisionID == "" {
+			return fmt.Errorf("directive_dispositions %s %s requires a durable decision_id", id, disposition)
+		}
+		if disposition == "satisfied" && decisionID != "" {
+			return fmt.Errorf("directive_dispositions %s may cite decision_id only for deferred or explicit_exception", id)
+		}
+		if disposition == "deferred" && mustLevel(expected[id].NormativeLevel) {
+			return fmt.Errorf("directive_dispositions %s cannot defer a MUST-level directive; satisfy it or cite an explicit_exception decision_id", id)
+		}
+	}
+	for i, raw := range Slice(result, "additions") {
+		var item Row
+		switch x := raw.(type) {
+		case map[string]any:
+			item = Row(x)
+		case Row:
+			item = x
+		default:
+			return fmt.Errorf("additions[%d] must be an object", i)
+		}
+		if strings.TrimSpace(researchFieldString(item["directive"])) == "" {
+			return fmt.Errorf("additions[%d] requires a non-empty directive", i)
+		}
+		if strings.TrimSpace(researchFieldString(item["reason"])) == "" {
+			return fmt.Errorf("additions[%d] requires a non-empty reason explaining why it is not inherited coverage", i)
+		}
+	}
+	return nil
+}
+
+func sortedDirectiveKeys(byID map[string]Row) []string {
+	keys := make([]string, 0, len(byID))
+	for k := range byID {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// ValidateReviewImpactEnumeration requires a passing review to carry the
+// sibling-effect enumeration as a durable, auditable artifact: the field
+// must exist, name the enumeration method, and give every listed site an
+// explicit affected/unaffected disposition with citable evidence. This makes
+// the enumeration falsifiable by a human reviewer, not provably complete. The
+// introduced-knob rule is diff-scoped: a site the change introduced as a
+// configuration key or flag must name the code path that reads it.
+//
+// derivedCandidates are configuration keys/flags the tooling derived from the
+// diff itself, independent of whether the reviewer flagged any site with
+// introduced_knob. Every one must be accounted for either by a site whose
+// reader_paths names it or by a candidate_dispositions entry; a legacy
+// exemption never waives this derived accounting, since it is a fact about the
+// diff rather than a self-report. A nil/empty list keeps prior behavior.
+func ValidateReviewImpactEnumeration(result Row, legacyExceptionIDs []string, derivedCandidates []DerivedConfigCandidate) error {
+	if strings.ToLower(strings.TrimSpace(S(result, "verdict"))) != "pass" {
+		return nil
+	}
+	enumeration := M(result, "impact_enumeration")
+	if len(enumeration) == 0 {
+		if err := validateDerivedCandidateAccounting(Row{}, derivedCandidates); err != nil {
+			return err
+		}
+		if len(legacyExceptionIDs) > 0 {
+			return nil
+		}
+		return fmt.Errorf("passing review requires impact_enumeration naming the enumeration method and an explicit disposition for every sibling-effect site")
+	}
+	if strings.TrimSpace(S(enumeration, "method")) == "" {
+		return fmt.Errorf("impact_enumeration.method must name the enumeration method used (for example literal-column grep set, call-graph walk, or store-mutation sweep)")
+	}
+	sites := Slice(enumeration, "sites")
+	if len(sites) == 0 && len(derivedCandidates) == 0 {
+		return fmt.Errorf("impact_enumeration.sites must list every site performing the same effect as the changed code")
+	}
+	for i, raw := range sites {
+		var site Row
+		switch x := raw.(type) {
+		case map[string]any:
+			site = Row(x)
+		case Row:
+			site = x
+		default:
+			return fmt.Errorf("impact_enumeration.sites[%d] must be an object", i)
+		}
+		if strings.TrimSpace(researchFieldString(site["site"])) == "" {
+			return fmt.Errorf("impact_enumeration.sites[%d] requires a non-empty site identifier", i)
+		}
+		disposition := strings.ToLower(strings.TrimSpace(researchFieldString(site["disposition"])))
+		if disposition != "affected" && disposition != "unaffected" {
+			return fmt.Errorf("impact_enumeration.sites[%d] disposition must be affected or unaffected", i)
+		}
+		if strings.TrimSpace(researchFieldString(site["evidence"])) == "" {
+			return fmt.Errorf("impact_enumeration.sites[%d] requires evidence for its disposition", i)
+		}
+		if e := citableEvidenceText(site["evidence"]); e != "" {
+			return fmt.Errorf("impact_enumeration.sites[%d] requires citable evidence (a changed file path, a test name, or a command run); %s", i, e)
+		}
+		if B(site, "introduced_knob") && len(Slice(site, "reader_paths")) == 0 {
+			return fmt.Errorf("impact_enumeration.sites[%d] is a configuration key or flag introduced by this change with no reader_paths; an introduced-but-never-read knob is a blocking defect, not a style preference", i)
+		}
+	}
+	return validateDerivedCandidateAccounting(enumeration, derivedCandidates)
+}
+
+// DerivedConfigCandidate is a configuration key or command-line flag that the
+// tooling derives directly from a diff, independent of any worker self-report.
+// Token is the knob text (for example a `--some-flag` or an env var name) and
+// Path is the changed file it was found in.
+type DerivedConfigCandidate struct {
+	Token string
+	Path  string
+}
+
+// Evidence-citation forms. A piece of evidence is citable only when it names a
+// concrete artifact a human can independently check: a source file path, a
+// test identifier, or a command actually run. Prose that merely asserts a
+// conclusion without naming an artifact is not citable.
+var (
+	evidencePathLikeRe    = regexp.MustCompile(`[\w.\-]+/[\w./\-]+\.\w+|[\w\-]+\.(go|md|py|sql|json|ya?ml|toml|ts|tsx|js|jsx|c|h|rs|java|kt|sh|txt|csv)`)
+	evidenceTestLikeRe    = regexp.MustCompile(`\bTest[A-Z]\w*|\btest_[a-z0-9_]+`)
+	evidenceCommandLikeRe = regexp.MustCompile(`\b(go\s+(test|vet|run|build)|make\s+\S+|pytest\b|cargo\s+(test|run)|npm\s+(run|test)|git\s+(log|diff|show|status)|grep\s|ripgrep\b|rg\s)`)
+	evidenceSettingWordRe = regexp.MustCompile(`--[a-z0-9][\w-]*|\b[A-Z][A-Z0-9_]{2,}\b`)
+)
+
+// evidenceGenericRe lists assertions that read like evidence but name no
+// artifact; such text is rejected even when it incidentally contains one of the
+// citable forms' stopwords.
+var evidenceGenericRe = regexp.MustCompile(`(?i)^(?:n/?a\.?|none|verified( in code)?|confirmed|tested|as discussed|looks good|see code|it works?|done|checked)$`)
+
+// evidenceText flattens an evidence field that is either a string or a list of
+// strings into a single searchable string.
+func evidenceText(raw any) string {
+	switch x := raw.(type) {
+	case string:
+		return strings.TrimSpace(x)
+	case []any:
+		parts := []string{}
+		for _, item := range x {
+			if s := strings.TrimSpace(researchFieldString(item)); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, " ; ")
+	default:
+		return strings.TrimSpace(researchFieldString(raw))
+	}
+}
+
+// citableEvidence reports whether an evidence value names a concrete,
+// independently checkable artifact.
+func citableEvidence(raw any) bool {
+	return citableEvidenceText(raw) == ""
+}
+
+// citableEvidenceText returns an empty string when the evidence is citable and
+// a short reason otherwise. It is the falsifiable content floor behind both
+// directive dispositions and impact-site enumerations.
+func citableEvidenceText(raw any) string {
+	text := evidenceText(raw)
+	if text == "" {
+		return "the evidence is empty"
+	}
+	if evidenceGenericRe.MatchString(strings.TrimSpace(text)) {
+		return "it only asserts a conclusion without naming a file, test, or command"
+	}
+	joined := strings.ToLower(text)
+	if evidencePathLikeRe.MatchString(text) || evidenceTestLikeRe.MatchString(text) || evidenceCommandLikeRe.MatchString(joined) || evidenceSettingWordRe.MatchString(text) {
+		return ""
+	}
+	return "it does not name a changed file path, a test identifier, or a command run"
+}
+
+// candidateAccounted reports whether a derived configuration candidate is
+// covered by the enumeration: either a site's reader_paths (or site text) names
+// the token, or a candidate_dispositions entry dispositions it.
+func candidateAccounted(enumeration Row, dispositions map[string]Row, candidate DerivedConfigCandidate) bool {
+	token := strings.ToLower(strings.TrimSpace(candidate.Token))
+	if token == "" {
+		return true
+	}
+	if _, ok := dispositions[token]; ok {
+		return true
+	}
+	for _, raw := range Slice(enumeration, "sites") {
+		site := rowFromAny(raw)
+		if site == nil {
+			continue
+		}
+		blob := strings.ToLower(researchFieldString(site["site"]))
+		for _, rp := range Slice(site, "reader_paths") {
+			blob += " " + strings.ToLower(researchFieldString(rp))
+		}
+		if strings.Contains(blob, token) {
+			return true
+		}
+	}
+	return false
+}
+
+// candidateRequiresDecision reports the dispositions whose accounting must be
+// backed by a durable decision id: a deliberately-unread or explicitly-
+// excepted knob is a decision, not an observation.
+func candidateRequiresDecision(disposition string) bool {
+	switch strings.ToLower(strings.TrimSpace(disposition)) {
+	case "deliberately-unread", "explicit-exception", "explicit_exception":
+		return true
+	}
+	return false
+}
+
+// validateDerivedCandidateAccounting requires that every candidate derived
+// from the diff be accounted for by the enumeration, and that any candidate
+// disposition which asserts a deliberate decision cites a durable decision id.
+// It is skipped entirely for a nil/empty candidate list so the pre-existing
+// behavior is byte-identical.
+func validateDerivedCandidateAccounting(enumeration Row, derivedCandidates []DerivedConfigCandidate) error {
+	if len(derivedCandidates) == 0 {
+		return nil
+	}
+	dispositions := map[string]Row{}
+	for _, raw := range Slice(enumeration, "candidate_dispositions") {
+		item := rowFromAny(raw)
+		if item == nil {
+			continue
+		}
+		token := strings.ToLower(strings.TrimSpace(researchFieldString(item["candidate"])))
+		if token == "" {
+			return fmt.Errorf("candidate_dispositions entry requires a non-empty candidate token")
+		}
+		if strings.TrimSpace(researchFieldString(item["disposition"])) == "" {
+			return fmt.Errorf("candidate_dispositions for %s requires a disposition", item["candidate"])
+		}
+		if candidateRequiresDecision(researchFieldString(item["disposition"])) && strings.TrimSpace(researchFieldString(item["decision_id"])) == "" {
+			return fmt.Errorf("candidate_dispositions for %s requires a durable decision_id", item["candidate"])
+		}
+		dispositions[token] = item
+	}
+	for _, candidate := range derivedCandidates {
+		if !candidateAccounted(enumeration, dispositions, candidate) {
+			return fmt.Errorf("impact_enumeration does not account for the derived configuration candidate %s in %s; mark the site as introduced_knob with reader_paths, or disposition it under candidate_dispositions", candidate.Token, candidate.Path)
+		}
+	}
+	return nil
+}
+
+// CandidateDecisionIDs returns the durable decision ids cited by a result's
+// candidate_dispositions so the submit/acceptance seams can verify they exist.
+func CandidateDecisionIDs(result Row) []string {
+	enumeration := M(result, "impact_enumeration")
+	seen := map[string]bool{}
+	out := []string{}
+	for _, raw := range Slice(enumeration, "candidate_dispositions") {
+		item := rowFromAny(raw)
+		if item == nil {
+			continue
+		}
+		id := strings.TrimSpace(researchFieldString(item["decision_id"]))
+		if id != "" && !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// rowFromAny coerces a decoded JSON value into a Row, returning nil when it is
+// not an object.
+func rowFromAny(raw any) Row {
+	switch x := raw.(type) {
+	case Row:
+		return x
+	case map[string]any:
+		return Row(x)
+	default:
+		return nil
+	}
 }

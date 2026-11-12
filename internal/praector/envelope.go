@@ -31,7 +31,7 @@ var availableProfiles = map[string]string{
 	"advise":      "Use for difficult conceptual/architectural judgment and a concrete recommendation.",
 }
 
-var resultKeys = []string{"verdict", "recommendation", "confidence", "intent_classification", "planner_directives", "qa_directives", "assumptions", "findings", "evidence", "artifacts", "risks", "unresolved", "as_of", "sources", "claims", "verification_oracles", "research_consistency", "authoritative_oracle_unavailable_reason", "oracle_exception_decision_id", "research_required"}
+var resultKeys = []string{"verdict", "recommendation", "confidence", "intent_classification", "planner_directives", "qa_directives", "assumptions", "findings", "evidence", "artifacts", "risks", "unresolved", "as_of", "sources", "claims", "verification_oracles", "research_consistency", "authoritative_oracle_unavailable_reason", "oracle_exception_decision_id", "research_required", "directive_dispositions", "additions", "impact_enumeration", "probes"}
 
 const readOnlyCapabilityPrompt = "This task is read-only. Editor permissions are denied, but shell commands, tests, imports, build tools, and smoke checks can still create or modify repository files. Treat **no net workspace mutation** as part of the task's completion contract.\n\n" +
 	"- At the start of the attempt, capture the worktree state (normally `git status --porcelain=v1 --untracked-files=all`) so you know the baseline.\n" +
@@ -78,6 +78,9 @@ func nonempty(v any) bool {
 
 func resultSummary(row Row) Row {
 	result := M(row, "result")
+	if len(result) == 0 && strings.TrimSpace(S(row, "result_json")) != "" {
+		result = JSONMap(S(row, "result_json"))
+	}
 	out := Row{"id": S(row, "id"), "profile": S(row, "profile"), "title": S(row, "title"), "status": S(row, "status"), "objective": S(row, "objective"), "summary": S(result, "summary")}
 	for _, key := range resultKeys {
 		if result != nil && nonempty(result[key]) {
@@ -101,6 +104,30 @@ func inheritedResearchConstraints(deps Rows) ([]any, error) {
 		})
 	}
 	return out, nil
+}
+
+// inheritedDirectiveProjection mirrors the research-constraint projection:
+// a thin, stable view of planning directives harvested from completed
+// critic/plan_review/advise ancestors. The projection is omitted entirely
+// when the inherited set is empty so zero-directive tasks pay no envelope
+// cost.
+func inheritedDirectiveProjection(deps Rows) []any {
+	directives := InheritedDirectives(deps)
+	if len(directives) == 0 {
+		return nil
+	}
+	out := make([]any, 0, len(directives))
+	for _, directive := range directives {
+		row := Row{
+			"directive_id": directive.ID, "kind": directive.Kind, "text": directive.Text,
+			"source_task_id": directive.TaskID, "source_profile": directive.SourceProfile,
+		}
+		if directive.NormativeLevel != "" {
+			row["normative_level"] = directive.NormativeLevel
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 func graphSnapshot(store *Store, collectionID string) (Row, error) {
@@ -187,6 +214,13 @@ func BuildTaskEnvelope(store *Store, project, collection, task, attempt Row) (st
 		"planning_policy":                planning.AsRow(), "delivery_policy": delivery.AsRow(),
 		"control_plane": Row{"command": "praector", "executable_env": "PRAECTOR_CLI", "rule": "Use `praector` for durable control-plane commands. Worker PATH contains a dedicated Praector shim even when the parent Python virtualenv is sanitized."},
 	}
+	directiveAncestors, err := store.DirectiveAncestors(S(task, "id"))
+	if err != nil {
+		return "", err
+	}
+	if inheritedDirectives := inheritedDirectiveProjection(directiveAncestors); len(inheritedDirectives) > 0 {
+		ctx["inherited_directives"] = inheritedDirectives
+	}
 	if parent != nil {
 		ctx["parent"] = resultSummary(parent)
 	} else {
@@ -211,9 +245,9 @@ func BuildTaskEnvelope(store *Store, project, collection, task, attempt Row) (st
 	capability := capabilityPrompt(S(task, "profile"))
 	reviewNote := ""
 	if S(task, "profile") == "review" {
-		reviewNote = "For an implementation review, include `verdict: pass` or `verdict: fail`. A fail is kept out of acceptance and drives bounded repair work."
+		reviewNote = "For an implementation review, include `verdict: pass` or `verdict: fail`. A fail is kept out of acceptance and drives bounded repair work. A passing review also requires `impact_enumeration` (method + per-site dispositions with evidence) and, when `inherited_directives` are present, `directive_dispositions` (one per directive id: satisfied/deferred/explicit_exception with evidence; deferred/exception require a durable `decision_id`). Every evidence value must cite a file path, a test name, or a command; generic prose such as \"verified in code\" or \"n/a\" is rejected. A MUST-level directive (structured level or a leading `MUST:`/`MUST NOT:` prefix) may never be deferred, only satisfied or explicit_exception with a decision id. Praector derives candidate introduced configuration knobs from the collection diff; every derived candidate must be named by a site's reader_paths or given an `impact_enumeration.candidate_dispositions` entry (`not-introduced`, or `deliberately-unread` with a durable `decision_id`) — leaving `introduced_knob` unset does not opt out."
 	} else if S(task, "profile") == "plan_review" {
-		reviewNote = "For a plan review, include `verdict: pass` or `verdict: fail`. A fail remains blocking; Praector will wake a coordinator to repair the graph before this reviewer runs again."
+		reviewNote = "For a plan review, include `verdict: pass` or `verdict: fail`. A fail remains blocking; Praector will wake a coordinator to repair the graph before this reviewer runs again. When `inherited_directives` are present, a passing verdict also requires `directive_dispositions` covering every directive id with citable evidence (a file path, a test name, or a command; deferred/exception require a durable `decision_id`). A MUST-level directive (structured level or a leading `MUST:`/`MUST NOT:` prefix) may never be deferred, only satisfied or explicit_exception with a decision id."
 	}
 	tmpl, err := assets.FS.ReadFile("envelope.md")
 	if err != nil {
