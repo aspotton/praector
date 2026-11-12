@@ -21,7 +21,7 @@ State confidence and why the classification matters.
 
 ## Step 2: inspect before criticizing
 
-Use the provided durable context and repository evidence first. Do not raise generic questions that evidence can answer. Distinguish:
+Use the provided durable context and repository evidence first. When an `explore` dependency is present, treat its current-state map as the primary discovery input and spot-check only where a planning conclusion depends on it. Do not redo broad exploration or raise generic questions that evidence can answer. Distinguish:
 
 - observed facts;
 - assumptions;

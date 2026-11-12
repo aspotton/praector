@@ -34,7 +34,7 @@ Preserve these unless the change explicitly redesigns them and updates the archi
 - OpenCode is a harness adapter, not the orchestration database or scheduler.
 - Project file state belongs in **Git**; organizational/orchestration state belongs in **Dolt**.
 - Workers execute in Praector-managed worktrees, never by mutating the user's original checkout.
-- `coordinator`, `critic`, `plan_review`, `research`, `review`, and `advise` are read-only with deterministic Git mutation checks.
+- `coordinator`, `explore`, `critic`, `plan_review`, `research`, `review`, and `advise` are read-only with deterministic Git mutation checks.
 - Every read-only worker must treat no-net-workspace-mutation as part of completion: capture its starting Git status, prefer verification modes that avoid incidental repository writes, restore only artifacts/changes caused by its own checks, and verify the final status matches the starting baseline. Never erase pre-existing or candidate state merely to make the worktree clean.
 - Only `implement` owns project-file mutation in the current release.
 - Native OpenCode `task`/subagent delegation remains disabled for managed runs.
@@ -177,7 +177,7 @@ A `WAITING` coordinator has already handed control to a blocking child/review an
 
 `depends_on` is an acyclic DAG invariant. Before any hard edge is committed, Praector checks whether the dependent already reaches the proposed prerequisite transitively; if so the edge is rejected. This applies to ordinary graph mutations and to the atomic initial edge batch published with a new task.
 
-`plan_review` remains a pre-write gate over durable implementation contracts. It may wait for prerequisite evidence (`critic`, `research`, `advise`) but must not depend on `implement` execution or on a coordinator that is itself waiting, directly or transitively, on that review. Reconciliation repairs legacy coordinator/review cycles and collapses multiple unstarted final plan reviews to one newest surviving gate, rewiring waiting coordinators and implementations to that gate.
+`plan_review` remains a pre-write gate over durable implementation contracts. It may wait for prerequisite evidence (`explore`, `critic`, `research`, `advise`) but must not depend on `implement` execution or on a coordinator that is itself waiting, directly or transitively, on that review. Reconciliation repairs legacy coordinator/review cycles and collapses multiple unstarted final plan reviews to one newest surviving gate, rewiring waiting coordinators and implementations to that gate.
 
 ### Semantic review repair lineage
 

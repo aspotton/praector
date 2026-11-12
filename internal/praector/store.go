@@ -793,7 +793,7 @@ func (s *Store) EnsureCollectionEntrypoint(cid string) (Row, error) {
 	if st := S(c, "status"); st != "RUNNING" && st != "BLOCKED" {
 		return nil, nil
 	}
-	obj := fmt.Sprintf("Own the initial decomposition of collection %s: %s. Inspect project context only as needed. Create durable critic/plan_review/research/implement/review/advise tasks using praector as appropriate. Do not perform implementation or substantive specialist work yourself. Ensure implementation tasks are sequenced by dependencies; independent review is automatically enforced for implementation tasks.", cid, S(c, "objective"))
+	obj := fmt.Sprintf("Own the initial decomposition of collection %s: %s. Consume the deterministic explore/critic preflight when present. Create durable plan_review/research/implement/review/advise tasks using praector as appropriate; request additional explore/critic work only when genuinely needed. Do not perform implementation or substantive specialist work yourself. Ensure implementation tasks are sequenced by dependencies; independent review is automatically enforced for implementation tasks.", cid, S(c, "objective"))
 	t, _, err := s.CreateTask(CreateTaskOptions{ProjectID: S(c, "project_id"), CollectionID: cid, Profile: "coordinator", Title: "Initial coordination", Objective: obj, Reason: "Recovered missing collection entry point", WorkspaceMode: "collection", Depth: 0, AllowDedupe: false})
 	if err != nil {
 		return nil, err

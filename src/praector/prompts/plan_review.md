@@ -10,6 +10,10 @@ When critic policy applies, the latest critic must be fresh for the current mate
 
 This is a **pre-write** graph review. Implementation tasks may already exist in READY state so you can inspect their durable contracts, but you do not wait for those implementations to execute. If the graph makes this `plan_review` depend on an `implement` task, treat that ordering as invalid: implementation must instead depend on the passing plan review.
 
+## Required preflight provenance
+
+When `planning_policy.explore_required` or `planning_policy.critic_required` is true, verify the proposed plan is grounded in the completed exploration/critic evidence available in durable context. A plan that ignores a material discovered constraint or a critic MUST/MUST NOT directive is not decision-complete.
+
 ## Check exactly these things
 
 1. Reference validity: referenced files, components, APIs, or prior task results exist and support the claims made about them.

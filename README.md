@@ -36,8 +36,8 @@ Praector currently provides:
 
 - **OpenCode** as the first harness implementation;
 - Git repositories as project workspaces;
-- coordinator, critic, plan-review, research, implement, review, and advise profiles;
-- deterministic planning-policy gates for non-trivial, security-sensitive, stateful, migration, destructive, and external-integration work;
+- coordinator, explore, critic, plan-review, research, implement, review, and advise profiles;
+- deterministic `explore -> critic` preflight for every implementation Collection, plus plan-review gates for non-trivial/security-sensitive/stateful/migration/destructive/integration work;
 - bounded local parallelism with durable crash/retry recovery;
 - orchestration state/history in **Dolt**, with `depends_on` maintained as an acyclic DAG;
 - isolated Git branches/worktrees, with human-readable Praector-generated commit subjects and durable provenance trailers;
@@ -102,6 +102,7 @@ Inspect runtime roles/prompts:
 ```bash
 praector profile list
 praector profile show coordinator
+praector profile show explore
 praector profile show critic
 praector profile show plan_review
 praector profile show advise
@@ -113,16 +114,22 @@ See [`docs/PROFILES.md`](docs/PROFILES.md) for the role map, inherited global en
 A successful implementation normally evolves like this:
 
 ```text
+explore
+   ↓
+critic
+   ↓
 coordinator
-    ↓
+   ↓
+plan_review   (for non-trivial implementation)
+   ↓
 implement
-    ↓
+   ↓
 independent review
-    ↓
+   ↓
 Collection COMPLETE
 ```
 
-More complex work can add a pre-planning critic, plan-review gate, research, architecture advice, blocking child tasks, repair tasks, retries, and coordinator graph repair dynamically.
+Every implementation Collection starts with the deterministic read-only `explore -> critic` preflight before coordinator planning. `explore` maps the current implementation surface; `critic` challenges requirements, scope, hazards, and verification against that evidence. The coordinator then synthesizes the durable work graph. Clearly trivial documentation-only implementation may skip final `plan_review`; bounded research, architecture advice, blocking child tasks, repair tasks, retries, and coordinator graph repair remain available when needed.
 
 ## Completed work is not automatically merged
 

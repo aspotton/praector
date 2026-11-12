@@ -557,7 +557,7 @@ Workers should always have `praector` available even when parent-venv sanitizati
 
 ## Blocking dependency completion invariant
 
-A task with an unresolved `depends_on` edge cannot become `COMPLETE`, even if its model submits a structured `status=complete` result after requesting blocking work. Praector defers completion to `WAITING` and records `TASK_COMPLETION_DEFERRED`; a fresh attempt is released only after all hard dependencies are `COMPLETE`. Delivery-policy repair is a terminal backstop and does not start while coordinator/critic/plan-review/research/advise work remains nonterminal.
+A task with an unresolved `depends_on` edge cannot become `COMPLETE`, even if its model submits a structured `status=complete` result after requesting blocking work. Praector defers completion to `WAITING` and records `TASK_COMPLETION_DEFERRED`; a fresh attempt is released only after all hard dependencies are `COMPLETE`. Delivery-policy repair is a terminal backstop and does not start while coordinator/explore/critic/plan-review/research/advise work remains nonterminal.
 
 ### Observing policy-gated writes
 

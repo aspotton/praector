@@ -172,7 +172,7 @@ Every disposable attempt receives the same packaged global engineering contract 
 
 ### Task Envelope compiler — `internal/praector/envelope.go`
 
-Builds `ORCH TASK ENVELOPE v1` for every fresh attempt.
+Builds `PRAECTOR TASK ENVELOPE v1` for every fresh attempt.
 
 It compiles:
 
@@ -241,7 +241,7 @@ Collection + coordinator Task created durably
         ▼
 Scheduler launches fresh coordinator Attempt
         │
-        ├── coordinator creates durable critic/plan_review/research/implement/review/advise Tasks
+        ├── Praector injects explore -> critic preflight; coordinator creates durable plan_review/research/implement/review/advise Tasks
         │
         └── coordinator submits result and exits
         │
@@ -321,6 +321,9 @@ fresh Parent Attempt with child result in the Envelope
 No model session is kept alive merely to wait for a dependency.
 
 ## Profiles and authority
+
+Repository exploration is a distinct planning phase. For implementation Collections, reconciliation injects a read-only `explore` task before the initial or acceptance-revision coordinator is allowed to shape material work; the mandatory critic depends on that exploration. This gives the coordinator an evidence-grounded current-system map plus an independent planning challenge before it creates implementation contracts. Internal critic-revalidation coordinators do not recursively trigger new exploration; exploration is per operator planning generation, while material-plan fingerprinting continues to cover only implementation/research/advice contracts.
+
 
 Praector currently uses one runtime contract and a small role-based profile taxonomy:
 
@@ -618,7 +621,7 @@ Cross-process orchestration cannot assume several coordinator CLI calls form one
 
 All `depends_on` edges form an acyclic directed graph. The store rejects an edge `A -> B` when a path already exists from `B` back to `A`; task creation validates the whole initial dependency/blocking/gating batch before publishing the task row. This is a control-plane invariant, not a model convention.
 
-`plan_review` is a pre-write gate over durable implementation contracts. It may wait for prerequisite evidence (`critic`, `research`, `advise`) but must not depend on `implement` execution or on a coordinator that transitively waits on that review. Reconciliation detects those legacy coordinator/review back-edges, removes the review-side prerequisite, and if repair activity produced multiple unstarted final reviews, supersedes older gates into the newest one. Waiting coordinators and implementations are rewired to that one surviving gate. When it passes, every waiting coordinator whose hard dependencies are satisfied is terminalized instead of being awakened to reshape an already approved graph.
+`plan_review` is a pre-write gate over durable implementation contracts. It may wait for prerequisite evidence (`explore`, `critic`, `research`, `advise`) but must not depend on `implement` execution or on a coordinator that transitively waits on that review. Reconciliation detects those legacy coordinator/review back-edges, removes the review-side prerequisite, and if repair activity produced multiple unstarted final reviews, supersedes older gates into the newest one. Waiting coordinators and implementations are rewired to that one surviving gate. When it passes, every waiting coordinator whose hard dependencies are satisfied is terminalized instead of being awakened to reshape an already approved graph.
 
 
 ### Single-flight final review and coordinator handoff

@@ -8,8 +8,8 @@ from typing import Any
 
 from .util import require_binary
 
-PROFILE_NAMES = ("coordinator", "critic", "plan_review", "research", "implement", "review", "advise")
-READ_ONLY_PROFILES = {"coordinator", "critic", "plan_review", "research", "review", "advise"}
+PROFILE_NAMES = ("coordinator", "explore", "critic", "plan_review", "research", "implement", "review", "advise")
+READ_ONLY_PROFILES = {"coordinator", "explore", "critic", "plan_review", "research", "review", "advise"}
 WRITE_PROFILES = {"implement"}
 
 

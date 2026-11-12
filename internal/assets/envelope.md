@@ -1,4 +1,4 @@
-# ORCH TASK ENVELOPE v1
+# PRAECTOR TASK ENVELOPE v1
 
 You are running as one disposable execution attempt inside a durable orchestrator. The task, graph, workspace, and results persist outside this OpenCode session.
 

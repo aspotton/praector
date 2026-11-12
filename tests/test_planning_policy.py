@@ -65,6 +65,8 @@ class FakePolicyStore:
             "title": kwargs["title"],
             "objective": kwargs["objective"],
             "reason": kwargs.get("reason", ""),
+            "requested_by_task_id": kwargs.get("requested_by_task_id"),
+            "parent_task_id": kwargs.get("parent_task_id"),
             "status": TaskStatus.READY.value,
             "depth": kwargs.get("depth", 0),
             "created_at": f"2026-11-10 10:02:0{self.counter}",
@@ -73,6 +75,13 @@ class FakePolicyStore:
         self.tasks.append(task)
         for dep in kwargs.get("depends_on") or []:
             self.add_edge(dep, task["id"], task["collection_id"], "depends_on")
+        if kwargs.get("spawned_by_task_id"):
+            self.add_edge(kwargs["spawned_by_task_id"], task["id"], task["collection_id"], "spawned_by")
+        if kwargs.get("blocking_caller_task_id"):
+            self.add_edge(task["id"], kwargs["blocking_caller_task_id"], task["collection_id"], "depends_on")
+            for existing in self.tasks:
+                if existing["id"] == kwargs["blocking_caller_task_id"]:
+                    existing["status"] = TaskStatus.WAITING.value
         critic_id = kwargs.get("critic_baseline_task_id")
         if critic_id is not None and critic_id not in self.baselines:
             self.record_critic_plan_baseline(
@@ -194,44 +203,67 @@ def test_security_and_stateful_objective_requires_critic_and_plan_review():
     policy = classify_planning_policy(
         "Add API-key authentication and per-key rate limiting to the public API endpoint."
     )
+    assert policy.explore_required is True
     assert policy.critic_required is True
     assert policy.plan_review_required is True
     assert "security" in policy.categories
     assert "stateful_behavior" in policy.categories
 
 
-def test_simple_bounded_change_does_not_force_extra_planning_gates():
+def test_trivial_implementation_still_gets_explore_and_critic_but_skips_plan_review():
     policy = classify_planning_policy("Fix a typo in README.md and update one example sentence.")
-    assert policy.critic_required is False
+    assert policy.explore_required is True
+    assert policy.critic_required is True
     assert policy.plan_review_required is False
 
 
-def test_scheduler_inserts_critic_and_plan_review_before_write(tmp_path: Path):
+def test_scheduler_injects_explore_then_critic_before_coordinator_and_plan_review(tmp_path: Path):
     store = FakePolicyStore(
         "Add API-key authentication and per-key rate limiting to the existing /hello endpoint."
     )
+    for task in store.tasks:
+        if task["id"] == "T-COORD":
+            task["status"] = TaskStatus.READY.value
     scheduler = Scheduler(store, GlobalConfig(home=tmp_path), max_workers=1)
 
     changed = scheduler._enforce_planning_policy("COL-1")
     assert changed is True
 
+    explores = [task for task in store.tasks if task["profile"] == "explore"]
     critics = [task for task in store.tasks if task["profile"] == "critic"]
     plan_reviews = [task for task in store.tasks if task["profile"] == "plan_review"]
+    assert len(explores) == 1
     assert len(critics) == 1
-    assert len(plan_reviews) == 1
+    assert len(plan_reviews) == 0
 
+    explore = explores[0]
     critic = critics[0]
+    coord = next(task for task in store.tasks if task["id"] == "T-COORD")
+    assert coord["status"] == TaskStatus.WAITING.value
+    critic_deps = {task["id"] for task in store.dependencies(critic["id"])}
+    coord_deps = {task["id"] for task in store.dependencies(coord["id"])}
+    assert explore["id"] in critic_deps
+    assert explore["id"] in coord_deps
+    assert critic["id"] in coord_deps
+
+    # Once preflight and coordination complete, policy installs the final plan review.
+    store.set_task_status(explore["id"], TaskStatus.COMPLETE.value)
+    store.set_task_status(critic["id"], TaskStatus.COMPLETE.value)
+    store.set_task_status(coord["id"], TaskStatus.COMPLETE.value)
+    changed = scheduler._enforce_planning_policy("COL-1")
+    assert changed is True
+    plan_reviews = [task for task in store.tasks if task["profile"] == "plan_review"]
+    assert len(plan_reviews) == 1
     plan_review = plan_reviews[0]
     plan_deps = {task["id"] for task in store.dependencies(plan_review["id"])}
     impl_deps = {task["id"] for task in store.dependencies("T-IMPL")}
-
     assert critic["id"] in plan_deps
     assert plan_review["id"] in impl_deps
     assert any(event[0] == "PLANNING_POLICY_ENFORCED" for event in store.events)
 
-    # Reconciliation is idempotent: don't manufacture another gate set.
     changed_again = scheduler._enforce_planning_policy("COL-1")
     assert changed_again is False
+    assert len([task for task in store.tasks if task["profile"] == "explore"]) == 1
     assert len([task for task in store.tasks if task["profile"] == "critic"]) == 1
     assert len([task for task in store.tasks if task["profile"] == "plan_review"]) == 1
 
@@ -776,11 +808,12 @@ def test_conversational_research_does_not_become_write_delivery():
     planning = classify_planning_policy(objective)
 
     assert delivery.implementation_required is False
+    assert planning.explore_required is False
     assert planning.plan_review_required is False
     assert planning.critic_required is False
 
 
-def test_conversational_nontrivial_code_change_requires_plan_review_without_forcing_critic():
+def test_conversational_nontrivial_code_change_requires_explore_critic_and_plan_review():
     from praector.planning_policy import classify_delivery_policy
 
     objective = "The CSV parser is intentionally small. I'd like to add support for escaped commas while preserving existing parsing behavior."
@@ -788,8 +821,9 @@ def test_conversational_nontrivial_code_change_requires_plan_review_without_forc
     planning = classify_planning_policy(objective)
 
     assert delivery.implementation_required is True
+    assert planning.explore_required is True
     assert planning.plan_review_required is True
-    assert planning.critic_required is False
+    assert planning.critic_required is True
     assert "implementation_change" in planning.categories
 
 
@@ -1028,3 +1062,54 @@ def test_waiting_coordinator_is_never_added_as_final_plan_review_prerequisite(tm
     assert "T-APPLY-NEW" in deps
     assert store.dependency_path("T-PLAN", "T-APPLY-OLD") is not None
     assert store.dependency_path("T-APPLY-OLD", "T-PLAN") is None
+
+
+def test_revision_generation_gets_fresh_explore_and_critic(tmp_path: Path):
+    store = FakePolicyStore(
+        "Add API-key authentication and per-key rate limiting to the existing /hello endpoint."
+    )
+    # Prior generation already completed its deterministic preflight.
+    store.tasks.extend([
+        {
+            "id": "T-OLD-EXPLORE", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "explore", "title": "Explore current implementation surface",
+            "objective": "Map repo", "reason": "policy", "status": TaskStatus.COMPLETE.value,
+            "depth": 1, "requested_by_task_id": "T-COORD", "parent_task_id": "T-COORD",
+            "created_at": "2026-11-10 10:00:10", "updated_at": "2026-11-10 10:00:20",
+        },
+        {
+            "id": "T-OLD-CRITIC", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "critic", "title": "Preflight implementation plan",
+            "objective": "Critique", "reason": "policy", "status": TaskStatus.COMPLETE.value,
+            "depth": 1, "requested_by_task_id": "T-COORD", "parent_task_id": "T-COORD",
+            "created_at": "2026-11-10 10:00:21", "updated_at": "2026-11-10 10:00:30",
+        },
+        {
+            "id": "T-REV", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "coordinator", "title": "Acceptance revision",
+            "objective": "Revise accepted work", "reason": "operator revision",
+            "status": TaskStatus.READY.value, "depth": 0,
+            "created_at": "2026-11-10 11:00:00", "updated_at": "2026-11-10 11:00:00",
+        },
+    ])
+    scheduler = Scheduler(store, GlobalConfig(home=tmp_path), max_workers=1)
+
+    assert scheduler._enforce_planning_policy("COL-1") is True
+
+    revision_explores = [
+        task for task in store.tasks
+        if task["profile"] == "explore" and task.get("requested_by_task_id") == "T-REV"
+    ]
+    revision_critics = [
+        task for task in store.tasks
+        if task["profile"] == "critic" and task.get("requested_by_task_id") == "T-REV"
+    ]
+    assert len(revision_explores) == 1
+    assert len(revision_critics) == 1
+    assert revision_explores[0]["id"] != "T-OLD-EXPLORE"
+    assert revision_critics[0]["id"] != "T-OLD-CRITIC"
+    critic_deps = {task["id"] for task in store.dependencies(revision_critics[0]["id"])}
+    assert revision_explores[0]["id"] in critic_deps
+    revision_deps = {task["id"] for task in store.dependencies("T-REV")}
+    assert revision_explores[0]["id"] in revision_deps
+    assert revision_critics[0]["id"] in revision_deps

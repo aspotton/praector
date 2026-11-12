@@ -22,6 +22,10 @@ For complex/ambiguous work it can request a blocking `critic`. For architecture/
 
 In addition, `planning_policy` in the Task Envelope is mandatory. When it marks `critic_required` or `plan_review_required`, the coordinator may not waive the gate; the scheduler will insert missing gates before write work if necessary. This makes independent planning controls an orchestration invariant rather than a self-review preference.
 
+### `explore`
+
+Read-only current-system discovery. It maps relevant code, tests, configuration, runtime boundaries, dependencies, conventions, and durable documentation before planning. It reports evidence and constraints but does not choose architecture or design the implementation. Implementation Collections receive this preflight automatically.
+
 ### `critic`
 
 Read-only pre-planning critic. It identifies hidden intent, contradictions, scope inflation, missing prerequisites, unsafe assumptions, and weak QA/acceptance criteria. Its output is actionable directives for the coordinator rather than implementation.
@@ -66,6 +70,7 @@ Inspect the active built-in contracts with:
 ```bash
 praector profile list
 praector profile show coordinator
+praector profile show explore
 praector profile show critic
 praector profile show plan_review
 praector profile show advise
@@ -79,7 +84,7 @@ The role prompt files specialize reasoning behavior; deterministic authority sti
 
 ## Task Envelope
 
-Every fresh Attempt receives a generated `ORCH TASK ENVELOPE v1`.
+Every fresh Attempt receives a generated `PRAECTOR TASK ENVELOPE v1`.
 
 The Envelope is the semantic continuity layer between disposable sessions. It includes:
 
@@ -403,4 +408,4 @@ For collections whose deterministic planning policy requires plan review, implem
 
 ### Plan-review dependency direction
 
-`plan_review` is a pre-write gate over durable implementation contracts. It may wait for prerequisite evidence (`critic`, `research`, `advise`) but must not depend on `implement` execution. The valid direction is `plan_review -> implement` (implementation depends on the passing plan review). Praector strips coordinator-requested implementation prerequisites from plan review and repairs the exact reciprocal deadlock if encountered in an existing collection.
+`plan_review` is a pre-write gate over durable implementation contracts. It may wait for prerequisite evidence (`explore`, `critic`, `research`, `advise`) but must not depend on `implement` execution. The valid direction is `plan_review -> implement` (implementation depends on the passing plan review). Praector strips coordinator-requested implementation prerequisites from plan review and repairs the exact reciprocal deadlock if encountered in an existing collection.

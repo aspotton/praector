@@ -196,7 +196,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # fail/retry as an ordinary task attempt instead of orphaning the collection.
     coordinator_objective = (
         f"Own the initial decomposition of the new collection: {args.objective}. "
-        "Inspect project context only as needed. Create durable critic/plan_review/research/implement/review/advise tasks using praector as appropriate. "
+        "Consume the deterministic explore/critic preflight when present. Create durable plan_review/research/implement/review/advise tasks using praector as appropriate; request additional explore/critic work only when genuinely needed. "
         "Do not perform implementation or substantive specialist work yourself. Ensure implementation tasks are sequenced by dependencies; "
         "independent review is automatically enforced for implementation tasks."
     )

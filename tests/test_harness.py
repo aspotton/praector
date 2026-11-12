@@ -5,7 +5,7 @@ from praector.harness.opencode import OpenCodeHarness
 def test_permissions_disable_native_subagents(monkeypatch):
     monkeypatch.setattr("praector.harness.opencode.require_binary", lambda x: x)
     h = OpenCodeHarness("opencode")
-    for profile in ("coordinator", "critic", "plan_review", "research", "review", "advise"):
+    for profile in ("coordinator", "explore", "critic", "plan_review", "research", "review", "advise"):
         cfg = h._inline_config(profile)
         assert cfg["permission"]["task"] == "deny"
         assert cfg["permission"]["edit"] == "deny"

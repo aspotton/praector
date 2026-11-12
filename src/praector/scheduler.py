@@ -204,16 +204,15 @@ class Scheduler:
         return fresh_critic, True
 
     def _enforce_planning_policy(self, collection_id: str) -> bool:
-        """Ensure deterministic pre-write planning gates for risky work.
+        """Ensure deterministic discovery, critique, and pre-write planning gates.
 
-        The coordinator is still free to create critic/plan-review tasks itself.
-        This method is the backstop: once write work exists, objectives that
-        cross a deterministic risk threshold may not run until the required
-        critic and independent plan review are present.
+        Implementation Collections receive an exploration and critic preflight
+        before coordinator planning. Plan review remains the independent final
+        pre-write gate for objectives that require it.
         """
         collection = self.store.get_collection(collection_id)
         policy = classify_planning_policy(collection.get("objective") or "")
-        if not (policy.critic_required or policy.plan_review_required):
+        if not (policy.explore_required or policy.critic_required or policy.plan_review_required):
             return False
 
         tasks = self.store.list_tasks(collection_id)
@@ -221,16 +220,113 @@ class Scheduler:
             task for task in tasks
             if task["status"] not in {TaskStatus.CANCELLED.value, TaskStatus.SUPERSEDED.value}
         ]
+        changed = False
+        reason_text = "; ".join(policy.reasons) or "Deterministic planning policy requires pre-write gates."
+
+        # Implementation Collections begin with deterministic discovery and
+        # critique before the coordinator shapes a material plan. Because this
+        # runs during reconciliation it also applies to acceptance revisions.
+        latest_coordinator = next(
+            (
+                task for task in reversed(active)
+                if task["profile"] == "coordinator"
+                and task.get("title") in {"Initial coordination", "Acceptance revision"}
+                and task["status"] in {
+                    TaskStatus.PENDING.value, TaskStatus.READY.value, TaskStatus.WAITING.value,
+                }
+            ),
+            None,
+        )
+        def latest_for_coordinator(profile: str):
+            for task in reversed(active):
+                if task["profile"] != profile:
+                    continue
+                if latest_coordinator is None or task.get("requested_by_task_id") == latest_coordinator["id"]:
+                    return task
+            return None
+
+        latest_explore = latest_for_coordinator("explore")
+        if policy.explore_required and latest_coordinator is not None and latest_explore is None:
+            parent_id = latest_coordinator["id"] if latest_coordinator else None
+            depth = int(latest_coordinator.get("depth") or 0) + 1 if latest_coordinator else 1
+            blocking = None
+            if latest_coordinator and latest_coordinator["status"] in {
+                TaskStatus.PENDING.value, TaskStatus.READY.value, TaskStatus.WAITING.value,
+            }:
+                blocking = latest_coordinator["id"]
+            self.store.create_task(
+                project_id=collection["project_id"], collection_id=collection_id,
+                profile="explore", title="Explore current implementation surface",
+                objective=(
+                    "Before planning, inspect the existing repository/system surface relevant to the Collection objective. "
+                    "Map relevant files/modules, entry points, callers/dependencies, shared state, configuration/runtime boundaries, "
+                    "tests, documentation, similar existing patterns, and compatibility/concurrency/platform constraints. Return a concise "
+                    "evidence-grounded current-state map for the critic and coordinator. Do not design the solution or implement changes; "
+                    "for a greenfield repository, say so explicitly and stop early."
+                ),
+                reason="Deterministic planning policy: repository exploration is required before implementation planning.",
+                parent_task_id=parent_id, requested_by_task_id=parent_id,
+                workspace_mode="collection", depth=depth, allow_dedupe=False,
+                spawned_by_task_id=parent_id, blocking_caller_task_id=blocking,
+            )
+            changed = True
+            tasks = self.store.list_tasks(collection_id)
+            active = [
+                task for task in tasks
+                if task["status"] not in {TaskStatus.CANCELLED.value, TaskStatus.SUPERSEDED.value}
+            ]
+            latest_coordinator = next(
+                (
+                    task for task in reversed(active)
+                    if task["profile"] == "coordinator"
+                    and task.get("title") in {"Initial coordination", "Acceptance revision"}
+                    and task["status"] in {
+                        TaskStatus.PENDING.value, TaskStatus.READY.value, TaskStatus.WAITING.value,
+                    }
+                ),
+                None,
+            )
+            latest_explore = latest_for_coordinator("explore")
+
+        latest_critic = latest_for_coordinator("critic")
+        if policy.critic_required and latest_coordinator is not None and latest_critic is None:
+            parent_id = latest_coordinator["id"] if latest_coordinator else None
+            depth = int(latest_coordinator.get("depth") or 0) + 1 if latest_coordinator else 1
+            blocking = None
+            if latest_coordinator and latest_coordinator["status"] in {
+                TaskStatus.PENDING.value, TaskStatus.READY.value, TaskStatus.WAITING.value,
+            }:
+                blocking = latest_coordinator["id"]
+            deps = [latest_explore["id"]] if latest_explore else []
+            self.store.create_task(
+                project_id=collection["project_id"], collection_id=collection_id,
+                profile="critic", title="Preflight implementation plan",
+                objective=(
+                    "Independently preflight the Collection objective before material planning. Consume the completed repository exploration "
+                    "as primary evidence when present. Deterministic policy categories: "
+                    f"{', '.join(policy.categories) or 'implementation'}. Identify hidden requirements, scope hazards, security/state/concurrency "
+                    "semantics, assumptions, executable QA directives, and any acceptance contradiction. Return concrete MUST/MUST NOT/VERIFY "
+                    "guidance for the coordinator; do not implement or mutate the graph."
+                ),
+                reason="Deterministic planning policy: every implementation Collection receives an independent critic.",
+                parent_task_id=parent_id, requested_by_task_id=parent_id,
+                depends_on=deps, workspace_mode="collection", depth=depth, allow_dedupe=False,
+                spawned_by_task_id=parent_id, blocking_caller_task_id=blocking,
+            )
+            changed = True
+            tasks = self.store.list_tasks(collection_id)
+            active = [
+                task for task in tasks
+                if task["status"] not in {TaskStatus.CANCELLED.value, TaskStatus.SUPERSEDED.value}
+            ]
+
         write_tasks = [
             task for task in active
             if task["profile"] == "implement"
             and task["status"] in {TaskStatus.PENDING.value, TaskStatus.READY.value}
         ]
         if not write_tasks:
-            return False
-
-        changed = False
-        reason_text = "; ".join(policy.reasons) or "Deterministic planning policy requires pre-write gates."
+            return changed
 
         # Repair the specific impossible graph produced when a coordinator made
         # final plan_review depend on an implement task while Praector also gated the
@@ -561,6 +657,7 @@ class Scheduler:
                 collection["project_id"], collection_id, None, None,
                 "PLANNING_POLICY_ENFORCED",
                 {
+                    "explore_required": policy.explore_required,
                     "critic_required": policy.critic_required,
                     "plan_review_required": policy.plan_review_required,
                     "categories": list(policy.categories),
@@ -597,7 +694,7 @@ class Scheduler:
 
         nonterminal_planning_tasks = [
             task for task in active
-            if task["profile"] in {"coordinator", "critic", "plan_review", "research", "advise"}
+            if task["profile"] in {"coordinator", "explore", "critic", "plan_review", "research", "advise"}
             and task["status"] in {
                 TaskStatus.PENDING.value, TaskStatus.READY.value, TaskStatus.RUNNING.value,
                 TaskStatus.WAITING.value, TaskStatus.VERIFYING.value,

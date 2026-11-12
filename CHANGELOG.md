@@ -6,6 +6,16 @@ All notable changes to Praector are recorded here. README and focused documentat
 
 ## Unreleased
 
+## 0.2.1
+
+- Added a first-class read-only `explore` runtime profile. Implementation Collections now receive a deterministic repository/system discovery preflight that maps relevant files, modules, callers/dependencies, shared state, configuration/runtime boundaries, tests, documentation, existing patterns, and compatibility/concurrency/platform constraints without designing or implementing the solution. The explorer result is durable evidence consumed by the critic and coordinator.
+- Made the independent pre-planning critic the default for every implementation Collection, including small implementation requests. Reconciliation injects `explore -> critic` before a new initial or acceptance-revision coordinator can shape material work; internal critic-revalidation coordinators do not recursively trigger exploration. Clearly trivial documentation-only implementation may still skip the final `plan_review`, while non-trivial implementation retains the independent pre-write plan-review floor.
+- Kept exploration evidence outside the material-plan fingerprint so repository discovery itself does not create critic-staleness churn. Material-plan revalidation continues to track implementation/research/advice contracts and meaningful dependencies.
+- Updated coordinator, critic, plan-review, profile, protocol, architecture, operations, workspace, and agent guidance to make the role split explicit: explore discovers what exists, critic challenges what the plan must not miss, research answers a bounded unknown, advise recommends among real tradeoffs, coordinator decomposes, plan review validates executability, implement changes, and review verifies the result.
+- Expanded the MCP roadmap into a concrete agent-facing control-plane design: daemon-hosted Streamable HTTP on loopback by default, one shared typed operation/service layer for CLI and MCP parity, durable Praector IDs as handles, tools/resources for status/evidence/work creation, official MCP Tasks-extension integration for long-running interactions where useful, and authority-scoped human/exec attention responses that remain durable Praector decisions.
+- Preserved the clean-break public namespace while preparing this release: removed the stale rename/migration document and renamed the generated Task Envelope header to `PRAECTOR TASK ENVELOPE`; the release source contains no deprecated project-name, home-marker, or environment namespace.
+- Added the repository baseline `.gitignore` for Praector local state, Go/Python build and test artifacts, virtual environments, secrets, temporary files, IDE metadata, and common OS noise.
+
 ## 0.2.0
 
 - Established the clean Praector public namespace: native executable/CLI `praector`, Go module/package, Python reference package, project marker (`.praector/project.toml`), default home (`~/.praector`), `PRAECTOR_*` worker/config environment, Git branch prefixes (`praector/collections/...`, `praector/tasks/...`), generated Git identity, and `Praector-*` provenance trailers.

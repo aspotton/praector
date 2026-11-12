@@ -37,7 +37,7 @@ Git answers "what changed in code?". Dolt answers "what work existed, why, and w
 
 ## Read-only capability violations
 
-Read-only profiles (`coordinator`, `critic`, `plan_review`, `research`, `review`, and `advise`) are instructed to baseline their worktree before verification, avoid incidental repository writes where practical, restore only byproducts caused by their own commands, and confirm the final worktree state matches the starting baseline before result submission. This prevents common test/cache side effects from unnecessarily consuming attempts while preserving candidate and pre-existing state.
+Read-only profiles (`coordinator`, `explore`, `critic`, `plan_review`, `research`, `review`, and `advise`) are instructed to baseline their worktree before verification, avoid incidental repository writes where practical, restore only byproducts caused by their own commands, and confirm the final worktree state matches the starting baseline before result submission. This prevents common test/cache side effects from unnecessarily consuming attempts while preserving candidate and pre-existing state.
 
 Praector still checks the worktree after every harness run. If a read-only worker leaves mutations behind, Praector rolls those changes back deterministically. That condition is an execution/protocol failure, not a semantic verdict on the plan or implementation. While the Task still has attempt budget, Praector records the attempt as failed, returns the same durable Task to `READY`, and emits `READ_ONLY_CAPABILITY_RETRY`. It does **not** create coordinator repair work merely because the read-only worker violated its capability boundary.
 

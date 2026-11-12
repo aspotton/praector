@@ -29,7 +29,7 @@ func TestProjectMarkerRoundTrip(t *testing.T) {
 	}
 }
 func TestProfileTaxonomy(t *testing.T) {
-	want := []string{"coordinator", "critic", "plan_review", "research", "implement", "review", "advise"}
+	want := []string{"coordinator", "explore", "critic", "plan_review", "research", "implement", "review", "advise"}
 	if len(ProfileNames) != len(want) {
 		t.Fatal(ProfileNames)
 	}

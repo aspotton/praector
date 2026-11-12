@@ -10,6 +10,7 @@ from .util import normalize_text
 
 @dataclass(frozen=True, slots=True)
 class PlanningPolicy:
+    explore_required: bool
     critic_required: bool
     plan_review_required: bool
     categories: tuple[str, ...]
@@ -17,6 +18,7 @@ class PlanningPolicy:
 
     def as_dict(self) -> dict[str, object]:
         return {
+            "explore_required": self.explore_required,
             "critic_required": self.critic_required,
             "plan_review_required": self.plan_review_required,
             "categories": list(self.categories),
@@ -199,9 +201,12 @@ def classify_planning_policy(objective: str) -> PlanningPolicy:
     external_contract = _matches_any(text, _EXTERNAL_CONTRACT_PATTERNS)
     external_integration = _matches_any(text, _EXTERNAL_INTEGRATION_PATTERNS)
 
-    if implementation and not trivial_docs:
+    if implementation:
         categories.append("implementation_change")
-        reasons.append("Non-trivial implementation work requires an independent plan-review gate before write work.")
+        reasons.append("Implementation work requires a read-only repository exploration preflight before coordination.")
+        reasons.append("Implementation work always requires an independent pre-planning critic.")
+        if not trivial_docs:
+            reasons.append("Non-trivial implementation work requires an independent plan-review gate before write work.")
     if security:
         categories.append("security")
         reasons.append("Security/authentication/credential-sensitive behavior requires an independent pre-planning critic.")
@@ -223,18 +228,20 @@ def classify_planning_policy(objective: str) -> PlanningPolicy:
     integration_sensitive_change = bool(
         implementation and (external_contract or external_integration)
     )
+    explore_required = implementation
     critic_required = (
-        security
+        implementation
+        or security
         or migration
         or destructive
         or (stateful and external_contract)
         or integration_sensitive_change
     )
     plan_review_required = (
-        critic_required
-        or stateful
+        stateful
         or migration
         or destructive
+        or integration_sensitive_change
         or (implementation and not trivial_docs)
     )
 
@@ -242,6 +249,7 @@ def classify_planning_policy(objective: str) -> PlanningPolicy:
         reasons.append("The objective crosses the deterministic threshold for an independent plan-review gate before write work.")
 
     return PlanningPolicy(
+        explore_required=explore_required,
         critic_required=critic_required,
         plan_review_required=plan_review_required,
         categories=tuple(categories),

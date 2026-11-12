@@ -10,12 +10,13 @@ import (
 	"strings"
 )
 
-var ProfileNames = []string{"coordinator", "critic", "plan_review", "research", "implement", "review", "advise"}
-var ReadOnlyProfiles = map[string]bool{"coordinator": true, "critic": true, "plan_review": true, "research": true, "review": true, "advise": true}
+var ProfileNames = []string{"coordinator", "explore", "critic", "plan_review", "research", "implement", "review", "advise"}
+var ReadOnlyProfiles = map[string]bool{"coordinator": true, "explore": true, "critic": true, "plan_review": true, "research": true, "review": true, "advise": true}
 var WriteProfiles = map[string]bool{"implement": true}
 
 var ProfileTitles = map[string]string{
 	"coordinator": "Coordinator / Planner",
+	"explore":     "Repository Explorer",
 	"critic":      "Pre-planning Critic",
 	"plan_review": "Plan Reviewer",
 	"research":    "Researcher",

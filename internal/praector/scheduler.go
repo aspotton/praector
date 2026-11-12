@@ -187,7 +187,7 @@ func (s *Scheduler) enforceDeliveryPolicy(collectionID string) (bool, error) {
 	}
 	for _, t := range active {
 		p, st := S(t, "profile"), S(t, "status")
-		planning := p == "coordinator" || p == "critic" || p == "plan_review" || p == "research" || p == "advise"
+		planning := p == "coordinator" || p == "explore" || p == "critic" || p == "plan_review" || p == "research" || p == "advise"
 		if planning && (st == TaskPending || st == TaskReady || st == TaskRunning || st == TaskWaiting || st == TaskVerifying) {
 			return false, nil
 		}
@@ -254,7 +254,7 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		return false, err
 	}
 	policy := ClassifyPlanningPolicy(S(collection, "objective"))
-	if !policy.CriticRequired && !policy.PlanReviewRequired {
+	if !policy.ExploreRequired && !policy.CriticRequired && !policy.PlanReviewRequired {
 		return false, nil
 	}
 	tasks, err := s.Store.ListTasks(collectionID)
@@ -262,6 +262,112 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		return false, err
 	}
 	active := activeTasks(tasks)
+	changed := false
+	reasonText := strings.Join(policy.Reasons, "; ")
+	if reasonText == "" {
+		reasonText = "Deterministic planning policy requires pre-write gates."
+	}
+
+	// Implementation Collections begin with deterministic discovery and critique
+	// before the coordinator is allowed to shape the material plan. This makes
+	// current-system understanding a durable input instead of incidental planner
+	// behavior. Reconciliation also applies to revisions, so the preflight is
+	// refreshed when a completed Collection is reopened for additional work.
+	var latestCoordinator Row
+	for i := len(active) - 1; i >= 0; i-- {
+		st := S(active[i], "status")
+		if S(active[i], "profile") == "coordinator" && (S(active[i], "title") == "Initial coordination" || S(active[i], "title") == "Acceptance revision") && (st == TaskPending || st == TaskReady || st == TaskWaiting) {
+			latestCoordinator = active[i]
+			break
+		}
+	}
+	latestForCoordinator := func(profile string) Row {
+		for i := len(active) - 1; i >= 0; i-- {
+			if S(active[i], "profile") != profile {
+				continue
+			}
+			if latestCoordinator == nil || S(active[i], "requested_by_task_id") == S(latestCoordinator, "id") {
+				return active[i]
+			}
+		}
+		return nil
+	}
+	latestExplore := latestForCoordinator("explore")
+	if policy.ExploreRequired && latestCoordinator != nil && latestExplore == nil {
+		pid := ""
+		depth := 1
+		blocking := ""
+		if latestCoordinator != nil {
+			pid = S(latestCoordinator, "id")
+			depth = I(latestCoordinator, "depth") + 1
+			st := S(latestCoordinator, "status")
+			if st == TaskPending || st == TaskReady || st == TaskWaiting {
+				blocking = pid
+			}
+		}
+		_, _, err = s.Store.CreateTask(CreateTaskOptions{
+			ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "explore",
+			Title:        "Explore current implementation surface",
+			Objective:    "Before planning, inspect the existing repository/system surface relevant to the Collection objective. Map relevant files/modules, entry points, callers/dependencies, shared state, configuration/runtime boundaries, tests, documentation, similar existing patterns, and compatibility/concurrency/platform constraints. Return a concise evidence-grounded current-state map for the critic and coordinator. Do not design the solution or implement changes; for a greenfield repository, say so explicitly and stop early.",
+			Reason:       "Deterministic planning policy: repository exploration is required before implementation planning.",
+			ParentTaskID: pid, RequestedByTaskID: pid, WorkspaceMode: "collection", Depth: depth, AllowDedupe: false,
+			SpawnedByTaskID: pid, BlockingCallerTaskID: blocking,
+		})
+		if err != nil {
+			return false, err
+		}
+		changed = true
+		tasks, _ = s.Store.ListTasks(collectionID)
+		active = activeTasks(tasks)
+		latestCoordinator = nil
+		for i := len(active) - 1; i >= 0; i-- {
+			st := S(active[i], "status")
+			if S(active[i], "profile") == "coordinator" && (S(active[i], "title") == "Initial coordination" || S(active[i], "title") == "Acceptance revision") && (st == TaskPending || st == TaskReady || st == TaskWaiting) {
+				latestCoordinator = active[i]
+				break
+			}
+		}
+		latestExplore = latestForCoordinator("explore")
+	}
+
+	latestCritic := latestForCoordinator("critic")
+	if policy.CriticRequired && latestCoordinator != nil && latestCritic == nil {
+		pid := ""
+		depth := 1
+		blocking := ""
+		if latestCoordinator != nil {
+			pid = S(latestCoordinator, "id")
+			depth = I(latestCoordinator, "depth") + 1
+			st := S(latestCoordinator, "status")
+			if st == TaskPending || st == TaskReady || st == TaskWaiting {
+				blocking = pid
+			}
+		}
+		deps := []string{}
+		if latestExplore != nil {
+			deps = append(deps, S(latestExplore, "id"))
+		}
+		_, _, err = s.Store.CreateTask(CreateTaskOptions{
+			ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "critic",
+			Title: "Preflight implementation plan",
+			Objective: fmt.Sprintf("Independently preflight the Collection objective before material planning. Consume the completed repository exploration as primary evidence when present. Deterministic policy categories: %s. Identify hidden requirements, scope hazards, security/state/concurrency semantics, assumptions, executable QA directives, and any acceptance contradiction. Return concrete MUST/MUST NOT/VERIFY guidance for the coordinator; do not implement or mutate the graph.", func() string {
+				if len(policy.Categories) > 0 {
+					return strings.Join(policy.Categories, ", ")
+				}
+				return "implementation"
+			}()),
+			Reason:       "Deterministic planning policy: every implementation Collection receives an independent critic.",
+			ParentTaskID: pid, RequestedByTaskID: pid, DependsOn: deps, WorkspaceMode: "collection", Depth: depth, AllowDedupe: false,
+			SpawnedByTaskID: pid, BlockingCallerTaskID: blocking,
+		})
+		if err != nil {
+			return false, err
+		}
+		changed = true
+		tasks, _ = s.Store.ListTasks(collectionID)
+		active = activeTasks(tasks)
+	}
+
 	writeTasks := Rows{}
 	for _, t := range active {
 		if S(t, "profile") == "implement" && (S(t, "status") == TaskPending || S(t, "status") == TaskReady) {
@@ -269,12 +375,7 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		}
 	}
 	if len(writeTasks) == 0 {
-		return false, nil
-	}
-	changed := false
-	reasonText := strings.Join(policy.Reasons, "; ")
-	if reasonText == "" {
-		reasonText = "Deterministic planning policy requires pre-write gates."
+		return changed, nil
 	}
 	planReviews := Rows{}
 	for _, t := range active {
@@ -565,7 +666,7 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		}
 	}
 	if changed {
-		_ = s.Store.Event(S(collection, "project_id"), collectionID, "", "", "PLANNING_POLICY_ENFORCED", Row{"critic_required": policy.CriticRequired, "plan_review_required": policy.PlanReviewRequired, "categories": policy.Categories, "critic_task_id": func() any {
+		_ = s.Store.Event(S(collection, "project_id"), collectionID, "", "", "PLANNING_POLICY_ENFORCED", Row{"explore_required": policy.ExploreRequired, "critic_required": policy.CriticRequired, "plan_review_required": policy.PlanReviewRequired, "categories": policy.Categories, "critic_task_id": func() any {
 			if critic != nil {
 				return S(critic, "id")
 			}

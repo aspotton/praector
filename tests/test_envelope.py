@@ -99,7 +99,7 @@ def _envelope_for_profile(profile: str) -> str:
 
 
 def test_every_profile_inherits_global_engineering_contract():
-    for profile in ("coordinator", "critic", "plan_review", "research", "implement", "review", "advise"):
+    for profile in ("coordinator", "explore", "critic", "plan_review", "research", "implement", "review", "advise"):
         prompt = _envelope_for_profile(profile)
         assert "## Global engineering contract" in prompt
         assert "Prefer the smallest coherent change" in prompt
@@ -118,7 +118,7 @@ def test_delegated_fresh_worker_inherits_same_global_contract_without_objective_
 
 
 def test_read_only_profiles_get_workspace_hygiene_contract_but_implement_does_not():
-    for profile in ("coordinator", "critic", "plan_review", "research", "review", "advise"):
+    for profile in ("coordinator", "explore", "critic", "plan_review", "research", "review", "advise"):
         prompt = _envelope_for_profile(profile)
         assert "Treat **no net workspace mutation** as part of the task's completion contract" in prompt
         assert "git status --porcelain=v1 --untracked-files=all" in prompt

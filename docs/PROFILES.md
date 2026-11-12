@@ -9,6 +9,7 @@ You can inspect the installed contracts directly:
 ```bash
 praector profile list
 praector profile show coordinator
+praector profile show explore
 praector profile show critic
 praector profile show plan_review
 praector profile show advise
@@ -51,6 +52,7 @@ Role prompts reinforce these rules rather than duplicating them. The coordinator
 
 | Praector profile | Purpose | Capability | Rough OMO analogue |
 | --- | --- | --- | --- |
+| `explore` | Evidence-grounded map of the current repository/system surface before implementation planning | read-only | repository discovery / context mapper |
 | `coordinator` | decision-complete planning plus durable graph authority | read-only, graph-authority | Prometheus planner plus part of Atlas orchestration |
 | `critic` | pre-plan gap analysis, hidden intent, scope/QA hazards | read-only | Metis / plan-consultant |
 | `plan_review` | practical executability review of the proposed task graph | read-only | Momus / plan-reviewer |
@@ -83,7 +85,7 @@ The coordinator owns the work graph, not product implementation. Its prompt requ
 - make task objectives decision-complete with DELIVERABLE / SCOPE / MUST HAVE / MUST NOT / VERIFY context;
 - submit its result and exit instead of waiting for workers.
 
-Clearly trivial documentation-only work may remain low-ceremony. Non-trivial implementation work has a deterministic `plan_review` floor; critic/advice/research remain conditional on risk, ambiguity, architecture, or evidence needs.
+Every implementation Collection receives a deterministic read-only `explore -> critic` preflight before its initial/revision coordinator plans material work. `explore` establishes what exists; `critic` challenges what the plan must not miss. Clearly trivial documentation-only work may still skip final `plan_review`; non-trivial implementation work retains the deterministic `plan_review` floor. `advise` and bounded `research` remain conditional on architecture/tradeoff or specific evidence needs.
 
 Unlike an interactive planning agent, Praector does not let managed workers ask the operator live questions. If evidence, critic, and advice still leave a requirement-defining ambiguity with no safe reversible default, the coordinator should block/fail planning with the exact unresolved choice rather than inventing an answer. A future durable operator-input gate can add interview-style clarification without making session continuity part of correctness.
 
@@ -146,7 +148,7 @@ The implementation reviewer re-reads the integrated candidate rather than trusti
 At runtime the model receives:
 
 ```text
-common ORCH TASK ENVELOPE
+common PRAECTOR TASK ENVELOPE
 + mandatory internal/assets/prompts/global.md engineering contract
 + profile purpose / OWN / ASK / DELEGATE boundary
 + mandatory internal/assets/prompts/<profile>.md operating contract

@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestSchedulerPolicyStagesCriticThenPlanReviewBeforeImplementation(t *testing.T) {
+func TestSchedulerPolicyStagesExploreCriticThenPlanReviewBeforeImplementation(t *testing.T) {
 	s, cfg := newFakeStore(t)
 	p, _ := s.RegisterProject(testProjectConfig(t.TempDir()))
 	c, coord, e := s.CreateCollectionWithCoordinator(S(p, "id"), "Secure feature", "Add API-key authentication and per-key rate limiting to the existing /hello endpoint.", "Plan")
@@ -21,36 +21,45 @@ func TestSchedulerPolicyStagesCriticThenPlanReviewBeforeImplementation(t *testin
 		t.Fatal(e)
 	}
 
-	// Exact Python behavior: while a coordinator is still shaping the graph,
-	// deterministic policy inserts the required critic but does not manufacture
-	// the final policy plan-review gate. Claim-time gating keeps implementation
-	// from running until planning settles.
+	// Deterministic policy injects repository exploration followed by a critic
+	// before the coordinator is allowed to shape the final implementation graph.
 	changed, e := sched.enforcePlanningPolicy(S(c, "id"))
 	if e != nil {
 		t.Fatal(e)
 	}
 	if !changed {
-		t.Fatal("expected critic policy mutation")
+		t.Fatal("expected explore/critic policy mutation")
 	}
 	tasks, _ := s.ListTasks(S(c, "id"))
+	var explore Row
 	var critic Row
 	planCount := 0
 	for _, x := range tasks {
 		switch S(x, "profile") {
+		case "explore":
+			explore = x
 		case "critic":
 			critic = x
 		case "plan_review":
 			planCount++
 		}
 	}
-	if critic == nil {
-		t.Fatalf("missing critic gate: %v", tasks)
+	if explore == nil || critic == nil {
+		t.Fatalf("missing explore/critic preflight: %v", tasks)
+	}
+	cdeps, _ := s.Dependencies(S(critic, "id"))
+	if !containsTaskID(cdeps, S(explore, "id")) {
+		t.Fatalf("critic does not depend on explore: %v", cdeps)
 	}
 	if planCount != 0 {
 		t.Fatalf("plan review should wait for coordinator handoff, got %d: %v", planCount, tasks)
 	}
 
-	// Simulate the critic finishing and the coordinator finishing graph shaping.
+	// Simulate exploration, critic, and coordinator finishing graph shaping.
+	_, _ = s.SubmitResult(S(explore, "id"), Row{"status": "complete", "summary": "repository mapped"})
+	if e = s.SetTaskStatus(S(explore, "id"), TaskComplete, "test explore complete"); e != nil {
+		t.Fatal(e)
+	}
 	_, _ = s.SubmitResult(S(critic, "id"), Row{"status": "complete", "summary": "preflight complete"})
 	if e = s.SetTaskStatus(S(critic, "id"), TaskComplete, "test critic complete"); e != nil {
 		t.Fatal(e)
@@ -193,5 +202,81 @@ func TestReadOnlyCapabilityViolationFailsAfterRetryBudget(t *testing.T) {
 	}
 	if !strings.Contains(JSONDumps(M(got, "result")), "retry budget exhausted") {
 		t.Fatalf("expected exhausted-budget risk, got %v", M(got, "result"))
+	}
+}
+
+func TestSchedulerPolicyGivesRevisionFreshExploreAndCritic(t *testing.T) {
+	s, cfg := newFakeStore(t)
+	p, _ := s.RegisterProject(testProjectConfig(t.TempDir()))
+	c, initial, err := s.CreateCollectionWithCoordinator(S(p, "id"), "Feature", "Add API-key authentication to the API.", "Plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldExplore, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "explore", Title: "Explore current implementation surface", Objective: "Map repo", Reason: "policy",
+		ParentTaskID: S(initial, "id"), RequestedByTaskID: S(initial, "id"), WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCritic, _, err := s.CreateTask(CreateTaskOptions{
+		ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "critic", Title: "Preflight implementation plan", Objective: "Critique", Reason: "policy",
+		ParentTaskID: S(initial, "id"), RequestedByTaskID: S(initial, "id"), DependsOn: []string{S(oldExplore, "id")}, WorkspaceMode: "collection", Depth: 1, AllowDedupe: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, task := range []Row{oldExplore, oldCritic, initial} {
+		_, _ = s.SubmitResult(S(task, "id"), Row{"status": "complete", "summary": "done"})
+		if err := s.SetTaskStatus(S(task, "id"), TaskComplete, "done"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// This test isolates revision-generation preflight rather than delivery acceptance.
+	if err := s.SetCollectionStatus(S(c, "id"), TaskComplete, true); err != nil {
+		t.Fatal(err)
+	}
+	rev, revision, err := s.RequestCollectionRevision(S(c, "id"), "Change the accepted implementation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rev
+	sched, err := NewScheduler(s, cfg, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := sched.enforcePlanningPolicy(S(c, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("expected fresh revision preflight")
+	}
+	tasks, _ := s.ListTasks(S(c, "id"))
+	var freshExplore, freshCritic Row
+	for _, task := range tasks {
+		if S(task, "requested_by_task_id") != S(revision, "id") {
+			continue
+		}
+		switch S(task, "profile") {
+		case "explore":
+			freshExplore = task
+		case "critic":
+			freshCritic = task
+		}
+	}
+	if freshExplore == nil || freshCritic == nil {
+		t.Fatalf("revision missing fresh explore/critic: %v", tasks)
+	}
+	if S(freshExplore, "id") == S(oldExplore, "id") || S(freshCritic, "id") == S(oldCritic, "id") {
+		t.Fatal("revision reused prior-generation preflight")
+	}
+	criticDeps, _ := s.Dependencies(S(freshCritic, "id"))
+	if !containsTaskID(criticDeps, S(freshExplore, "id")) {
+		t.Fatalf("fresh critic does not depend on fresh explore: %v", criticDeps)
+	}
+	revisionDeps, _ := s.Dependencies(S(revision, "id"))
+	if !containsTaskID(revisionDeps, S(freshExplore, "id")) || !containsTaskID(revisionDeps, S(freshCritic, "id")) {
+		t.Fatalf("revision coordinator not blocked on fresh preflight: %v", revisionDeps)
 	}
 }

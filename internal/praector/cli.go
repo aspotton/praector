@@ -418,7 +418,7 @@ func cmdRun(args []string) int {
 	if title == "" {
 		title = HumanTitle(objective, 80)
 	}
-	coordObj := fmt.Sprintf("Own the initial decomposition of the new collection: %s. Inspect project context only as needed. Create durable critic/plan_review/research/implement/review/advise tasks using praector as appropriate. Do not perform implementation or substantive specialist work yourself. Ensure implementation tasks are sequenced by dependencies; independent review is automatically enforced for implementation tasks.", objective)
+	coordObj := fmt.Sprintf("Own the initial decomposition of the new collection: %s. Consume the deterministic explore/critic preflight when present. Create durable plan_review/research/implement/review/advise tasks using praector as appropriate; request additional explore/critic work only when genuinely needed. Do not perform implementation or substantive specialist work yourself. Ensure implementation tasks are sequenced by dependencies; independent review is automatically enforced for implementation tasks.", objective)
 	c, coord, e := store.CreateCollectionWithCoordinator(S(project, "id"), title, objective, coordObj)
 	if e != nil {
 		return fail(e)

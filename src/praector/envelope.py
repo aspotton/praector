@@ -12,8 +12,13 @@ from .planning_policy import classify_delivery_policy, classify_planning_policy
 PROFILE_GUIDANCE = {
     "coordinator": {
         "purpose": "Produce/refine a decision-complete durable work graph and own graph-level reasoning.",
-        "own": "Inspect context, classify the work, resolve planning assumptions, decompose work, and define dependencies/verification.",
-        "delegate": "Substantive research, implementation, independent plan review, implementation review, or specialist consultation.",
+        "own": "Consume exploration/critic evidence, resolve planning assumptions, decompose work, and define dependencies/verification.",
+        "delegate": "Repository exploration, substantive research, implementation, independent plan review, implementation review, or specialist consultation.",
+    },
+    "explore": {
+        "purpose": "Map the existing repository/system surface relevant to the Collection objective before planning.",
+        "own": "Inspect relevant files, modules, tests, configuration, runtime boundaries, callers/dependencies, existing patterns, and documentation; return evidence-grounded current-state context.",
+        "delegate": "Solution design, architecture preference, implementation, graph mutation, or independent review.",
     },
     "critic": {
         "purpose": "Challenge the request before planning by surfacing hidden intent, ambiguity, scope hazards, and verification gaps.",
@@ -48,6 +53,7 @@ PROFILE_GUIDANCE = {
 }
 
 AVAILABLE_PROFILES = {
+    "explore": "Use for broad repository/system discovery before planning: what exists, how it connects, and what constraints matter.",
     "critic": "Use for pre-planning gap analysis: hidden intent, ambiguity, scope hazards, assumptions, and QA directives.",
     "plan_review": "Use to review whether a proposed graph/task plan is executable before write work begins.",
     "research": "Use for additional facts, repository investigation, authoritative evidence, or bounded discovery.",
@@ -209,7 +215,7 @@ def build_task_envelope(
             "A fail remains blocking; Praector will wake a coordinator to repair the graph before this reviewer runs again."
         )
 
-    return f"""# ORCH TASK ENVELOPE v1
+    return f"""# PRAECTOR TASK ENVELOPE v1
 
 You are running as one disposable execution attempt inside a durable orchestrator. The task, graph, workspace, and results persist outside this OpenCode session.
 

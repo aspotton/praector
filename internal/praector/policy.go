@@ -10,8 +10,8 @@ import (
 )
 
 type PlanningPolicy struct {
-	CriticRequired, PlanReviewRequired bool
-	Categories, Reasons                []string
+	ExploreRequired, CriticRequired, PlanReviewRequired bool
+	Categories, Reasons                                 []string
 }
 type DeliveryPolicy struct {
 	ImplementationRequired bool
@@ -19,7 +19,7 @@ type DeliveryPolicy struct {
 }
 
 func (p PlanningPolicy) AsRow() Row {
-	return Row{"critic_required": p.CriticRequired, "plan_review_required": p.PlanReviewRequired, "categories": p.Categories, "reasons": p.Reasons}
+	return Row{"explore_required": p.ExploreRequired, "critic_required": p.CriticRequired, "plan_review_required": p.PlanReviewRequired, "categories": p.Categories, "reasons": p.Reasons}
 }
 func (p DeliveryPolicy) AsRow() Row {
 	return Row{"implementation_required": p.ImplementationRequired, "categories": p.Categories, "reasons": p.Reasons}
@@ -75,9 +75,13 @@ func ClassifyPlanningPolicy(obj string) PlanningPolicy {
 	destructive := matchesAny(obj, destructivePatterns)
 	extContract := matchesAny(obj, externalContractPatterns)
 	extIntegration := matchesAny(obj, externalIntegrationPatterns)
-	if implementation && !trivial {
+	if implementation {
 		cats = append(cats, "implementation_change")
-		reasons = append(reasons, "Non-trivial implementation work requires an independent plan-review gate before write work.")
+		reasons = append(reasons, "Implementation work requires a read-only repository exploration preflight before coordination.")
+		reasons = append(reasons, "Implementation work always requires an independent pre-planning critic.")
+		if !trivial {
+			reasons = append(reasons, "Non-trivial implementation work requires an independent plan-review gate before write work.")
+		}
 	}
 	if security {
 		cats = append(cats, "security")
@@ -103,8 +107,9 @@ func ClassifyPlanningPolicy(obj string) PlanningPolicy {
 		reasons = append(reasons, "External provider/gateway integration behavior requires an independent critic before write work.")
 	}
 	integrationSensitive := implementation && (extContract || extIntegration)
-	critic := security || migration || destructive || (stateful && extContract) || integrationSensitive
-	plan := critic || stateful || migration || destructive || (implementation && !trivial)
+	explore := implementation
+	critic := implementation || security || migration || destructive || (stateful && extContract) || integrationSensitive
+	plan := stateful || migration || destructive || integrationSensitive || (implementation && !trivial)
 	if plan {
 		found := false
 		for _, r := range reasons {
@@ -117,7 +122,7 @@ func ClassifyPlanningPolicy(obj string) PlanningPolicy {
 			reasons = append(reasons, "The objective crosses the deterministic threshold for an independent plan-review gate before write work.")
 		}
 	}
-	return PlanningPolicy{critic, plan, cats, reasons}
+	return PlanningPolicy{explore, critic, plan, cats, reasons}
 }
 func ClassifyDeliveryPolicy(obj string) DeliveryPolicy {
 	impl := requiresImplementation(obj)

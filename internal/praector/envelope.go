@@ -11,7 +11,8 @@ import (
 type profileGuide struct{ Purpose, Own, Delegate string }
 
 var profileGuidance = map[string]profileGuide{
-	"coordinator": {"Produce/refine a decision-complete durable work graph and own graph-level reasoning.", "Inspect context, classify the work, resolve planning assumptions, decompose work, and define dependencies/verification.", "Substantive research, implementation, independent plan review, implementation review, or specialist consultation."},
+	"coordinator": {"Produce/refine a decision-complete durable work graph and own graph-level reasoning.", "Consume exploration/critic evidence, resolve planning assumptions, decompose work, and define dependencies/verification.", "Repository exploration, substantive research, implementation, independent plan review, implementation review, or specialist consultation."},
+	"explore":     {"Map the existing repository/system surface relevant to the Collection objective before planning.", "Inspect relevant files, modules, tests, configuration, runtime boundaries, callers/dependencies, existing patterns, and documentation; return evidence-grounded current-state context.", "Solution design, architecture preference, implementation, graph mutation, or independent review."},
 	"critic":      {"Challenge the request before planning by surfacing hidden intent, ambiguity, scope hazards, and verification gaps.", "Intent classification, evidence-grounded gap analysis, planner directives, risk/assumption analysis, and QA directives.", "Implementation or graph mutation. Request bounded research only when decisive evidence is genuinely missing."},
 	"plan_review": {"Independently determine whether the proposed durable work graph is executable without blocking gaps.", "Reference checks, task executability, dependency coherence, scope coherence, and verification-plan review.", "Plan repair or implementation. Return a verdict; Praector/coordinator handles graph repair."},
 	"research":    {"Investigate a bounded question and return verifiable evidence.", "Repository investigation, evidence gathering, source comparison, and analysis within the assigned question.", "Independent specialist work, implementation, architecture changes, or review outside this task's scope."},
@@ -21,6 +22,7 @@ var profileGuidance = map[string]profileGuide{
 }
 
 var availableProfiles = map[string]string{
+	"explore":     "Use for broad repository/system discovery before planning: what exists, how it connects, and what constraints matter.",
 	"critic":      "Use for pre-planning gap analysis: hidden intent, ambiguity, scope hazards, assumptions, and QA directives.",
 	"plan_review": "Use to review whether a proposed graph/task plan is executable before write work begins.",
 	"research":    "Use for additional facts, repository investigation, authoritative evidence, or bounded discovery.",
