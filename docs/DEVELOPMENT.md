@@ -118,6 +118,20 @@ which only run the durable validation and return the plan, never push/merge/
 accept, plus explicit-root project `init`/registration) are gated behind a
 separate default-off `privileged` opt-in.
 
+Protocol honesty and local security live at deterministic seams: `mcp/server.go`
+advertises only the implemented protocol revision and returns a JSON-RPC
+Invalid-params error for any other requested `initialize` version (never echoes
+an unsupported one); `mcp/transport.go` requires a matching
+`MCP-Protocol-Version` header on post-`initialize` requests and validates the
+request Host/Origin as a loopback authority before dispatch (HTTP 400 / 403
+respectively), layered on the unchanged `IsLoopbackAddr` socket-bind gate. The
+bridge adds no daemon-cwd fallback (an operation inferring a project requires an
+explicit `PRJ-*`/`COL-*`/`T-*` id), `init` requires an absolute `root_path`, and
+resources advertise accurate content types (`application/json` for JSON listings,
+`text/plain` for CLI/help text). An independent external conformance oracle
+(`scripts/mcp_conformance.py`) exercises the live loopback listener from an
+external client.
+
 Good place for:
 
 - JSON-RPC/MCP protocol framing and the streamable-HTTP transport (`mcp/`);

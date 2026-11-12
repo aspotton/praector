@@ -1467,8 +1467,13 @@ type DoctorCheck struct {
 	Status string // "ok" | "warn" | "fail"
 }
 
-// DoctorInput is the (empty) input for `praector doctor`.
-type DoctorInput struct{}
+// DoctorInput is the input for `praector doctor`. An empty ProjectID preserves the
+// CLI's cwd-based project-marker discovery; an explicit ProjectID (used by the MCP
+// bridge, which has no safe implicit cwd) resolves that registered project from
+// durable state instead of inspecting the process working directory.
+type DoctorInput struct {
+	ProjectID string
+}
 
 // DoctorOutput is the ordered diagnostic results plus the failure count.
 type DoctorOutput struct {
@@ -1504,6 +1509,32 @@ func (s *Service) Doctor(ctx context.Context, in DoctorInput) (DoctorOutput, err
 		add("ok", fmt.Sprintf("Dolt state: %s", st.StateDir))
 	} else {
 		add("fail", fmt.Sprintf("Dolt state: %v", e))
+	}
+	// An explicit project identifier (MCP bridge) resolves the registered project
+	// from durable state and never inspects the process working directory.
+	if in.ProjectID != "" {
+		if store == nil {
+			add("fail", fmt.Sprintf("project %s: Dolt state unavailable", in.ProjectID))
+			return out, nil
+		}
+		pr, e := store.GetProject(in.ProjectID)
+		if e != nil {
+			add("fail", fmt.Sprintf("project %s: %v", in.ProjectID, e))
+			return out, nil
+		}
+		pc := ProjectConfigFromRow(pr)
+		add("ok", fmt.Sprintf("project: %s (%s)", pc.Name, pc.ProjectID))
+		if st, e := os.Stat(pc.Root); e != nil || !st.IsDir() {
+			add("fail", fmt.Sprintf("project repository does not exist: %s", pc.Root))
+		} else {
+			add("ok", fmt.Sprintf("project repository: %s", pc.Root))
+		}
+		if _, e := pc.ResolvedOpenCode(); e != nil {
+			add("fail", fmt.Sprintf("project OpenCode command: %v", e))
+		} else {
+			add("ok", fmt.Sprintf("project OpenCode command: %s", pc.OpenCodeCommand))
+		}
+		return out, nil
 	}
 	if marker, ok := FindProjectMarker(""); ok {
 		pc, e := ReadProjectMarker(marker)

@@ -14,12 +14,29 @@ package mcp
 
 import "encoding/json"
 
-// Supported protocol versions. The server advertises ProtocolVersion and, on
-// initialize, echoes the client's requested version when it is one we support.
+// Supported protocol revisions. The server advertises ONLY ProtocolVersion: it
+// implements exactly one MCP revision and never claims support for a revision it
+// does not implement. A client requesting any other revision is refused (see
+// Server.initializeResult) rather than echoed, per the authoritative research
+// (DEC-92e6ae36d4: advertise ONLY 2025-06-18; never echo unsupported versions).
 const (
-	// ProtocolVersion is the highest MCP revision this server advertises.
+	// ProtocolVersion is the single MCP revision this server implements and
+	// advertises.
 	ProtocolVersion = "2025-06-18"
 )
+
+// ProtocolVersionHeader is the HTTP header a Streamable-HTTP client sets on every
+// post-initialize request to name the protocol revision in force. Praector
+// requires it to equal ProtocolVersion on any non-initialize request (see
+// serveStreamable); it does not assume the pre-2025-06-18 revision for clients
+// that omit it, because it does not implement that revision.
+const ProtocolVersionHeader = "MCP-Protocol-Version"
+
+// SupportedVersions lists every protocol revision this server actually
+// implements. It is exposed (via initialize errors and the transport) so clients
+// can discover the honest supported set rather than a version the server only
+// echoes.
+func SupportedVersions() []string { return []string{ProtocolVersion} }
 
 // JSON-RPC method names handled by the core.
 const (

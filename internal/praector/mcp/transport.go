@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -41,6 +42,17 @@ func (s *Server) serveStreamable(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// DNS-rebinding / local-listener hardening: before reading, decoding, or
+	// dispatching anything, the request's Host/local-authority and Origin must
+	// resolve to the loopback authority this server binds. A foreign Origin or
+	// Host (e.g. an attacker-controlled DNS record rebound to 127.0.0.1) is
+	// rejected with 403 before any tool/resource handler runs. This is defense in
+	// depth on top of the authoritative socket bind gate (NewLoopbackServer); it
+	// does not replace IsLoopbackAddr.
+	if !requestAuthorized(r) {
+		http.Error(w, "forbidden: request authority is not loopback", http.StatusForbidden)
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
 	if err != nil {
 		writeJSON(w, errorResponse(nil, codeParseError, "failed to read request body", nil))
@@ -51,6 +63,17 @@ func (s *Server) serveStreamable(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, errorResponse(nil, codeParseError, derr.Error(), nil))
 		return
 	}
+	// Per the 2025-06-18 Streamable-HTTP contract, every request after
+	// initialize must carry MCP-Protocol-Version naming a revision this server
+	// implements. Praector does not implement any pre-2025-06-18 revision, so a
+	// missing or unsupported header is a plain 400 (it does not silently assume
+	// 2025-03-26). initialize itself may omit the header.
+	if req.Method != methodInitialize {
+		if v := r.Header.Get(ProtocolVersionHeader); v != ProtocolVersion {
+			http.Error(w, fmt.Sprintf("invalid or missing %s header (want %s)", ProtocolVersionHeader, ProtocolVersion), http.StatusBadRequest)
+			return
+		}
+	}
 	resp := s.handle(req)
 	if resp == nil {
 		// Notification: acknowledged with no body.
@@ -58,6 +81,56 @@ func (s *Server) serveStreamable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, *resp)
+}
+
+// requestAuthorized reports whether an inbound Streamable-HTTP request targets
+// the loopback authority this server binds, guarding against DNS rebinding and
+// other cross-origin attacks against a local, unauthenticated listener. The
+// Host/local-authority must be loopback, and when a browser Origin header is
+// present it must be an http/https origin whose host is loopback and whose port
+// matches the request authority (fail closed). A request with no Origin (a
+// non-browser client) is accepted on the Host check alone.
+func requestAuthorized(r *http.Request) bool {
+	if !loopbackAuthority(r.Host) {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" || origin == "null" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	if !loopbackAuthority(u.Host) {
+		return false
+	}
+	return authorityPort(u.Host) == authorityPort(r.Host)
+}
+
+// loopbackAuthority reports whether a "host[:port]" authority names a loopback
+// interface: the hostname "localhost" or a 127.0.0.0/8 or [::1] address. A bare
+// or non-loopback host is refused.
+func loopbackAuthority(authority string) bool {
+	host, _, err := net.SplitHostPort(authority)
+	if err != nil {
+		host = authority
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// authorityPort returns the port component of a "host[:port]" authority, or the
+// empty string when no explicit port is present.
+func authorityPort(authority string) string {
+	if _, port, err := net.SplitHostPort(authority); err == nil {
+		return port
+	}
+	return ""
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

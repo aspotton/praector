@@ -247,10 +247,45 @@ cleanup` — are **default-off** behind the independent
 `privileged` opt-in. When disabled they are neither advertised nor callable, and
 even when enabled the `pr`/`accept` tools only run the durable acceptance/PR
 validation and return the resulting plan: they never push, merge, or otherwise
-implicitly accept. An MCP `init` call requires an explicit target `root_path` and
-never operates on the daemon process working directory. Direct acceptance and
-external PR delivery remain
+implicitly accept, while `cleanup` performs real worktree/branch removal and
+`init` performs real project registration/filesystem changes. An MCP `init` call
+requires an explicit **absolute** target `root_path` (relative paths, `.`, `..`,
+and an empty value are refused) and never operates on the daemon process working
+directory. Direct acceptance and external PR delivery remain
 operator-side actions.
+
+### Protocol and local-security contract
+
+The listener implements a single MCP protocol revision and is honest about it: it
+advertises only the revision it actually implements, and an `initialize` request
+for any other revision is **refused** rather than echoed back as if supported. On
+every request after `initialize`, the client must send an `MCP-Protocol-Version`
+HTTP header equal to that revision; a missing or unsupported header is rejected
+with HTTP 400 (Praector does not implement — and therefore does not assume — any
+older revision). `initialize` itself may omit the header.
+
+Because the listener is loopback-only and unauthenticated, it also defends
+against DNS-rebinding and related local-listener attacks: before any tool or
+resource handler runs, the request's Host/local-authority and (when present) its
+`Origin` are validated as a loopback authority (localhost, a `127.0.0.0/8`, or
+`[::1]` address, with a matching port); a foreign authority or Origin is rejected
+with HTTP 403. This is defense in depth on top of the authoritative socket-bind
+gate that already refuses to bind a non-loopback address.
+
+MCP operations carry **no implicit daemon cwd**. Any tool whose domain operation
+would otherwise infer a project from the working directory instead requires an
+explicit `PRJ-*` project identifier or a resolvable `COL-*`/`T-*` durable id
+(`praector_run` requires `project`; `status`, `graph`, `doctor`, `task list`,
+`project show`, `memory add`/`list`, and `decision add` follow the same rule). The
+CLI keeps its cwd-based project discovery unchanged.
+
+Resources advertise an accurate content type: JSON-backed resources (the profile
+and project listings) advertise `application/json`, while CLI/help-text resources
+advertise `text/plain`. An independent external conformance oracle
+(`scripts/mcp_conformance.py`, run against a live loopback listener by
+`TestMCPExternalConformanceOracle`) verifies negotiation, the header/Origin
+contracts, `tools/list`, `resources/list`/`read`, a safe read call, and a safe
+durable queue-write, independently of the in-process protocol tests.
 
 ## Observe work
 

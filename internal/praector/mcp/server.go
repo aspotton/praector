@@ -70,7 +70,7 @@ type Server struct {
 func (s *Server) handle(req rpcRequest) *rpcResponse {
 	switch req.Method {
 	case methodInitialize:
-		return s.result(req.ID, s.initializeResult(req.Params))
+		return s.initialize(req.ID, req.Params)
 	case methodInitialized:
 		return nil // notification: acknowledged, no body
 	case methodPing:
@@ -108,7 +108,13 @@ func (s *Server) handle(req rpcRequest) *rpcResponse {
 	}
 }
 
-func (s *Server) initializeResult(params json.RawMessage) map[string]any {
+// initialize answers the MCP initialize request with honest version negotiation:
+// it advertises the one revision it actually implements. An empty or matching
+// requested version succeeds; any other non-empty requested version is refused
+// with a JSON-RPC Invalid-params error carrying the supported set, rather than
+// echoed back as if it were supported (DEC-92e6ae36d4: never advertise a revision
+// this server does not implement).
+func (s *Server) initialize(id json.RawMessage, params json.RawMessage) *rpcResponse {
 	requested := ""
 	if len(params) > 0 {
 		var p struct {
@@ -118,20 +124,20 @@ func (s *Server) initializeResult(params json.RawMessage) map[string]any {
 			requested = p.ProtocolVersion
 		}
 	}
-	version := ProtocolVersion
 	if requested != "" && requested != ProtocolVersion {
-		// Per MCP, echo an unsupported-but-requested version back so the client
-		// can decide; the server still advertises only what it implements below.
-		version = requested
+		return s.err(id, codeInvalidParams, "Unsupported protocol version", map[string]any{
+			"supported": SupportedVersions(),
+			"requested": requested,
+		})
 	}
-	return map[string]any{
-		"protocolVersion": version,
+	return s.result(id, map[string]any{
+		"protocolVersion": ProtocolVersion,
 		"capabilities": map[string]any{
 			"tools":     map[string]any{"listChanged": false},
 			"resources": map[string]any{"subscribe": false, "listChanged": false},
 		},
 		"serverInfo": map[string]any{"name": s.ServerName, "version": s.ServerVersion},
-	}
+	})
 }
 
 func (s *Server) toolsCall(id json.RawMessage, params json.RawMessage) *rpcResponse {

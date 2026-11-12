@@ -57,7 +57,9 @@ def test_release_versions_live_in_changelog_not_readme_or_focused_docs():
     import re
     import tomllib
 
-    version_pattern = re.compile(r"\b\d+\.\d+\.\d+\b")
+    # Match a standalone X.Y.Z release tag only, not a fragment of a longer
+    # dotted-decimal number such as an IPv4 loopback literal (127.0.0.1).
+    version_pattern = re.compile(r"(?<![\d.])\d+\.\d+\.\d+(?![\d.])")
     package_version = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 
     init_text = (ROOT / "src" / "praector" / "__init__.py").read_text(encoding="utf-8")
