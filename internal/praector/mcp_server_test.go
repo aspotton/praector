@@ -138,6 +138,85 @@ func TestMCPRoundTripOverLoopback(t *testing.T) {
 	}
 }
 
+// TestMCPPrivilegedConfigDefaultOff asserts the privileged-write surface is a
+// separate opt-in that stays OFF unless explicitly enabled via [mcp] privileged or
+// PRAECTOR_MCP_PRIVILEGED, independent of whether the listener is enabled.
+func TestMCPPrivilegedConfigDefaultOff(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("PRAECTOR_MCP", "1")
+	t.Setenv("PRAECTOR_MCP_PRIVILEGED", "")
+	if cfg := LoadMCPServerConfig(GlobalConfig{Home: home}); cfg.Privileged {
+		t.Fatal("privileged writes must be off by default even when the listener is enabled")
+	}
+	t.Setenv("PRAECTOR_MCP_PRIVILEGED", "1")
+	if cfg := LoadMCPServerConfig(GlobalConfig{Home: home}); !cfg.Privileged {
+		t.Fatal("PRAECTOR_MCP_PRIVILEGED=1 should enable privileged writes")
+	}
+	t.Setenv("PRAECTOR_MCP_PRIVILEGED", "")
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("[mcp]\nenabled = true\nprivileged = true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := LoadMCPServerConfig(GlobalConfig{Home: home}); !cfg.Privileged {
+		t.Fatal("[mcp] privileged = true must enable the privileged surface")
+	}
+}
+
+// TestMCPPrivilegedToolsUnavailableWhileDisabled proves the loopback server started
+// with the default (unprivileged) config advertises no privileged write tool and
+// refuses a direct call to one, while still serving read/queue tools.
+func TestMCPPrivilegedToolsUnavailableWhileDisabled(t *testing.T) {
+	s, cfg := newFakeStore(t)
+	svc := &Service{store: s, cfg: cfg}
+	t.Setenv("PRAECTOR_MCP", "127.0.0.1:0")
+	t.Setenv("PRAECTOR_MCP_PRIVILEGED", "")
+	srv, err := startMCPServer(svc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve(ln)
+	defer srv.Close()
+	call := func(payload map[string]any) map[string]any {
+		body, _ := json.Marshal(payload)
+		resp, err := http.Post("http://"+ln.Addr().String()+mcpEndpoint(), "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return out
+	}
+	tl := call(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+	res, _ := tl["result"].(map[string]any)
+	tools, _ := res["tools"].([]any)
+	for _, want := range []string{"praector_collection_pr", "praector_collection_accept", "praector_collection_cleanup"} {
+		if hasToolNamed(tools, want) {
+			t.Fatalf("privileged tool %q must not be listed while disabled", want)
+		}
+	}
+	if !hasToolNamed(tools, "praector_project_list") {
+		t.Fatal("read-only parity tool must remain listed while privileged writes are disabled")
+	}
+	tc := call(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": map[string]any{"name": "praector_collection_accept", "arguments": map[string]any{"collection": "COL-none"}}})
+	if tr, _ := tc["result"].(map[string]any); !strings.Contains(asText(tr), "privileged") {
+		t.Fatalf("direct call to a disabled privileged tool must be refused: %v", tc)
+	}
+}
+
+func asText(tr map[string]any) string {
+	content, _ := tr["content"].([]any)
+	if len(content) == 0 {
+		return ""
+	}
+	c, _ := content[0].(map[string]any)
+	s, _ := c["text"].(string)
+	return s
+}
+
 // TestMCPBridgeNeverLaunchesProcesses is the invariant guard for DEC-1580dff0e0 /
 // DEC-aacb7bfc23: neither the MCP core package nor the bridge wiring may
 // construct a Scheduler or run a collection. Enqueue-only execution is enforced

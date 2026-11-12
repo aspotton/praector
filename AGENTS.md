@@ -32,7 +32,7 @@ Preserve these unless the change explicitly redesigns them and updates the archi
 - **Task != Attempt != Session.** Session continuity is never required for correctness.
 - The scheduler owns process lifecycle, retries, dependency readiness, recovery, and integration. Hard `depends_on` edges are an acyclic DAG invariant; never bypass the store cycle guard. Upgraded legacy cycles must be normalized before reconciliation, and unknown cycle shapes are quarantined to their Collection rather than guessed at or allowed to terminate the global daemon.
 - OpenCode is a harness adapter, not the orchestration database or scheduler.
-- The optional MCP surface is another adapter over the same `Service`/Store paths as the CLI: it is disabled by default, binds **loopback only**, and is enqueue-only — it never constructs a scheduler, launches processes, runs a collection, or bypasses policy/review/acceptance.
+- The optional MCP surface is another adapter over the same `Service`/Store paths as the CLI: it is disabled by default, binds **loopback only**, and is enqueue-only — it never constructs a scheduler, launches processes, runs a collection, or bypasses policy/review/acceptance. Its tool/resource surface is commandHelp-driven (each CLI command maps to exactly one tool/resource via `serviceOps`, so the surfaces cannot drift); read-only and pass-through queue-write tools reuse the identical gated `Store` methods, and the privileged collection-finalizing tools (`collection pr`/`accept`/`cleanup`, which only validate/plan and never push/merge/accept) sit behind a separate, default-off `privileged` opt-in.
 - Project file state belongs in **Git**; organizational/orchestration state belongs in **Dolt**.
 - Workers execute in Praector-managed worktrees, never by mutating the user's original checkout.
 - `coordinator`, `critic`, `plan_review`, `research`, `review`, and `advise` are read-only with deterministic Git mutation checks.
@@ -98,7 +98,7 @@ Keep responsibilities separated:
 - **Workspace (`internal/praector/workspace.go`)**: branches, worktrees, checkpoints, integration, acceptance, cleanup.
 - **Envelope (`internal/praector/envelope.go`)**: model-facing semantic contract/context compilation.
 - **Harness (`internal/praector/harness.go`)**: launch/observe one disposable model/tool session. Do not move scheduling policy here.
-- **MCP (`internal/praector/mcp/` + `mcp_server.go`)**: the MCP protocol core, loopback-only transport, and the tool/resource bridge over the shared service layer. It adds no orchestration/process-launch path; every MCP action delegates to a typed `Service` op. Enqueue-only "execute" actions mirror the CLI `--detach` path and rely on the running daemon.
+- **MCP (`internal/praector/mcp/` + `mcp_server.go`)**: the MCP protocol core, loopback-only transport, and the tool/resource bridge over the shared service layer. It adds no orchestration/process-launch path; every MCP action delegates to a typed `Service` op. The bridge is driven off `commandHelp`/`serviceOps` so every CLI command projects to exactly one MCP tool (leaf) or resource (namespace / launch-only). Enqueue-only "execute" actions mirror the CLI `--detach` path and rely on the running daemon; privileged collection-finalizing tools remain default-off behind an independent `privileged` opt-in.
 
 Add future harnesses behind the native harness boundary; do not scatter provider-specific branches through scheduler/store code. The Python tree is a regression oracle, not the primary place for new runtime behavior.
 

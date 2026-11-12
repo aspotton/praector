@@ -105,11 +105,21 @@ onto typed `Service` ops. The daemon hosts a **loopback-only (127.0.0.1)**
 listener goroutine, started from `cmdDaemon` when enabled and fully decoupled
 from the reconcile loop and `scheduler.lock`.
 
+The bridge enumerates `commandHelp`/`serviceOps` (the same registry the CLI
+parity test binds to) rather than a hand-maintained list, so every CLI command
+projects to exactly one MCP surface item — a callable tool for a leaf command, a
+readable resource for a command namespace or the launch-only `daemon` command —
+and the two surfaces cannot drift ("now and always"). Read-only commands and
+pass-through queue writes reuse the identical gated `Store`/workspace methods;
+privileged collection-finalizing tools (`collection pr`/`accept`/`cleanup`,
+which only run the durable validation and return the plan, never push/merge/
+accept) are gated behind a separate default-off `privileged` opt-in.
+
 Good place for:
 
 - JSON-RPC/MCP protocol framing and the streamable-HTTP transport (`mcp/`);
-- tool/resource definitions that delegate to a single typed `Service` op
-  (`mcp_server.go`);
+- tool/resource definitions that delegate to a single typed `Service` op, driven
+  off `commandHelp`/`serviceOps` (`mcp_server.go`);
 - enqueue-only "execute"-style actions that create durable work via the same
   `CreateCollectionWithCoordinator`/`CreateTask` Store paths as the CLI `--detach`
   path and rely on the running daemon.

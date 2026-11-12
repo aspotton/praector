@@ -46,7 +46,7 @@ Praector currently provides:
 - explicit human/policy acceptance into the base branch;
 - durable revisions when acceptance finds a defect before merge.
 
-An opt-in, **loopback-only** MCP server is available: when enabled, a running `praector daemon` hosts a local MCP listener so agents can drive the same durable control plane the CLI uses (see [`docs/OPERATIONS.md`](docs/OPERATIONS.md)). Durable human/exec escalation, stronger platform validation, distributed execution, full CLI-parity MCP tool coverage, and broader control-plane integrations are tracked in [`ROADMAP.md`](ROADMAP.md).
+An opt-in, **loopback-only** MCP server is available: when enabled, a running `praector daemon` hosts a local MCP listener exposing the **same command surface as the CLI** — read-only tools, pass-through queue writes, and readable resources, with privileged collection-finalizing tools (acceptance/PR/cleanup) behind a separate default-off opt-in (see [`docs/OPERATIONS.md`](docs/OPERATIONS.md)). Durable human/exec escalation, stronger platform validation, distributed execution, remote/ authenticated MCP access, and broader control-plane integrations are tracked in [`ROADMAP.md`](ROADMAP.md).
 
 ## Quick start
 

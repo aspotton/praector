@@ -160,20 +160,34 @@ const DefaultMCPAddr = "127.0.0.1:8765"
 // opt-in via ~/.praector/config.toml [mcp] or the PRAECTOR_MCP environment
 // override. Binding is always restricted to loopback (auth/identity deferred per
 // DEC-aacb7bfc23).
+//
+// Privileged is a SECOND, independent opt-in that gates the tools performing
+// privileged/collection-finalizing writes (acceptance, PR delivery, cleanup) on
+// top of an already-enabled listener. It is DEFAULT-OFF: a running MCP listener
+// exposes read-only parity and pass-through queue writes but not these tools
+// until the operator explicitly opts in, because they are the boundary the
+// acceptance/PR rules treat as operator-only (DEC-aacb7bfc23).
 type MCPServerConfig struct {
-	Enabled bool
-	Addr    string
+	Enabled    bool
+	Addr       string
+	Privileged bool
 }
 
 // LoadMCPServerConfig resolves the MCP listener settings from the global
 // config.toml [mcp] section (parsed by the same dependency-light parseMarkerTOML
 // used for project markers) with a PRAECTOR_MCP environment override. A missing
 // or unreadable config file yields the safe default: disabled on loopback.
+//
+// The privileged-write surface has a separate, default-off opt-in (`privileged`
+// in the [mcp] section, or the PRAECTOR_MCP_PRIVILEGED environment override) so
+// collection-finalizing tools are never exposed merely because the listener was
+// enabled.
 func LoadMCPServerConfig(g GlobalConfig) MCPServerConfig {
-	cfg := MCPServerConfig{Enabled: false, Addr: DefaultMCPAddr}
+	cfg := MCPServerConfig{Enabled: false, Addr: DefaultMCPAddr, Privileged: false}
 	if d, err := parseMarkerTOML(filepath.Join(g.Home, "config.toml")); err == nil {
 		if m := d["mcp"]; m != nil {
 			cfg.Enabled = boolOr(m["enabled"], false)
+			cfg.Privileged = boolOr(m["privileged"], false)
 			if a := strings.TrimSpace(m["addr"]); a != "" {
 				cfg.Addr = a
 			}
@@ -190,6 +204,19 @@ func LoadMCPServerConfig(g GlobalConfig) MCPServerConfig {
 		default:
 			cfg.Addr = v
 			cfg.Enabled = true
+		}
+	}
+	// PRAECTOR_MCP_PRIVILEGED is an independent opt-in for the privileged-write
+	// tools. A truthy value enables them (implying the listener is expected on);
+	// any other value leaves the file-derived setting untouched and never forces
+	// the privileged surface off once enabled, matching the safe-default posture.
+	if v := strings.TrimSpace(os.Getenv("PRAECTOR_MCP_PRIVILEGED")); v != "" {
+		switch strings.ToLower(v) {
+		case "1", "true", "on", "yes":
+			cfg.Privileged = true
+			cfg.Enabled = true
+		case "0", "false", "off", "no":
+			cfg.Privileged = false
 		}
 	}
 	return cfg

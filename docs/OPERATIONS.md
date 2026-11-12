@@ -205,7 +205,8 @@ Enable it in `~/.praector/config.toml`:
 ```toml
 [mcp]
 enabled = true
-addr = "127.0.0.1:8765"   # optional; loopback only
+addr = "127.0.0.1:8765"        # optional; loopback only
+privileged = false             # optional; expose collection-finalizing write tools (pr/accept/cleanup)
 ```
 
 or for a single invocation via the `PRAECTOR_MCP` environment override (a truthy
@@ -215,6 +216,7 @@ token toggles enablement; any other value is treated as an explicit loopback
 ```bash
 PRAECTOR_MCP=1 praector daemon
 PRAECTOR_MCP=127.0.0.1:9000 praector daemon
+PRAECTOR_MCP_PRIVILEGED=1 praector daemon   # also expose the privileged write tools
 ```
 
 The listener is decoupled from the reconcile loop and the scheduler lock. It
@@ -223,6 +225,24 @@ performs only durable Store reads and enqueue-only actions (for example
 daemon then executes); it never launches worker processes or runs a collection
 inline, and never bypasses dependency, planning, review, capability, or
 acceptance checks. A non-loopback address is refused at startup.
+
+The tool/resource surface is **commandHelp-driven**: every CLI command maps to
+exactly one MCP surface item, so the CLI and MCP surfaces cannot drift. Leaf
+commands appear as callable tools, and each command namespace plus the
+launch-only `daemon` command appear as readable resources. Read-only commands
+and pass-through queue writes (`task request`, `result submit`, `memory add`,
+`decision add`, `task add-dependency`/`supersede`, `coordinator attention`,
+`run`, `task retry`, `collection revise`) are always exposed, and each reuses
+the identical gated `Store`/workspace method as the CLI, so policy, planning,
+audit, cycle, and revision checks are never bypassed.
+
+Privileged collection-finalizing tools — `collection pr`, `collection accept`,
+and `collection cleanup` — are **default-off** behind the independent
+`privileged` opt-in. When disabled they are neither advertised nor callable, and
+even when enabled the `pr`/`accept` tools only run the durable acceptance/PR
+validation and return the resulting plan: they never push, merge, or otherwise
+implicitly accept. Direct acceptance and external PR delivery remain
+operator-side actions.
 
 ## Observe work
 
