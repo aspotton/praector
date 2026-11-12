@@ -206,6 +206,120 @@ func TestAcceptancePlanAndFastForward(t *testing.T) {
 	}
 }
 
+func twoBranchFixture(t *testing.T) (string, *GitWorkspace, Row, Row) {
+	t.Helper()
+	git, err := RequireBinary("git")
+	if err != nil {
+		t.Skip("git unavailable")
+	}
+	repo := t.TempDir()
+	if _, err = Run(context.Background(), []string{git, "init", "-b", "main", repo}, "", nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, repo, "config", "user.email", "praector@test")
+	gitTest(t, repo, "config", "user.name", "Praector Test")
+	if err = os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, repo, "add", ".")
+	gitTest(t, repo, "commit", "-m", "base")
+	gitTest(t, repo, "checkout", "-b", "praector/collections/col-derive")
+	if err = os.WriteFile(filepath.Join(repo, "cmd.go"), []byte("package main\n\nvar settingFlag = \"--derive-test-knob\"\nvar settingEnv = \"DERIVE_TEST_SETTING\"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, repo, "add", ".")
+	gitTest(t, repo, "commit", "-m", "candidate")
+	gitTest(t, repo, "checkout", "main")
+	return repo, &GitWorkspace{Cfg: GlobalConfig{Home: t.TempDir()}, Git: git},
+		Row{"id": "PRJ-derive", "root_path": repo, "base_branch": "main"},
+		Row{"id": "COL-derive", "integration_branch": "praector/collections/col-derive"}
+}
+
+func TestDeriveConfigCandidatesIsDeterministicAndFailsLoudly(t *testing.T) {
+	repo, w, project, collection := twoBranchFixture(t)
+	first, err := w.DeriveConfigCandidates(project, collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := w.DeriveConfigCandidates(project, collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) == 0 || JSONDumps(first) != JSONDumps(second) {
+		t.Fatalf("candidate derivation must yield an identical sorted list across invocations: %v vs %v", first, second)
+	}
+	tokens := map[string]bool{}
+	for _, candidate := range first {
+		tokens[candidate.Token] = true
+	}
+	if !tokens["--derive-test-knob"] || !tokens["DERIVE_TEST_SETTING"] {
+		t.Fatalf("added flag and env-var literals must be enumerated: %v", first)
+	}
+	// The three-dot basis must not count base-branch-side changes: an added
+	// token that exists only on main must never appear.
+	gitTest(t, repo, "checkout", "main")
+	if err = os.WriteFile(filepath.Join(repo, "mainonly.go"), []byte("package main\n\nvar flag = \"--base-side-only\"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, repo, "add", ".")
+	gitTest(t, repo, "commit", "-m", "base side change")
+	gitTest(t, repo, "checkout", "praector/collections/col-derive")
+	gitTest(t, repo, "checkout", "main")
+	after, err := w.DeriveConfigCandidates(project, collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range after {
+		if candidate.Token == "--base-side-only" {
+			t.Fatalf("a base-branch-only token must not be derived as introduced (two-dot drift): %v", after)
+		}
+	}
+	// A missing branch is an absent basis (no candidates, no error); a broken
+	// repository path must fail loudly rather than return an empty list.
+	missingBranch := Row{"id": "COL-missing", "integration_branch": "praector/collections/col-missing"}
+	none, err := w.DeriveConfigCandidates(project, missingBranch)
+	if err != nil || len(none) != 0 {
+		t.Fatalf("an absent integration branch must yield no candidates with no error: %v %v", none, err)
+	}
+	if _, err = w.ChangedPaths(filepath.Join(t.TempDir(), "not-a-repo"), "main", "main"); err == nil {
+		t.Fatal("ChangedPaths must fail loudly on a git error, never return an empty list silently")
+	}
+	broken := Row{"id": "PRJ-broken", "root_path": filepath.Join(t.TempDir(), "not-a-repo"), "base_branch": "main"}
+	quiet, err := w.DeriveConfigCandidates(broken, collection)
+	if err != nil || len(quiet) != 0 {
+		t.Fatalf("a non-repository root is an absent basis, not a git error: %v %v", quiet, err)
+	}
+}
+
+func TestChangedPathsUsesNameOnlyZDelimitedBasis(t *testing.T) {
+	repo, w, project, collection := twoBranchFixture(t)
+	weird := "spaced dir/with\"quote--knob.go"
+	gitTest(t, repo, "checkout", "praector/collections/col-derive")
+	if err := os.MkdirAll(filepath.Join(repo, "spaced dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "spaced dir", "with\"quote--knob.go"), []byte("package x\n\nvar flag = \"--space-derivable-knob\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, repo, "add", ".")
+	gitTest(t, repo, "commit", "-m", "weird path")
+	gitTest(t, repo, "checkout", "main")
+	_ = project
+	paths, err := w.ChangedPaths(repo, S(project, "base_branch"), S(collection, "integration_branch"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, path := range paths {
+		if path == weird {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("core.quotePath must not drop a quoted/spaced path from the -z listing: %v", paths)
+	}
+}
+
 func TestTaskGitCommitMessageUsesHumanSubjectAndPraectorTrailers(t *testing.T) {
 	task := Row{
 		"id":            "T-c5a2d04929",

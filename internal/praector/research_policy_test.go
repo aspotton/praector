@@ -9,7 +9,7 @@ import (
 // a passing review result must carry under the gate-traceability contract.
 func passingImpactEnumeration() Row {
 	return Row{"method": "literal-column grep set", "sites": []any{
-		Row{"site": "internal/praector/store.go", "disposition": "unaffected", "evidence": "grep for the mutated column shows no other writer"},
+		Row{"site": "internal/praector/store.go", "disposition": "unaffected", "evidence": "grep of internal/praector/store.go for the mutated column shows no other writer"},
 	}}
 }
 

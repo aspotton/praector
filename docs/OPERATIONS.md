@@ -549,27 +549,30 @@ For required-critic work, the first critic is sealed when the coordinator reache
 
 ## Gate traceability: reading a rejected submit and clearing a legacy exception
 
-Directive traceability and sibling-effect enumeration are enforced deterministically at three points: the reviewer's `praector result submit`, the claim-time planning barrier, and collection acceptance. No CLI command, flag, or output is involved.
+Directive traceability is enforced deterministically at three points: the reviewer's `praector result submit`, the claim-time planning barrier, and collection acceptance. Sibling-effect (impact) enumeration is enforced at exactly two points: the reviewer's `praector result submit` and collection acceptance — there is no claim-time impact-enumeration gate. No CLI command, flag, or output is involved.
 
 A rejected review/plan-review submit names exactly what is missing, deterministically:
 
 - `directive_dispositions did not disposition directive ids: T-…,T-…` — the result must add one disposition object per listed stable directive id (`<source-task-id>:<kind>:<ordinal>`), each with `disposition` (`satisfied`/`deferred`/`explicit_exception`) and concrete `evidence`. Rerun guidance: the reviewer simply resubmits with the dispositions; the ids come verbatim from the Envelope's `inherited_directives`.
 - `directive_dispositions <id> deferred requires a durable decision_id` — record the decision first (`praector decision add --statement ... --collection COL-...`) and resubmit citing it.
+- `directive_dispositions <id> is a MUST-level directive and cannot be deferred` — a directive whose level is MUST (structured `normative_level` or a leading `MUST:`/`MUST NOT:` prefix) must be resubmitted as `satisfied`, or as `explicit_exception` with a durable decision id; deferral is reserved for SHOULD-level and unlevelled directives.
+- `requires citable evidence (a file path, a test name, or a command)` — the disposition or impact-site evidence is generic prose ("verified in code", "n/a"). Cite something a human can open: a path such as `internal/praector/policy.go`, a test name such as `TestDirectiveTraceabilityRejectsMissingDispositionsThenAcceptsCompleteSet`, or a command such as `go test ./internal/praector/ -run TestDirective` / `make test-go`.
 - `references unknown directive ids (report genuinely new directives under additions, not dispositions)` — move the new directive into `additions` with a `reason`.
-- `passing review requires impact_enumeration …` / `impact_enumeration.sites[N] …` — the passing review must name its enumeration method and dispose every listed sibling-effect site with evidence; an introduced configuration knob with no `reader_paths` is reported as the blocking introduced-but-never-read defect.
+- `passing review requires impact_enumeration …` / `impact_enumeration.sites[N] …` — the passing review must name its enumeration method and dispose every listed sibling-effect site with citable evidence; an introduced configuration knob with no `reader_paths` is reported as the blocking introduced-but-never-read defect.
+- `impact_enumeration does not account for the derived configuration candidates …` — Praector derived candidate introduced knobs from the collection diff (`git diff base...integration` added lines: flag literals, environment-variable names, config/table keys, setting-like keys; git's own flags and well-known environment names are exempt). Account for each named candidate by listing it in some site's identifier/`reader_paths`, or add an `impact_enumeration.candidate_dispositions` entry: `not-introduced`, or `deliberately-unread` with a durable decision id. The self-reported `introduced_knob` flag cannot decline this rule; the derived list is heuristic and human-falsifiable, not a completeness proof. The candidate list is recomputed against the collection integration branch at each check, so a genuinely new knob appearing at acceptance is correctly required rather than treated as drift.
 - `oracle-exception review requires a non-empty probes list …` — the conformance-exception result must add probes with `scenario`, `command_or_test`, and `observed_outcome`.
 
 If a completed review's gap is only discovered later, Praector records a `DIRECTIVE_TRACEABILITY_GAP` event on that task (visible via `praector collection show` / events) instead of silently passing.
 
-Collections whose reviews completed before this contract have results without the new fields. New submissions are always strict, but the retroactive claim-time and acceptance gates honor one documented escape hatch so history is not rewritten or retroactively failed:
+Collections whose reviews completed before this contract have results without the new fields. New submissions are always strict, but the retroactive claim-time and acceptance gates honor one documented, scoped escape hatch so history is not rewritten or retroactively failed. An operator creates it with `praector decision add` against the specific collection — without `--task` (a worker session always records decisions task-scoped, and a task-scoped decision can never arm the escape) — and the statement must name the collection id:
 
 ```bash
 praector decision add --collection COL-... \
-  --statement "Legacy gate-traceability exception: <why this pre-contract history is accepted as-is>" \
+  --statement "Legacy gate-traceability exception: pre-contract review results accepted as-is for COL-... <why>" \
   --rationale "<evidence>"
 ```
 
-A durable decision whose statement begins with `Legacy gate-traceability exception:` clears the retroactive gates for that Collection; deleting or superseding it re-enables them. It has no effect on new submissions, and it should be recorded deliberately by the operator, not reflexively — the honest default is to let the reviewer resubmit with real dispositions.
+A marker decision exempts a collection only when it is collection-scoped to that collection (`collection_id` set — a project-wide decision or one scoped to a different collection does nothing), its statement names that collection id, and it carries no task scope. That trio is the deliberate operator-ownership rule: the decisions table has no actor column, so scope plus task-NULL is the schema-free discriminator, and the naming requirement means a scoped decision cannot blanket a whole project. It never waives derived-configuration-candidate accounting, and it has no effect on new submissions. A wrongly created marker is retired by superseding it — `praector decision add --collection COL-... --supersedes DEC-... --statement "Retire erroneous legacy exception for COL-..." ...` — which re-enables the gates immediately (superseded decisions are ignored everywhere). Deleting is not required and should be avoided; the retirement decision keeps the audit trail. The honest default remains letting the reviewer resubmit with real dispositions.
 
 ## Troubleshooting
 

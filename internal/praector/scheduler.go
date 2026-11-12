@@ -1171,7 +1171,7 @@ func (s *Scheduler) observeDirectiveTraceabilityGaps(collectionID string, consum
 		if e != nil {
 			return
 		}
-		if len(LegacyGateTraceabilityExceptionIDs(decisions)) > 0 {
+		if len(LegacyGateTraceabilityExceptionIDs(decisions, S(consumer, "collection_id"))) > 0 {
 			continue
 		}
 		_ = s.Store.Event(S(consumer, "project_id"), collectionID, S(consumer, "id"), "", "DIRECTIVE_TRACEABILITY_GAP", Row{"reason": gapErr.Error()})

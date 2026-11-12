@@ -1496,7 +1496,15 @@ func (s *Store) SetTaskWorkspace(tid string, wt, branch, base, head *string) err
 func (s *Store) SetTaskStatus(tid, status, msg string) error {
 	return s.Mutate("UPDATE tasks SET status="+SQLLiteral(status)+",updated_at="+SQLLiteral(UTCNow())+" WHERE id="+SQLLiteral(tid), msg)
 }
-func (s *Store) SubmitResult(tid string, result Row) (Row, error) {
+
+// SubmitResult records a worker result. derivedConfigCandidates is an
+// optional, seam-computed diff-derived configuration-knob candidate list
+// (base...collection integration branch) that a passing review's impact
+// enumeration must account for. Callers without Git workspace access pass
+// nothing and get exactly the historical behavior; the submit seam in the
+// service layer computes the list so no git access enters the Store or the
+// pure policy validators.
+func (s *Store) SubmitResult(tid string, result Row, derivedConfigCandidates ...DerivedConfigCandidate) (Row, error) {
 	before, err := s.GetTask(tid)
 	if err != nil {
 		return nil, err
@@ -1612,8 +1620,23 @@ func (s *Store) SubmitResult(tid string, result Row) (Row, error) {
 					}
 				}
 				if profile == "review" {
-					if e := ValidateReviewImpactEnumeration(result, nil); e != nil {
+					if e := ValidateReviewImpactEnumeration(result, nil, derivedConfigCandidates); e != nil {
 						return nil, e
+					}
+					if decisionIDs := CandidateDecisionIDs(result); len(decisionIDs) > 0 {
+						decisions, e := s.ListDecisions(S(before, "project_id"), S(before, "collection_id"))
+						if e != nil {
+							return nil, e
+						}
+						known := map[string]bool{}
+						for _, decision := range decisions {
+							known[S(decision, "id")] = true
+						}
+						for _, decisionID := range decisionIDs {
+							if !known[decisionID] {
+								return nil, fmt.Errorf("candidate disposition decision_id %s is not a durable decision in this Collection", decisionID)
+							}
+						}
 					}
 				}
 			}
@@ -1962,9 +1985,6 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 	if ok, e := s.directiveTraceabilityGateLocked(S(review, "id"), review, true); e != nil || !ok {
 		return ok, e
 	}
-	if ok, e := s.reviewImpactEnumerationGateLocked(review, task); e != nil || !ok {
-		return ok, e
-	}
 	edge, err := s.queryLocked("SELECT 1 AS ok FROM task_edges WHERE from_task_id=" + SQLLiteral(S(review, "id")) + " AND to_task_id=" + SQLLiteral(S(task, "id")) + " AND relation='depends_on' LIMIT 1")
 	if err != nil || len(edge) == 0 {
 		return false, err
@@ -2032,7 +2052,10 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 // (review or plan_review) must have dispositioned every inherited planning
 // directive. Consumer producers (critic) are not gated on their own output.
 // Pre-existing history that predates the validator is exempted only through
-// the documented single-decision legacy exception, never silently.
+// the documented, collection-scoped single-decision legacy exception, never
+// silently. This is the LIVE claim-time seam; impact enumeration by contrast
+// is enforced only at submit and acceptance, so there is deliberately no
+// claim-time impact-enumeration gate here.
 func (s *Store) directiveTraceabilityGateLocked(ancestorID string, consumer Row, requirePass bool) (bool, error) {
 	if S(consumer, "status") != TaskComplete {
 		return true, nil
@@ -2056,36 +2079,11 @@ func (s *Store) directiveTraceabilityGateLocked(ancestorID string, consumer Row,
 	if err != nil {
 		return false, err
 	}
-	return len(LegacyGateTraceabilityExceptionIDs(decisions)) > 0, nil
+	return len(LegacyGateTraceabilityExceptionIDs(decisions, S(consumer, "collection_id"))) > 0, nil
 }
 
-// reviewImpactEnumerationGateLocked retroactively enforces the durable
-// impact_enumeration artifact only where it can name a concrete defect class:
-// a passing review whose enumeration (or its absence) leaves an introduced
-// configuration knob unreadable. New submissions are always validated strictly
-// at SubmitResult; legacy review results may only be waived through the
-// documented single-decision exception.
-func (s *Store) reviewImpactEnumerationGateLocked(review, task Row) (bool, error) {
-	if S(review, "profile") != "review" || S(review, "status") != TaskComplete {
-		return true, nil
-	}
-	result := M(review, "result")
-	if len(result) == 0 {
-		result = JSONMap(S(review, "result_json"))
-	}
-	if strings.ToLower(strings.TrimSpace(S(result, "verdict"))) != "pass" {
-		return true, nil
-	}
-	if ValidateReviewImpactEnumeration(result, nil) == nil {
-		return true, nil
-	}
-	decisions, err := s.decisionsLocked(S(review, "project_id"), S(review, "collection_id"))
-	if err != nil {
-		return false, err
-	}
-	return len(LegacyGateTraceabilityExceptionIDs(decisions)) > 0, nil
-}
-
+// decisionsLocked returns durable decisions scoped to the project or the
+// given collection that have not been retired via superseded_by.
 func (s *Store) decisionsLocked(projectID, collectionID string) (Rows, error) {
 	return s.queryLocked("SELECT * FROM decisions WHERE (project_id=" + SQLLiteral(projectID) + " AND (collection_id IS NULL OR collection_id=" + SQLLiteral(collectionID) + ")) AND superseded_by IS NULL ORDER BY created_at")
 }
