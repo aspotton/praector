@@ -283,7 +283,7 @@ func TestTerminalStateBlocksWhenRequiredCriticSealIsStale(t *testing.T) {
 	if err = s.AddEdge(S(impl, "id"), S(review, "id"), S(c, "id"), "verifies"); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = s.SubmitResult(S(review, "id"), Row{"status": "complete", "summary": "pass", "verdict": "pass"})
+	_, _ = s.SubmitResult(S(review, "id"), Row{"status": "complete", "summary": "pass", "verdict": "pass", "impact_enumeration": passingImpactEnumeration()})
 	if err = s.SetTaskStatus(S(review, "id"), TaskComplete, "review pass"); err != nil {
 		t.Fatal(err)
 	}
@@ -491,7 +491,7 @@ func TestV021CriticSealRemainsCompatibleAfterResearchDigestUpgrade(t *testing.T)
 	if err = s.AddEdge(S(impl, "id"), S(review, "id"), S(c, "id"), "verifies"); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = s.SubmitResult(S(review, "id"), Row{"status": "complete", "summary": "pass", "verdict": "pass"})
+	_, _ = s.SubmitResult(S(review, "id"), Row{"status": "complete", "summary": "pass", "verdict": "pass", "impact_enumeration": passingImpactEnumeration()})
 	if err = s.SetTaskStatus(S(review, "id"), TaskComplete, "review complete"); err != nil {
 		t.Fatal(err)
 	}

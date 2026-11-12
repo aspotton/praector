@@ -117,6 +117,7 @@ When changing a subsystem, update the corresponding docs in the same change:
 | Runtime global/profile prompt semantics | `internal/assets/prompts/global.md`, `docs/PROFILES.md`, `docs/AGENT_PROTOCOL.md`, possibly `docs/ARCHITECTURE.md` |
 | Deterministic planning-gate policy | `docs/PROFILES.md`, `docs/AGENT_PROTOCOL.md`, `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md` |
 | Task Envelope/delegation/result schema | `docs/AGENT_PROTOCOL.md`, possibly `docs/ARCHITECTURE.md` |
+| Gate-traceability validators, inherited directives, impact enumeration, oracle probes | `docs/AGENT_PROTOCOL.md`, `docs/ARCHITECTURE.md`, `docs/PROFILES.md`, `docs/OPERATIONS.md` (legacy-exception clearing), plus the affected `src/praector/prompts/*.md` via `make sync-assets` |
 | Git branch/worktree/integration/PR/acceptance | `docs/WORKSPACES.md`, `docs/ARCHITECTURE.md` |
 | Schema/state transitions/events/recovery | `docs/STATE_AND_RECOVERY.md`, `docs/ARCHITECTURE.md` |
 | Install/config/operator workflow | `README.md`, `docs/OPERATIONS.md` |

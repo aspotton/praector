@@ -869,6 +869,33 @@ func validateCollectionForAcceptance(store *Store, c Row) (Row, Rows, error) {
 			verifies[S(ed, "from_task_id")] = append(verifies[S(ed, "from_task_id")], S(ed, "to_task_id"))
 		}
 	}
+	legacyDecisions, e := store.ListDecisions(S(c, "project_id"), S(c, "id"))
+	if e != nil {
+		return nil, nil, e
+	}
+	legacyIDs := LegacyGateTraceabilityExceptionIDs(legacyDecisions)
+	for _, t := range tasks {
+		if S(t, "profile") != "review" && S(t, "profile") != "plan_review" {
+			continue
+		}
+		if S(t, "status") != TaskComplete || strings.ToLower(strings.TrimSpace(S(M(t, "result"), "verdict"))) != "pass" {
+			continue
+		}
+		if ancestors, e := store.DirectiveAncestors(S(t, "id")); e == nil {
+			if directives := InheritedDirectives(ancestors); len(directives) > 0 {
+				if e := ValidateDirectiveTraceability(M(t, "result"), directives, true, legacyIDs); e != nil {
+					return nil, nil, fmt.Errorf("Collection %s cannot be accepted: %w", S(c, "id"), e)
+				}
+			}
+		} else {
+			return nil, nil, e
+		}
+		if S(t, "profile") == "review" {
+			if e := ValidateReviewImpactEnumeration(M(t, "result"), legacyIDs); e != nil {
+				return nil, nil, fmt.Errorf("Collection %s cannot be accepted: %w", S(c, "id"), e)
+			}
+		}
+	}
 	for _, t := range tasks {
 		if S(t, "profile") != "implement" || S(t, "status") != TaskComplete {
 			continue

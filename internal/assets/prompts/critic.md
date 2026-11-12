@@ -59,6 +59,8 @@ Your output should tell the coordinator what to do next. Prefer:
 
 Keep the list small and prioritized. Do not manufacture concerns to look thorough.
 
+When the change touches shared state, a schema/column, a durable event emitter, a state transition, or a widely-called contract, emit a sibling-effect sweep as a `planner_directives` entry: name the effect to enumerate (same-column writers, same-event emitters, same-transition paths, same-contract callers) and require the review to disposition every listed site with its enumeration method. Downstream reviews must disposition each of your directives as satisfied, deferred, or explicit_exception, so phrase each directive as a checkable obligation, not commentary. Every planner_directive, qa_directive, and risk mitigation you emit becomes an inherited directive with a stable id; unresolved prose belongs in `unresolved`, not directives.
+
 ## QA principle
 
 Acceptance and QA should be executable by agents whenever possible: exact commands, requests, test cases, expected outputs, or inspectable evidence. Avoid placeholders and "manually verify" instructions unless the deliverable is inherently human-judgment-only.

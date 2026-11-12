@@ -414,9 +414,18 @@ COMPLETE
 
 A review Task cannot count as complete review evidence unless its structured result contains an explicit `verdict: pass` or `verdict: fail`.
 
-Exiting a reviewer session without that structured verdict is a protocol failure, not a substantive fail verdict. Praector retries the same durable review Task first. A genuine `verdict=fail` is different: the failed review becomes terminal historical evidence, the repair implementation depends on it, and successful repair integration creates a **new durable review Task with a fresh context**. That fresh reviewer independently re-evaluates the repaired integrated candidate and verifies both the repair implementation and the original implementation it corrected. Collection terminal reconciliation therefore requires every completed implementation lineage to end in a completed passing verifier before the Collection may become `COMPLETE`.
+Exiting a reviewer session without that structured verdict is a protocol failure, not a substantive fail verdict. Praector retries the same durable review Task first. A genuine `verdict=fail` is different: the failed review becomes terminal historical evidence, the repair implementation depends on it, and successful repair integration creates a **new durable review Task with a fresh context**. That fresh reviewer independently re-evaluates the repaired integrated candidate and verifies both the repair implementation and the original implementation it corrected. The failed review is also a hard dependency of the fresh review, so its findings/evidence are carried in the new context rather than forgotten; the fresh reviewer re-checks or refutes each carried finding, and the prior verdict itself is not authoritative. Collection terminal reconciliation therefore requires every completed implementation lineage to end in a completed passing verifier before the Collection may become `COMPLETE`.
 
 Historical failed reviews remain visible for provenance; they do not permanently poison acceptance once a fresh post-repair review proves the corrected lineage. Protocol-broken reviewer replacements still use same-role supersession and preserve prerequisite/verification lineage.
+
+## Gate traceability
+
+The model-driven gates verify conformance to the contract they were handed; the gate-traceability layer additionally verifies that what that contract already told them to check was actually checked. It adds no table and no schema migration.
+
+- Completed critic/plan-review/advise results are harvested along `depends_on` lineage (`Store.DirectiveAncestors`, mirroring `Store.ResearchAncestors`) into uniformly-identified inherited directives (`<source-task-id>:<kind>:<ordinal>`), and the same harvest feeds the Envelope projection `inherited_directives`.
+- Passing reviews and plan reviews must disposition every inherited directive (`satisfied`/`deferred`/`explicit_exception`, the latter two requiring a durable decision id) and must carry the durable `impact_enumeration` sibling-effect sweep with per-site dispositions and a named enumeration method. Both are deterministic validators (`ValidateDirectiveTraceability`, `ValidateReviewImpactEnumeration`) wired at the existing research-consistency seams — submit, claim-time planning barrier, and acceptance — so the mechanisms cannot drift. The enumeration is auditable and falsifiable by a human, never a completeness proof.
+- An oracle exception in an external-conformance review must name the concrete `probes` (scenario, command/test, observed outcome) that replace the missing authoritative oracle.
+- A `DIRECTIVE_TRACEABILITY_GAP` event is recorded when a completed consumer's dispositions are missing; enforcement itself lives at the submit/claim/acceptance gates, and pre-existing history is exempted only through the documented single-decision legacy exception.
 
 ## Workspace and integration boundary
 

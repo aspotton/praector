@@ -471,6 +471,16 @@ Deterministic planning-gate classification lives in `internal/praector/policy.go
 
 A requested task is not scheduler-visible until its initial graph contract is durable. Praector writes the task row, initial `depends_on` edges, `spawned_by` edge, blocking child-to-parent edge, and parent `WAITING` transition under one state lock and semantic commit. This prevents a concurrent scheduler from claiming a task in the gap between task creation and dependency attachment. Coordinator-requested `plan_review` is always a blocking handoff and automatically carries the latest non-superseded critic as a dependency when one exists.
 
+### Gate-traceability changes
+
+Directive traceability and impact enumeration intentionally reuse the research-consistency plumbing rather than adding a parallel mechanism:
+
+- ancestor traversal uses the same unlocked/locked pair convention as research (`DirectiveAncestors`/`directiveAncestorsLocked`); pick the variant each seam already uses, because the unlocked variant recursively takes the store lock and deadlocks under an already-held lock;
+- validators are pure functions in `policy.go` shaped like `ValidateResearchConsumerResult` with identical `requirePass` (pass-only) semantics, wired at the same seams: `SubmitResult`, the claim-time planning barrier, and acceptance; a scheduler-side observation only records `DIRECTIVE_TRACEABILITY_GAP` events and never rewrites history;
+- directive ids derive purely from persisted `result_json` order (`<task>:<kind>:<ordinal>`) so revalidation/reconciliation re-match prior dispositions; never hash model-facing text or collide with the research `<task>:<claim>` reference form;
+- retroactive enforcement at the read/acceptance seams honors the single-decision escape hatch (`LegacyGateTraceabilityMarker`); submission is always strict;
+- prompt text for the result fields is authored only in `src/praector/prompts/` and synced with `make sync-assets`.
+
 
 ### Planning-race regression tests
 

@@ -81,6 +81,16 @@ Continue hardening this layer through real dogfood runs:
 
 The design goal is traceable reasoning rather than more ceremony: authoritative evidence should be able to flow into durable claims, planner directives, implementation contracts, and independent verification without silently changing meaning along the way.
 
+### Deferred from the gate-traceability change
+
+The directive-traceability / sibling-effect / review-carry-over / oracle-probe change deliberately stopped short of the following; each was designed to stay possible without a rearchitecture:
+
+- per-collection measurement gates: code-coverage thresholds, `-race` in a Collection gate, goroutine-leak detection, and mutation testing — these need target-project build integration and a new external dependency;
+- a machine-proof of sibling-effect enumeration completeness (the current `impact_enumeration` is deliberately human-auditable/falsifiable, not provable) and coverage instrumentation behind it;
+- a dedicated directives/claims durable table or ledger; directives and claims intentionally stay inside `task.result_json` and could be lifted into a table only if result-JSON harvesting stops scaling;
+- any new CLI command/flag/output or MCP read surface for the traceability ledger — the existing gates were wired so `commandHelp`→`serviceOps`→`mcpSurface` parity stays untouched;
+- richer operator tooling around the `Legacy gate-traceability exception` decision (e.g. a first-class waiver command instead of `praector decision add`).
+
 ## 4. MCP interface
 
 MCP is a first-class Praector interface for coding agents and human-facing agents. It must expose the same durable **domain operations** as the CLI rather than invoking CLI subprocesses or maintaining a second orchestration implementation. The normal user experience should be that a human talks to an MCP-capable agent, and that agent can inspect and operate Praector with the same authority/policy boundaries as an equivalent CLI caller.
