@@ -407,6 +407,8 @@ praector events T-... --type TASK_FAILED
 
 Rows are returned oldest-first by `created_at` then `id`. Each page prints a `next_cursor`; pass it back unchanged as `--since` for the next page (an exclusive composite cursor, so paging never repeats or skips a row). A project-scoped read (`praector events --project PRJ-...`) is always bounded by `--limit`. See [CLI](CLI.md#events) and [State and Recovery](STATE_AND_RECOVERY.md#events).
 
+A scope id you supply must name something that exists: `praector events` exits `1` with the same `collection/task/project not found` message the other read commands print, so a mistyped id in a `--since` paging loop is an error rather than a page that looks empty because the target was wrong. A `--project`/`--collection` pair where the collection is not owned by that project is rejected the same way. An existing scope with no matching events is still an empty, successful page with no `next_cursor`, which is the only output that legitimately means "nothing happened yet".
+
 ## Understand `BLOCKED`
 
 A Collection becomes `BLOCKED` when incomplete work remains but no Task is currently executing or runnable and no durable harness Session for the Collection is still running. A parent Task may briefly be `WAITING` while its OpenCode Session finishes; that state remains `RUNNING`, not `BLOCKED`.
