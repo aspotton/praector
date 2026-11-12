@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from praector.config import Limits, ProjectConfig, read_project_marker, write_project_marker
+from praector.config import Limits, ProjectCapabilities, ProjectConfig, project_config_from_row, read_project_marker, write_project_marker
 
 
 def test_project_marker_round_trip(tmp_path):
@@ -51,3 +51,18 @@ def test_find_project_marker_uses_praector_namespace(tmp_path):
     marker = marker_dir / "project.toml"
     marker.write_text("version = 1\n", encoding="utf-8")
     assert find_project_marker(nested) == marker
+
+
+def test_project_research_capability_round_trip_and_legacy_default(tmp_path):
+    cfg = ProjectConfig(
+        project_id="PRJ-cap", name="cap", root=tmp_path, base_branch="main",
+        capabilities=ProjectCapabilities(current_external_research=False),
+    )
+    marker = write_project_marker(cfg)
+    loaded = read_project_marker(marker)
+    assert loaded.capabilities.current_external_research is False
+
+    legacy = project_config_from_row({
+        "id": "PRJ-old", "name": "old", "root_path": str(tmp_path), "base_branch": "main", "config_json": "{}",
+    })
+    assert legacy.capabilities.current_external_research is True

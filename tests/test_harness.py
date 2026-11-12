@@ -1,11 +1,12 @@
 from pathlib import Path
+import subprocess
 from praector.harness.opencode import OpenCodeHarness
 
 
 def test_permissions_disable_native_subagents(monkeypatch):
     monkeypatch.setattr("praector.harness.opencode.require_binary", lambda x: x)
     h = OpenCodeHarness("opencode")
-    for profile in ("coordinator", "critic", "plan_review", "research", "review", "advise"):
+    for profile in ("coordinator", "explore", "critic", "plan_review", "research", "review", "advise"):
         cfg = h._inline_config(profile)
         assert cfg["permission"]["task"] == "deny"
         assert cfg["permission"]["edit"] == "deny"
@@ -23,7 +24,8 @@ def test_opencode_invocation_uses_current_cli_and_pure_mode(monkeypatch, tmp_pat
         pid = 12345
         returncode = 0
 
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
+            captured["stdin_prompt"] = input
             return ('{"type":"text","text":"done"}\n', '')
 
     def fake_popen(args, **kwargs):
@@ -47,8 +49,48 @@ def test_opencode_invocation_uses_current_cli_and_pure_mode(monkeypatch, tmp_pat
     assert "--standalone" not in captured["args"]
     assert "--pure" in captured["args"]
     assert captured["args"][:2] == ["opencode", "run"]
-    assert captured["args"][-1] == "do work"
+    assert "do work" not in captured["args"]
+    assert captured["kwargs"]["stdin"] is subprocess.PIPE
+    assert captured["stdin_prompt"] == "do work"
     assert captured["kwargs"]["env"]["PWD"] == str(tmp_path)
+
+
+def test_large_prompt_is_streamed_via_stdin_not_argv(monkeypatch, tmp_path):
+    monkeypatch.setattr("praector.harness.opencode.require_binary", lambda x: x)
+    captured = {}
+
+    class FakeProc:
+        pid = 12345
+        returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            captured["input"] = input
+            return ('{"type":"text","text":"done"}\n', '')
+
+    def fake_popen(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr("praector.harness.opencode.subprocess.Popen", fake_popen)
+    prompt = "evidence:" + ("x" * 512_000)
+    h = OpenCodeHarness("opencode")
+    h.run_task(
+        prompt=prompt,
+        workdir=tmp_path,
+        profile="critic",
+        model=None,
+        env={"PRAECTOR_TASK_ID": "T-large"},
+        log_path=tmp_path / "run.log",
+        timeout_seconds=30,
+    )
+
+    assert prompt not in captured["args"]
+    assert captured["kwargs"]["stdin"] is subprocess.PIPE
+    assert captured["input"] == prompt
+    log = (tmp_path / "run.log").read_text(encoding="utf-8")
+    assert "prompt_transport=stdin" in log
+    assert f"prompt_bytes={len(prompt.encode('utf-8'))}" in log
 
 
 def test_opencode_worker_env_sanitizes_parent_virtualenv_by_default(monkeypatch, tmp_path):
@@ -66,7 +108,7 @@ def test_opencode_worker_env_sanitizes_parent_virtualenv_by_default(monkeypatch,
         pid = 12345
         returncode = 0
 
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
             return ('{"type":"text","text":"done"}\n', '')
 
     def fake_popen(args, **kwargs):
@@ -108,7 +150,7 @@ def test_opencode_worker_env_can_opt_out_of_parent_virtualenv_sanitization(monke
         pid = 12345
         returncode = 0
 
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
             return ('{"type":"text","text":"done"}\n', '')
 
     def fake_popen(args, **kwargs):
@@ -145,7 +187,7 @@ def test_explicit_task_virtualenv_can_override_cleaned_parent(monkeypatch, tmp_p
         pid = 12345
         returncode = 0
 
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
             return ('{"type":"text","text":"done"}\n', '')
 
     def fake_popen(args, **kwargs):
@@ -190,7 +232,7 @@ def test_sanitized_worker_keeps_praector_control_plane_via_dedicated_shim(monkey
         pid = 12345
         returncode = 0
 
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
             return ('{"type":"text","text":"done"}\n', '')
 
     def fake_popen(args, **kwargs):

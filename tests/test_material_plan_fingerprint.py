@@ -1,4 +1,4 @@
-from praector.planning_policy import material_plan_fingerprint
+from praector.planning_policy import material_plan_fingerprint, material_plan_fingerprint_v021
 
 
 def _tasks():
@@ -67,3 +67,20 @@ def test_material_plan_fingerprint_keeps_inherited_checkpoint_material():
     base = material_plan_fingerprint("Add auth", tasks, [])
     tasks[0]["base_commit"] = "def"
     assert material_plan_fingerprint("Add auth", tasks, []) != base
+
+
+def test_v021_fingerprint_compatibility_ignores_new_research_result_digest():
+    tasks = _tasks()
+    tasks.append({
+        "id": "T-R", "profile": "research", "title": "Current spec",
+        "objective": "Research current protocol", "reason": "external evidence", "status": "COMPLETE",
+        "workspace_mode": "collection", "base_commit": "",
+        "result": {"status": "complete", "summary": "fresh result", "evidence": ["official spec"]},
+    })
+    current = material_plan_fingerprint("Add auth", tasks, [])
+    v021 = material_plan_fingerprint_v021("Add auth", tasks, [])
+    assert current != v021
+
+    tasks[2]["result"] = {"status": "complete", "summary": "changed fresh result", "evidence": ["new official spec"]}
+    assert material_plan_fingerprint("Add auth", tasks, []) != current
+    assert material_plan_fingerprint_v021("Add auth", tasks, []) == v021

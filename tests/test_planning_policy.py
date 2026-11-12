@@ -2,7 +2,11 @@ from pathlib import Path
 
 from praector.config import GlobalConfig
 from praector.models import TaskStatus
-from praector.planning_policy import classify_planning_policy
+from praector.planning_policy import (
+    classify_planning_policy, material_plan_fingerprint, validate_deterministic_research_result,
+    validate_external_conformance_review_result, validate_research_consumer_result,
+    research_claim_ids, research_claim_constraints, research_exception_decision_ids,
+)
 from praector.scheduler import Scheduler
 
 
@@ -51,6 +55,16 @@ class FakePolicyStore:
         assert collection_id == "COL-1"
         return dict(self.collection)
 
+    def get_project(self, project_id):
+        assert project_id == "PRJ-1"
+        return {
+            "id": "PRJ-1",
+            "name": "fake",
+            "root_path": ".",
+            "base_branch": "main",
+            "config": {"capabilities": {"current_external_research": True}},
+        }
+
     def list_tasks(self, collection_id):
         assert collection_id == "COL-1"
         return [dict(task) for task in self.tasks]
@@ -65,6 +79,8 @@ class FakePolicyStore:
             "title": kwargs["title"],
             "objective": kwargs["objective"],
             "reason": kwargs.get("reason", ""),
+            "requested_by_task_id": kwargs.get("requested_by_task_id"),
+            "parent_task_id": kwargs.get("parent_task_id"),
             "status": TaskStatus.READY.value,
             "depth": kwargs.get("depth", 0),
             "created_at": f"2026-11-10 10:02:0{self.counter}",
@@ -73,6 +89,13 @@ class FakePolicyStore:
         self.tasks.append(task)
         for dep in kwargs.get("depends_on") or []:
             self.add_edge(dep, task["id"], task["collection_id"], "depends_on")
+        if kwargs.get("spawned_by_task_id"):
+            self.add_edge(kwargs["spawned_by_task_id"], task["id"], task["collection_id"], "spawned_by")
+        if kwargs.get("blocking_caller_task_id"):
+            self.add_edge(task["id"], kwargs["blocking_caller_task_id"], task["collection_id"], "depends_on")
+            for existing in self.tasks:
+                if existing["id"] == kwargs["blocking_caller_task_id"]:
+                    existing["status"] = TaskStatus.WAITING.value
         critic_id = kwargs.get("critic_baseline_task_id")
         if critic_id is not None and critic_id not in self.baselines:
             self.record_critic_plan_baseline(
@@ -106,6 +129,21 @@ class FakePolicyStore:
             if edge["to_task_id"] == task_id and edge["relation"] == "depends_on"
         ]
         return [dict(task) for task in self.tasks if task["id"] in dep_ids]
+
+    def research_ancestors(self, task_id):
+        seen = {task_id}
+        queue = [task_id]
+        found = {}
+        while queue:
+            current = queue.pop(0)
+            for dep in self.dependencies(current):
+                dep_id = dep["id"]
+                if dep.get("profile") == "research" and dep.get("status") == TaskStatus.COMPLETE.value:
+                    found[dep_id] = dict(dep)
+                if dep_id not in seen:
+                    seen.add(dep_id)
+                    queue.append(dep_id)
+        return sorted(found.values(), key=lambda task: (task.get("created_at", ""), task["id"]))
 
     def add_dependency(self, task_id, dependency_id):
         self.add_edge(dependency_id, task_id, "COL-1", "depends_on")
@@ -194,44 +232,67 @@ def test_security_and_stateful_objective_requires_critic_and_plan_review():
     policy = classify_planning_policy(
         "Add API-key authentication and per-key rate limiting to the public API endpoint."
     )
+    assert policy.explore_required is True
     assert policy.critic_required is True
     assert policy.plan_review_required is True
     assert "security" in policy.categories
     assert "stateful_behavior" in policy.categories
 
 
-def test_simple_bounded_change_does_not_force_extra_planning_gates():
+def test_trivial_implementation_still_gets_explore_and_critic_but_skips_plan_review():
     policy = classify_planning_policy("Fix a typo in README.md and update one example sentence.")
-    assert policy.critic_required is False
+    assert policy.explore_required is True
+    assert policy.critic_required is True
     assert policy.plan_review_required is False
 
 
-def test_scheduler_inserts_critic_and_plan_review_before_write(tmp_path: Path):
+def test_scheduler_injects_explore_then_critic_before_coordinator_and_plan_review(tmp_path: Path):
     store = FakePolicyStore(
         "Add API-key authentication and per-key rate limiting to the existing /hello endpoint."
     )
+    for task in store.tasks:
+        if task["id"] == "T-COORD":
+            task["status"] = TaskStatus.READY.value
     scheduler = Scheduler(store, GlobalConfig(home=tmp_path), max_workers=1)
 
     changed = scheduler._enforce_planning_policy("COL-1")
     assert changed is True
 
+    explores = [task for task in store.tasks if task["profile"] == "explore"]
     critics = [task for task in store.tasks if task["profile"] == "critic"]
     plan_reviews = [task for task in store.tasks if task["profile"] == "plan_review"]
+    assert len(explores) == 1
     assert len(critics) == 1
-    assert len(plan_reviews) == 1
+    assert len(plan_reviews) == 0
 
+    explore = explores[0]
     critic = critics[0]
+    coord = next(task for task in store.tasks if task["id"] == "T-COORD")
+    assert coord["status"] == TaskStatus.WAITING.value
+    critic_deps = {task["id"] for task in store.dependencies(critic["id"])}
+    coord_deps = {task["id"] for task in store.dependencies(coord["id"])}
+    assert explore["id"] in critic_deps
+    assert explore["id"] in coord_deps
+    assert critic["id"] in coord_deps
+
+    # Once preflight and coordination complete, policy installs the final plan review.
+    store.set_task_status(explore["id"], TaskStatus.COMPLETE.value)
+    store.set_task_status(critic["id"], TaskStatus.COMPLETE.value)
+    store.set_task_status(coord["id"], TaskStatus.COMPLETE.value)
+    changed = scheduler._enforce_planning_policy("COL-1")
+    assert changed is True
+    plan_reviews = [task for task in store.tasks if task["profile"] == "plan_review"]
+    assert len(plan_reviews) == 1
     plan_review = plan_reviews[0]
     plan_deps = {task["id"] for task in store.dependencies(plan_review["id"])}
     impl_deps = {task["id"] for task in store.dependencies("T-IMPL")}
-
     assert critic["id"] in plan_deps
     assert plan_review["id"] in impl_deps
     assert any(event[0] == "PLANNING_POLICY_ENFORCED" for event in store.events)
 
-    # Reconciliation is idempotent: don't manufacture another gate set.
     changed_again = scheduler._enforce_planning_policy("COL-1")
     assert changed_again is False
+    assert len([task for task in store.tasks if task["profile"] == "explore"]) == 1
     assert len([task for task in store.tasks if task["profile"] == "critic"]) == 1
     assert len([task for task in store.tasks if task["profile"] == "plan_review"]) == 1
 
@@ -776,11 +837,12 @@ def test_conversational_research_does_not_become_write_delivery():
     planning = classify_planning_policy(objective)
 
     assert delivery.implementation_required is False
+    assert planning.explore_required is False
     assert planning.plan_review_required is False
     assert planning.critic_required is False
 
 
-def test_conversational_nontrivial_code_change_requires_plan_review_without_forcing_critic():
+def test_conversational_nontrivial_code_change_requires_explore_critic_and_plan_review():
     from praector.planning_policy import classify_delivery_policy
 
     objective = "The CSV parser is intentionally small. I'd like to add support for escaped commas while preserving existing parsing behavior."
@@ -788,8 +850,9 @@ def test_conversational_nontrivial_code_change_requires_plan_review_without_forc
     planning = classify_planning_policy(objective)
 
     assert delivery.implementation_required is True
+    assert planning.explore_required is True
     assert planning.plan_review_required is True
-    assert planning.critic_required is False
+    assert planning.critic_required is True
     assert "implementation_change" in planning.categories
 
 
@@ -1028,3 +1091,501 @@ def test_waiting_coordinator_is_never_added_as_final_plan_review_prerequisite(tm
     assert "T-APPLY-NEW" in deps
     assert store.dependency_path("T-PLAN", "T-APPLY-OLD") is not None
     assert store.dependency_path("T-APPLY-OLD", "T-PLAN") is None
+
+
+def test_revision_generation_gets_fresh_explore_and_critic(tmp_path: Path):
+    store = FakePolicyStore(
+        "Add API-key authentication and per-key rate limiting to the existing /hello endpoint."
+    )
+    # Prior generation already completed its deterministic preflight.
+    store.tasks.extend([
+        {
+            "id": "T-OLD-EXPLORE", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "explore", "title": "Explore current implementation surface",
+            "objective": "Map repo", "reason": "policy", "status": TaskStatus.COMPLETE.value,
+            "depth": 1, "requested_by_task_id": "T-COORD", "parent_task_id": "T-COORD",
+            "created_at": "2026-11-10 10:00:10", "updated_at": "2026-11-10 10:00:20",
+        },
+        {
+            "id": "T-OLD-CRITIC", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "critic", "title": "Preflight implementation plan",
+            "objective": "Critique", "reason": "policy", "status": TaskStatus.COMPLETE.value,
+            "depth": 1, "requested_by_task_id": "T-COORD", "parent_task_id": "T-COORD",
+            "created_at": "2026-11-10 10:00:21", "updated_at": "2026-11-10 10:00:30",
+        },
+        {
+            "id": "T-REV", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "coordinator", "title": "Acceptance revision",
+            "objective": "Revise accepted work", "reason": "operator revision",
+            "status": TaskStatus.READY.value, "depth": 0,
+            "created_at": "2026-11-10 11:00:00", "updated_at": "2026-11-10 11:00:00",
+        },
+    ])
+    scheduler = Scheduler(store, GlobalConfig(home=tmp_path), max_workers=1)
+
+    assert scheduler._enforce_planning_policy("COL-1") is True
+
+    revision_explores = [
+        task for task in store.tasks
+        if task["profile"] == "explore" and task.get("requested_by_task_id") == "T-REV"
+    ]
+    revision_critics = [
+        task for task in store.tasks
+        if task["profile"] == "critic" and task.get("requested_by_task_id") == "T-REV"
+    ]
+    assert len(revision_explores) == 1
+    assert len(revision_critics) == 1
+    assert revision_explores[0]["id"] != "T-OLD-EXPLORE"
+    assert revision_critics[0]["id"] != "T-OLD-CRITIC"
+    critic_deps = {task["id"] for task in store.dependencies(revision_critics[0]["id"])}
+    assert revision_explores[0]["id"] in critic_deps
+    revision_deps = {task["id"] for task in store.dependencies("T-REV")}
+    assert revision_explores[0]["id"] in revision_deps
+    assert revision_critics[0]["id"] in revision_deps
+
+
+def _valid_fresh_research_result():
+    return {
+        "status": "complete",
+        "summary": "current external contract verified",
+        "as_of": "2026-11-12",
+        "sources": [{"id": "spec", "authority": "official", "authority_level": "official_specification", "reference": "https://example.test/spec", "version": "current"}],
+        "claims": [{
+            "id": "claim-x",
+            "claim": "The current specification requires behavior X.",
+            "source": "spec",
+            "authority": "official specification",
+            "normative_level": "MUST",
+            "planner_directive": "Implementation MUST preserve behavior X.",
+            "directive_effect": "preserve",
+            "confidence": "high",
+        }],
+        "verification_oracles": [{"kind": "official_reference_oracle", "name": "official SDK"}],
+        "risks": [],
+        "unresolved": [],
+    }
+
+
+def _research_consistency_for(tasks):
+    constraints = research_claim_constraints(tasks)
+    return {
+        "verdict": "pass",
+        "checked_claim_ids": [item["claim_ref"] for item in constraints],
+        "claims": [
+            {
+                "claim_id": item["claim_ref"],
+                "disposition": "preserved",
+                "inherited_directive": item["planner_directive"],
+                "derived_directives": [],
+            }
+            for item in constraints
+        ],
+        "contradictions": [],
+    }
+
+
+def test_v022_external_protocol_policy_requires_fresh_research_and_conformance():
+    policy = classify_planning_policy("Implement support for the current MCP protocol specification in an HTTP server.")
+    assert policy.explore_required
+    assert policy.research_required
+    assert policy.critic_required
+    assert policy.plan_review_required
+    assert policy.external_conformance_required
+    assert policy.threat_model_required
+
+    local = classify_planning_policy("Refactor local parser helper to remove duplicate code and update its tests.")
+    assert local.research_required is False
+
+    dependency_graph = classify_planning_policy("Refactor the local task dependency graph reconciliation and add unit tests.")
+    assert dependency_graph.research_required is False
+
+    current_local = classify_planning_policy("Inspect the current implementation and refactor its local parser tests.")
+    assert current_local.research_required is False
+
+    current_news = classify_planning_policy("Research current news and recent events affecting the vendor before making a recommendation.")
+    assert current_news.research_required is True
+
+
+def test_v022_research_result_schema_and_fingerprint_include_evidence():
+    result = _valid_fresh_research_result()
+    validate_deterministic_research_result(result, require_oracle=True)
+    bad = _valid_fresh_research_result()
+    bad["claims"] = [{
+        "id": "claim-x", "claim": "x", "source": "spec", "authority": "official", "normative_level": "MUST",
+        "planner_directive": "ignore x", "directive_effect": "weaken", "confidence": "high",
+    }]
+    import pytest
+    with pytest.raises(ValueError):
+        validate_deterministic_research_result(bad, require_oracle=True)
+
+    task = {
+        "id": "T-R", "profile": "research", "title": "Fresh external research preflight",
+        "objective": "research", "reason": "fresh external evidence", "workspace_mode": "collection",
+        "result": result,
+    }
+    fp1 = material_plan_fingerprint("Implement current MCP protocol support", [task], [])
+    changed = _valid_fresh_research_result()
+    changed["as_of"] = "2026-11-13"
+    task2 = dict(task, result=changed)
+    fp2 = material_plan_fingerprint("Implement current MCP protocol support", [task2], [])
+    assert fp1 != fp2
+
+
+def test_v022_research_trace_and_oracle_validation():
+    import pytest
+
+    unbacked = _valid_fresh_research_result()
+    unbacked["planner_directives"] = ["A contradictory free-form directive"]
+    with pytest.raises(ValueError):
+        validate_deterministic_research_result(unbacked, require_oracle=True)
+
+    black_box_only = _valid_fresh_research_result()
+    black_box_only["verification_oracles"] = [{"kind": "black_box_test", "name": "implementation-owned client"}]
+    with pytest.raises(ValueError):
+        validate_deterministic_research_result(black_box_only, require_oracle=True)
+    black_box_only["authoritative_oracle_unavailable_reason"] = "No official oracle is available."
+    validate_deterministic_research_result(black_box_only, require_oracle=True)
+
+    research_task = {
+        "id": "T-R", "profile": "research", "status": TaskStatus.COMPLETE.value,
+        "result": _valid_fresh_research_result(),
+    }
+    with pytest.raises(ValueError):
+        validate_research_consumer_result(
+            {"research_consistency": {"verdict": "pass", "checked_claim_ids": [], "contradictions": []}},
+            [research_task], require_pass=True,
+        )
+    validate_research_consumer_result(
+        {"research_consistency": _research_consistency_for([research_task])},
+        [research_task], require_pass=True,
+    )
+
+    with pytest.raises(ValueError):
+        validate_external_conformance_review_result({
+            "verdict": "pass",
+            "verification_oracles": [{"kind": "black_box_test", "name": "same-team client", "used": True}],
+        })
+    validate_external_conformance_review_result({
+        "verdict": "pass",
+        "verification_oracles": [{"kind": "official_reference_oracle", "name": "official SDK", "used": True}],
+    })
+
+
+def test_v022_scheduler_stages_explore_and_research_before_critic(tmp_path: Path):
+    store = FakePolicyStore("Implement support for the current MCP protocol specification in an HTTP server.")
+    # The initial coordinator must still be active for deterministic generation preflight.
+    store.tasks[0]["status"] = TaskStatus.READY.value
+    scheduler = Scheduler(store, GlobalConfig(home=tmp_path), max_workers=1)
+    assert scheduler._enforce_planning_policy("COL-1") is True
+    explores = [task for task in store.tasks if task["profile"] == "explore"]
+    research = [task for task in store.tasks if task["profile"] == "research"]
+    critics = [task for task in store.tasks if task["profile"] == "critic"]
+    assert len(explores) == len(research) == len(critics) == 1
+    assert store.dependencies(research[0]["id"]) == []
+    critic_deps = {task["id"] for task in store.dependencies(critics[0]["id"])}
+    assert explores[0]["id"] in critic_deps
+    assert research[0]["id"] in critic_deps
+    coord_deps = {task["id"] for task in store.dependencies("T-COORD")}
+    assert {explores[0]["id"], research[0]["id"], critics[0]["id"]} <= coord_deps
+
+
+def test_v022_external_protocol_revision_gets_fresh_research_preflight(tmp_path: Path):
+    store = FakePolicyStore("Implement support for the current MCP protocol specification in an HTTP server.")
+    store.tasks[0]["status"] = TaskStatus.COMPLETE.value
+    store.tasks.append({
+        "id": "T-REV-EXT", "project_id": "PRJ-1", "collection_id": "COL-1",
+        "profile": "coordinator", "title": "Acceptance revision", "objective": "Revise protocol behavior",
+        "reason": "operator revision", "status": TaskStatus.READY.value, "depth": 0,
+        "created_at": "2026-11-12 12:00:00", "updated_at": "2026-11-12 12:00:00",
+    })
+    scheduler = Scheduler(store, GlobalConfig(home=tmp_path), max_workers=1)
+    assert scheduler._enforce_planning_policy("COL-1") is True
+    children = [task for task in store.tasks if task.get("requested_by_task_id") == "T-REV-EXT"]
+    explore = next(task for task in children if task["profile"] == "explore")
+    research = next(task for task in children if task["profile"] == "research")
+    critic = next(task for task in children if task["profile"] == "critic")
+    assert store.dependencies(research["id"]) == []
+    critic_deps = {task["id"] for task in store.dependencies(critic["id"])}
+    assert {explore["id"], research["id"]} <= critic_deps
+    revision_deps = {task["id"] for task in store.dependencies("T-REV-EXT")}
+    assert {explore["id"], research["id"], critic["id"]} <= revision_deps
+
+
+def test_v022_advise_can_request_blocking_fresh_research(tmp_path: Path):
+    store = FakePolicyStore("Analyze a local design choice.")
+    advise = {
+        "id": "T-ADVISE", "project_id": "PRJ-1", "collection_id": "COL-1",
+        "profile": "advise", "title": "Advise", "objective": "Recommend",
+        "reason": "decision", "status": TaskStatus.WAITING.value, "depth": 1,
+        "created_at": "2026-11-12 12:00:00", "updated_at": "2026-11-12 12:00:00",
+        "result": {"status": "waiting", "research_required": [{"question": "What does the current external standard require?"}]},
+    }
+    store.tasks.append(advise)
+    scheduler = Scheduler(store, GlobalConfig(home=tmp_path), max_workers=1)
+    assert scheduler._enforce_research_requests("COL-1") is True
+    research = next(task for task in store.tasks if task["profile"] == "research" and task.get("requested_by_task_id") == "T-ADVISE")
+    deps = {task["id"] for task in store.dependencies("T-ADVISE")}
+    assert research["id"] in deps
+    assert any(event[0] == "RESEARCH_REQUIRED" for event in store.events)
+
+
+def test_v022_external_plan_review_depends_on_all_current_research(tmp_path: Path):
+    store = FakePolicyStore("Implement support for the current MCP protocol specification in an HTTP server.")
+    store.tasks[0]["status"] = TaskStatus.COMPLETE.value
+    store.tasks[1]["status"] = TaskStatus.READY.value
+
+    research_ids = []
+    claim_ids = []
+    for index, claim_id in enumerate(("claim-a", "claim-b"), start=1):
+        result = _valid_fresh_research_result()
+        result["claims"][0] = dict(result["claims"][0], id=claim_id, claim=f"Requirement {claim_id}", planner_directive=f"Preserve {claim_id}")
+        task = {
+            "id": f"T-RESEARCH-{index}", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "research", "title": f"Research {index}", "objective": "fresh evidence",
+            "reason": "fresh external evidence", "status": TaskStatus.COMPLETE.value, "depth": 1,
+            "created_at": f"2026-11-12 10:00:0{index}", "updated_at": f"2026-11-12 10:00:0{index}",
+            "requested_by_task_id": "T-COORD", "result": result,
+        }
+        store.tasks.append(task)
+        research_ids.append(task["id"])
+        claim_ids.append(claim_id)
+
+    critic = {
+        "id": "T-CRITIC-EXT", "project_id": "PRJ-1", "collection_id": "COL-1",
+        "profile": "critic", "title": "External critic", "objective": "challenge protocol plan",
+        "reason": "policy", "status": TaskStatus.COMPLETE.value, "depth": 1,
+        "created_at": "2026-11-12 10:00:10", "updated_at": "2026-11-12 10:00:10",
+        "requested_by_task_id": "T-COORD",
+        "result": {"status": "complete", "summary": "checked", "research_consistency": _research_consistency_for(
+            [task for task in store.tasks if task["id"] in research_ids]
+        )},
+    }
+    store.tasks.append(critic)
+    for research_id in research_ids:
+        store.add_dependency(critic["id"], research_id)
+
+    scheduler = Scheduler(store, GlobalConfig(home=tmp_path), max_workers=1)
+    assert scheduler._enforce_planning_policy("COL-1") is True
+
+    plan_reviews = [task for task in store.tasks if task["profile"] == "plan_review" and task["status"] != TaskStatus.SUPERSEDED.value]
+    assert len(plan_reviews) == 1
+    plan_deps = {task["id"] for task in store.dependencies(plan_reviews[0]["id"])}
+    assert set(research_ids) <= plan_deps
+    assert critic["id"] in plan_deps
+    impl_deps = {task["id"] for task in store.dependencies("T-IMPL")}
+    assert plan_reviews[0]["id"] in impl_deps
+
+
+def test_v022_duplicate_claim_ids_are_task_qualified():
+    first = {"id": "T-R1", "profile": "research", "status": TaskStatus.COMPLETE.value, "result": _valid_fresh_research_result()}
+    second = {"id": "T-R2", "profile": "research", "status": TaskStatus.COMPLETE.value, "result": _valid_fresh_research_result()}
+    assert research_claim_ids([first, second]) == ["T-R1:claim-x", "T-R2:claim-x"]
+    import pytest
+    with pytest.raises(ValueError):
+        validate_research_consumer_result(
+            {"research_consistency": {"verdict": "pass", "checked_claim_ids": ["claim-x"], "contradictions": []}},
+            [first, second], require_pass=True,
+        )
+    validate_research_consumer_result(
+        {"research_consistency": _research_consistency_for([first, second])},
+        [first, second], require_pass=True,
+    )
+
+
+def test_v022_research_exception_decision_id_extraction():
+    result = _valid_fresh_research_result()
+    result["claims"][0]["directive_effect"] = "exception"
+    result["claims"][0]["exception_decision_id"] = "DEC-123"
+    assert research_exception_decision_ids(result) == ["DEC-123"]
+
+
+def test_v022_current_news_objective_gets_research_without_implementation_ceremony(tmp_path: Path):
+    store = FakePolicyStore("Research current news and recent events affecting the vendor and summarize the implications.")
+    store.tasks = [store.tasks[0]]
+    store.tasks[0]["status"] = TaskStatus.READY.value
+    scheduler = Scheduler(store, GlobalConfig(home=tmp_path), max_workers=1)
+    assert scheduler._enforce_planning_policy("COL-1") is True
+    research = [task for task in store.tasks if task["profile"] == "research"]
+    assert len(research) == 1
+    assert not [task for task in store.tasks if task["profile"] in {"explore", "critic", "plan_review", "implement"}]
+    coordinator_deps = {task["id"] for task in store.dependencies("T-COORD")}
+    assert research[0]["id"] in coordinator_deps
+
+
+def test_v024_rejects_changed_inherited_research_directive():
+    import pytest
+
+    research_result = _valid_fresh_research_result()
+    research_result["claims"][0] = dict(
+        research_result["claims"][0],
+        id="C1",
+        claim="initialize MUST include protocolVersion",
+        planner_directive="Missing, non-string, or malformed protocolVersion MUST return Invalid Params.",
+    )
+    research = {
+        "id": "T-R", "profile": "research", "status": TaskStatus.COMPLETE.value,
+        "result": research_result,
+    }
+    consistency = _research_consistency_for([research])
+    consistency["claims"][0]["inherited_directive"] = "Absent params may succeed with the default protocol version."
+    with pytest.raises(ValueError):
+        validate_research_consumer_result(
+            {"research_consistency": consistency}, [research], require_pass=True
+        )
+
+
+def test_v024_active_generation_legacy_critic_is_revalidated(tmp_path: Path):
+    store = FakePolicyStore("Implement support for the current MCP protocol specification in an HTTP server.")
+    store.tasks = [
+        {
+            "id": "T-COORD", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "coordinator", "title": "Acceptance revision", "objective": "Revise MCP",
+            "reason": "operator revision", "status": TaskStatus.READY.value, "depth": 0,
+            "created_at": "2026-11-12 12:00:00", "updated_at": "2026-11-12 12:00:00",
+        },
+        {
+            "id": "T-EXPLORE", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "explore", "title": "Explore current implementation surface", "objective": "map",
+            "reason": "policy", "status": TaskStatus.COMPLETE.value, "depth": 1,
+            "requested_by_task_id": "T-COORD", "parent_task_id": "T-COORD",
+            "created_at": "2026-11-12 12:00:01", "updated_at": "2026-11-12 12:00:02",
+            "result": {"status": "complete", "summary": "mapped"},
+        },
+        {
+            "id": "T-RESEARCH", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "research", "title": "Fresh external research preflight", "objective": "research",
+            "reason": "fresh external evidence", "status": TaskStatus.COMPLETE.value, "depth": 1,
+            "requested_by_task_id": "T-COORD", "parent_task_id": "T-COORD",
+            "created_at": "2026-11-12 12:00:01", "updated_at": "2026-11-12 12:00:03",
+            "result": _valid_fresh_research_result(),
+        },
+        {
+            "id": "T-CRITIC", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "critic", "title": "Preflight implementation plan", "objective": "critique",
+            "reason": "policy", "status": TaskStatus.COMPLETE.value, "depth": 1,
+            "requested_by_task_id": "T-COORD", "parent_task_id": "T-COORD",
+            "created_at": "2026-11-12 12:00:04", "updated_at": "2026-11-12 12:00:05",
+            "result": {
+                "status": "complete", "summary": "legacy 0.2.3 critic",
+                "research_consistency": {
+                    "verdict": "pass", "checked_claim_ids": ["claim-x"], "contradictions": []
+                },
+            },
+        },
+    ]
+    store.add_dependency("T-CRITIC", "T-EXPLORE")
+    store.add_dependency("T-CRITIC", "T-RESEARCH")
+    store.add_dependency("T-COORD", "T-EXPLORE")
+    store.add_dependency("T-COORD", "T-RESEARCH")
+    store.add_dependency("T-COORD", "T-CRITIC")
+
+    scheduler = Scheduler(store, GlobalConfig(home=tmp_path), max_workers=1)
+    assert scheduler._enforce_planning_policy("COL-1") is True
+
+    assert store.get_task("T-CRITIC")["status"] == TaskStatus.SUPERSEDED.value
+    replacements = [
+        task for task in store.tasks
+        if task["profile"] == "critic"
+        and task["title"] == "Revalidate inherited research constraints"
+        and task["status"] != TaskStatus.SUPERSEDED.value
+    ]
+    assert len(replacements) == 1
+    replacement = replacements[0]
+    replacement_deps = {task["id"] for task in store.dependencies(replacement["id"])}
+    assert {"T-EXPLORE", "T-RESEARCH"} <= replacement_deps
+    coord_deps = {task["id"] for task in store.dependencies("T-COORD")}
+    assert replacement["id"] in coord_deps
+    assert "T-CRITIC" not in coord_deps
+    assert any(event[0] == "RESEARCH_CONSISTENCY_REVALIDATION_REQUIRED" for event in store.events)
+
+
+def test_v025_running_collection_revalidates_legacy_critic_after_generation_coordinator_completed(tmp_path: Path):
+    store = FakePolicyStore("Implement support for the current MCP protocol specification in an HTTP server.")
+    store.collection["status"] = "RUNNING"
+    store.tasks = [
+        {
+            "id": "T-COORD", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "coordinator", "title": "Acceptance revision", "objective": "Revise MCP",
+            "reason": "operator revision", "status": TaskStatus.COMPLETE.value, "depth": 0,
+            "created_at": "2026-11-12 12:00:00", "updated_at": "2026-11-12 12:00:10",
+            "result": {"status": "complete", "summary": "old planning complete"},
+        },
+        {
+            "id": "T-EXPLORE", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "explore", "title": "Explore current implementation surface", "objective": "map",
+            "reason": "policy", "status": TaskStatus.COMPLETE.value, "depth": 1,
+            "requested_by_task_id": "T-COORD", "parent_task_id": "T-COORD",
+            "created_at": "2026-11-12 12:00:01", "updated_at": "2026-11-12 12:00:02",
+            "result": {"status": "complete", "summary": "mapped"},
+        },
+        {
+            "id": "T-RESEARCH", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "research", "title": "Fresh external research preflight", "objective": "research",
+            "reason": "fresh external evidence", "status": TaskStatus.COMPLETE.value, "depth": 1,
+            "requested_by_task_id": "T-COORD", "parent_task_id": "T-COORD",
+            "created_at": "2026-11-12 12:00:01", "updated_at": "2026-11-12 12:00:03",
+            "result": _valid_fresh_research_result(),
+        },
+        {
+            "id": "T-CRITIC", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "critic", "title": "Preflight implementation plan", "objective": "critique",
+            "reason": "policy", "status": TaskStatus.COMPLETE.value, "depth": 1,
+            "requested_by_task_id": "T-COORD", "parent_task_id": "T-COORD",
+            "created_at": "2026-11-12 12:00:04", "updated_at": "2026-11-12 12:00:05",
+            "result": {
+                "status": "complete", "summary": "legacy critic",
+                "research_consistency": {"verdict": "pass", "checked_claim_ids": ["claim-x"], "contradictions": []},
+            },
+        },
+    ]
+    store.add_dependency("T-CRITIC", "T-EXPLORE")
+    store.add_dependency("T-CRITIC", "T-RESEARCH")
+    store.add_dependency("T-COORD", "T-EXPLORE")
+    store.add_dependency("T-COORD", "T-RESEARCH")
+    store.add_dependency("T-COORD", "T-CRITIC")
+
+    scheduler = Scheduler(store, GlobalConfig(home=tmp_path), max_workers=1)
+    assert scheduler._enforce_planning_policy("COL-1") is True
+    assert store.get_task("T-CRITIC")["status"] == TaskStatus.SUPERSEDED.value
+    replacements = [task for task in store.tasks if task["title"] == "Revalidate inherited research constraints" and task["status"] != TaskStatus.SUPERSEDED.value]
+    repairs = [task for task in store.tasks if task["title"] == "Apply inherited research revalidation" and task["status"] != TaskStatus.SUPERSEDED.value]
+    assert len(replacements) == 1
+    assert len(repairs) == 1
+    assert replacements[0]["id"] in {task["id"] for task in store.dependencies(repairs[0]["id"])}
+
+
+def test_v024_historical_completed_legacy_consumer_is_not_reopened(tmp_path: Path):
+    store = FakePolicyStore("Implement support for the current MCP protocol specification in an HTTP server.")
+    store.collection["status"] = "COMPLETE"
+    store.tasks = [
+        {
+            "id": "T-COORD", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "coordinator", "title": "Initial coordination", "objective": "Plan",
+            "reason": "entry", "status": TaskStatus.COMPLETE.value, "depth": 0,
+            "created_at": "2026-11-10 10:00:00", "updated_at": "2026-11-10 10:01:00",
+        },
+        {
+            "id": "T-RESEARCH", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "research", "title": "Fresh external research preflight", "objective": "research",
+            "reason": "fresh external evidence", "status": TaskStatus.COMPLETE.value, "depth": 1,
+            "requested_by_task_id": "T-COORD", "parent_task_id": "T-COORD",
+            "created_at": "2026-11-10 10:00:10", "updated_at": "2026-11-10 10:00:20",
+            "result": _valid_fresh_research_result(),
+        },
+        {
+            "id": "T-CRITIC", "project_id": "PRJ-1", "collection_id": "COL-1",
+            "profile": "critic", "title": "Preflight implementation plan", "objective": "critique",
+            "reason": "policy", "status": TaskStatus.COMPLETE.value, "depth": 1,
+            "requested_by_task_id": "T-COORD", "parent_task_id": "T-COORD",
+            "created_at": "2026-11-10 10:00:21", "updated_at": "2026-11-10 10:00:30",
+            "result": {
+                "status": "complete", "summary": "historical legacy critic",
+                "research_consistency": {"verdict": "pass", "checked_claim_ids": ["claim-x"], "contradictions": []},
+            },
+        },
+    ]
+    store.add_dependency("T-CRITIC", "T-RESEARCH")
+    scheduler = Scheduler(store, GlobalConfig(home=tmp_path), max_workers=1)
+    scheduler._enforce_planning_policy("COL-1")
+    assert store.get_task("T-CRITIC")["status"] == TaskStatus.COMPLETE.value
+    assert not [task for task in store.tasks if task["title"] == "Revalidate inherited research constraints"]

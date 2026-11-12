@@ -218,14 +218,20 @@ class OpenCodeHarness(Harness):
         ]
         if model:
             args.extend(["--model", model])
-        args.append(prompt)
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Rich preflight evidence can make critic/plan-review prompts much larger
+        # than the platform exec argv limit. OpenCode run reads non-TTY stdin as
+        # prompt input, so preserve the complete prompt by streaming it rather
+        # than appending it to argv (or truncating evidence). communicate() closes
+        # stdin after writing, which also avoids OpenCode waiting indefinitely for
+        # EOF in headless mode.
         proc = subprocess.Popen(
             args,
             cwd=str(workdir),
             env=process_env,
             text=True,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -234,7 +240,7 @@ class OpenCodeHarness(Harness):
             on_start(proc.pid)
         timed_out = False
         try:
-            stdout, stderr = proc.communicate(timeout=timeout_seconds)
+            stdout, stderr = proc.communicate(input=prompt, timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
             try:
@@ -260,6 +266,7 @@ class OpenCodeHarness(Harness):
             f"model={model or ''}\n"
             f"prompt_bytes={prompt_bytes}\n"
             f"prompt_sha256={prompt_sha256}\n"
+            f"prompt_transport=stdin\n"
             f"sanitize_parent_venv={str(sanitize_parent_venv).lower()}\n"
             f"virtual_env={process_env.get('VIRTUAL_ENV', '')}\n"
             f"praector_control={praector_control or ''}\n"

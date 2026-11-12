@@ -88,7 +88,7 @@ For most runtime delegation, prefer `auto` unless the semantics are explicitly k
 
 ### Read-only Task
 
-For `coordinator`, `critic`, `plan_review`, `research`, `review`, or `advise`:
+For `coordinator`, `explore`, `critic`, `plan_review`, `research`, `review`, or `advise`:
 
 1. create/reuse detached worktree;
 2. select base reference from workspace mode/base commit;

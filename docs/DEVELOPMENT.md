@@ -506,3 +506,7 @@ When changing `praector collection pr`, keep tests for both result generations:
 - current implementation results with explicit `pr_summary` and `changes` must render those reviewer-facing fields directly;
 - older results without `changes` must recover multiple concrete change bullets from durable findings/evidence rather than collapsing to the implementation task title;
 - verification remains grounded in passing independent review evidence and unresolved items remain durable-result derived.
+
+## Research/evidence policy tests
+
+Changes to planning classification must test both positive and negative research triggers. External/current protocol/provider/regulatory/dependency work should exercise `explore + research -> critic -> coordinator`; purely local work must prove it does not incur unnecessary external research. Deterministic research tests should cover source authority levels, stable claim ids (including cross-task collision qualification), durable exception-decision validation, claim-backed directives, Task Envelope `inherited_research_constraints`, exact inherited-directive preservation, per-claim `research_consistency` dispositions, active-generation revalidation of legacy consumer traces, authoritative-oracle enforcement for external-conformance review, research-result fingerprint staleness, `RESEARCH_REQUIRED` resume behavior, capability-unavailable blocking, and implementation input-lineage reconciliation. Keep Go and Python reference behavior aligned.

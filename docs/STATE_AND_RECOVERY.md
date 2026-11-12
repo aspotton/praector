@@ -37,7 +37,7 @@ Git answers "what changed in code?". Dolt answers "what work existed, why, and w
 
 ## Read-only capability violations
 
-Read-only profiles (`coordinator`, `critic`, `plan_review`, `research`, `review`, and `advise`) are instructed to baseline their worktree before verification, avoid incidental repository writes where practical, restore only byproducts caused by their own commands, and confirm the final worktree state matches the starting baseline before result submission. This prevents common test/cache side effects from unnecessarily consuming attempts while preserving candidate and pre-existing state.
+Read-only profiles (`coordinator`, `explore`, `critic`, `plan_review`, `research`, `review`, and `advise`) are instructed to baseline their worktree before verification, avoid incidental repository writes where practical, restore only byproducts caused by their own commands, and confirm the final worktree state matches the starting baseline before result submission. This prevents common test/cache side effects from unnecessarily consuming attempts while preserving candidate and pre-existing state.
 
 Praector still checks the worktree after every harness run. If a read-only worker leaves mutations behind, Praector rolls those changes back deterministically. That condition is an execution/protocol failure, not a semantic verdict on the plan or implementation. While the Task still has attempt budget, Praector records the attempt as failed, returns the same durable Task to `READY`, and emits `READ_ONLY_CAPABILITY_RETRY`. It does **not** create coordinator repair work merely because the read-only worker violated its capability boundary.
 
@@ -470,3 +470,9 @@ If a revalidation/repair coordinator requests another final review while a non-f
 ## Legacy cyclic graph recovery
 
 The current store rejects every new cyclic `depends_on` mutation, but persistent state may contain cycles written by older Praector releases. Bootstrap and per-Collection reconciliation therefore run a legacy normalization pass before any new graph rewiring. Only protocol-invalid review prerequisites are auto-removed: implementation execution cannot be a prerequisite of pre-write plan review, and a plan review cannot wait on a coordinator that is already downstream of that review. Unknown cycle shapes remain untouched and place only that Collection into `BLOCKED` quarantine. Quarantine is durable through `DEPENDENCY_CYCLE_QUARANTINED`; the global daemon continues scheduling unrelated Collections and never schedules runnable tasks from the quarantined Collection.
+
+## Evidence and input-lineage recovery
+
+Fresh research is durable task/result state. Its result digest participates in material planning fingerprints, so evidence refreshes can trigger the existing critic/plan-review revalidation machinery. `RESEARCH_REQUIRED`, `RESEARCH_CAPABILITY_REQUIRED`, `TASK_INPUT_LINEAGE`, and `RECONCILIATION_REQUIRED` events make uncertainty/capability/lineage transitions inspectable after daemon restart.
+
+Praector does not discard implementation merely because its inputs changed while it was running. Integration is preserved and the independent review is reframed as reconciliation against the current material plan, research, and prerequisite lineage.

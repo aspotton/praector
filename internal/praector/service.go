@@ -491,7 +491,7 @@ func (s *Service) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	if title == "" {
 		title = HumanTitle(in.Objective, 80)
 	}
-	coordObj := fmt.Sprintf("Own the initial decomposition of the new collection: %s. Inspect project context only as needed. Create durable critic/plan_review/research/implement/review/advise tasks using praector as appropriate. Do not perform implementation or substantive specialist work yourself. Ensure implementation tasks are sequenced by dependencies; independent review is automatically enforced for implementation tasks.", in.Objective)
+	coordObj := fmt.Sprintf("Own the initial decomposition of the new collection: %s. Consume the deterministic explore/critic preflight when present. Create durable plan_review/research/implement/review/advise tasks using praector as appropriate; request additional explore/critic work only when genuinely needed. Do not perform implementation or substantive specialist work yourself. Ensure implementation tasks are sequenced by dependencies; independent review is automatically enforced for implementation tasks.", in.Objective)
 	c, coord, e := s.store.CreateCollectionWithCoordinator(S(project, "id"), title, in.Objective, coordObj)
 	if e != nil {
 		return RunOutput{}, e
@@ -1423,7 +1423,7 @@ func (s *Service) Init(ctx context.Context, in InitInput) (InitOutput, error) {
 		for _, n := range ProfileNames {
 			models[n] = ""
 		}
-		cfg = ProjectConfig{ProjectID: MakeID("PRJ"), Name: filepath.Base(root), Root: root, BaseBranch: br, Harness: "opencode", OpenCodeCommand: oc, Models: models, Limits: DefaultLimits()}
+		cfg = ProjectConfig{ProjectID: MakeID("PRJ"), Name: filepath.Base(root), Root: root, BaseBranch: br, Harness: "opencode", OpenCodeCommand: oc, Models: models, Limits: DefaultLimits(), Capabilities: DefaultProjectCapabilities()}
 	}
 	if in.Name != "" {
 		cfg.Name = in.Name

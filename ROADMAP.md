@@ -65,9 +65,25 @@ Near-term platform work:
 
 The goal is full Windows support, not a permanently experimental port.
 
-## 3. MCP interface
+## 3. Evidence-aware orchestration quality
 
-MCP should expose the same durable control plane that the CLI uses, not create a second orchestration implementation.
+Praector should treat current external evidence as durable planning input when correctness depends on changing reality rather than model memory. The current baseline can require fresh research alongside repository exploration, feed both into critic and plan review, record structured source/claim provenance, and stale material planning when accepted external evidence changes.
+
+Continue hardening this layer through real dogfood runs:
+
+- expand deterministic freshness classification without making purely local work pay an unnecessary research cost;
+- improve authoritative-source selection and contradiction handling for standards, APIs, vendor behavior, laws/regulations, security guidance, and current events;
+- exercise `RESEARCH_REQUIRED` round-trips raised by critic, plan-review, review, and advise tasks;
+- prefer official/reference/provider verification oracles for external contracts, while distinguishing them from implementation-owned black-box tests;
+- stress prerequisite/evidence lineage changes while downstream implementation is already running, including reconciliation and fresh-review behavior;
+- extend capability-aware routing beyond current external research as additional harness capabilities become relevant;
+- improve operator visibility into why research was required, which evidence made a plan stale, and why reconciliation was triggered.
+
+The design goal is traceable reasoning rather than more ceremony: authoritative evidence should be able to flow into durable claims, planner directives, implementation contracts, and independent verification without silently changing meaning along the way.
+
+## 4. MCP interface
+
+MCP is a first-class Praector interface for coding agents and human-facing agents. It must expose the same durable **domain operations** as the CLI rather than invoking CLI subprocesses or maintaining a second orchestration implementation. The normal user experience should be that a human talks to an MCP-capable agent, and that agent can inspect and operate Praector with the same authority/policy boundaries as an equivalent CLI caller.
 
 **Status:** the local loopback listener is live, and the CLI/MCP surface is now
 commandHelp-driven so every command maps to exactly one MCP tool or resource —
@@ -81,55 +97,79 @@ acceptance into the base branch) sit behind a separate,
 default-off `privileged` opt-in. The remaining work below (remote transport +
 auth, richer escalation integration) stays on the roadmap.
 
-### Architecture principles
+### Shared service/operation layer
 
-- CLI and MCP share the same store/service/domain operations.
-- MCP must never bypass dependency, planning, review, capability, revision, or acceptance checks.
-- Start read-only and expand mutation capabilities deliberately.
-- Preserve durable IDs (`PRJ-*`, `COL-*`, `T-*`, attempts, decisions, revisions) across CLI and MCP.
-- Keep local stdio operation simple; design remote transport/auth as a separate security boundary.
+- Extract command-independent typed domain/service operations from CLI handlers.
+- Make CLI and MCP thin adapters over those same operations.
+- Maintain one operation registry describing name, input/output schema, mutability, authority class, help text, and audit requirements where practical.
+- Add parity tests so a new operator-visible domain capability cannot silently appear in only one interface.
+- Define parity semantically rather than literally: process/bootstrap commands such as starting the daemon do not become self-referential MCP tools, but their underlying inspectable/configurable domain behavior should remain available when meaningful.
 
-### Read-only MCP surface first
+### Daemon-hosted transport
 
-Expose agent-friendly equivalents for the information operators already inspect through the CLI:
+When MCP is enabled, the running Praector daemon hosts the MCP endpoint. Target the modern stateless MCP model and Streamable HTTP for network clients. Default binding should be loopback-only (`127.0.0.1` / `::1`) so local coding agents can connect without exposing Praector on the LAN. Remote/LAN/Tailscale/public binding is a separate explicit security mode requiring authentication/authorization. An optional stdio bridge may be useful for clients that insist on spawning a local MCP process, but it should bridge to the same service layer rather than become a second server implementation.
 
-- projects and project configuration;
-- Collection list/show/status/graph;
-- Task show and dependency context;
-- attempts/sessions and summarized logs;
-- structured results, review verdicts, evidence, decisions, revisions, and acceptance state;
-- durable memory/context records;
+### Agent-facing state surface
+
+Use resources for durable inspectable state and tools for parameterized queries/actions. Expose at minimum:
+
+- project/configuration discovery;
+- Collection list/show/status/graph and revision/acceptance state;
+- Task show/dependencies and role/objective/status;
+- attempts, sessions, summarized/tail logs, structured results, evidence, decisions, and review verdicts;
 - pull-request delivery metadata;
-- pending human/exec escalations once that layer exists.
+- daemon/runtime health;
+- pending attention/escalation objects once that layer exists.
 
-Prefer MCP resources for durable inspectable state and MCP tools for queries/actions that require parameters or side effects.
+Stable Praector IDs (`PRJ-*`, `COL-*`, `T-*`, attempts, revisions, decisions, escalations) are the handles agents pass between calls. MCP has no trustworthy equivalent of the CLI caller's current working directory, so project-scoped mutations must resolve context from an explicit registered `PRJ-*` (or from a durable child ID that deterministically identifies its project), never from server process cwd or arbitrary client-supplied filesystem paths. The daemon can therefore serve multiple registered projects under one Praector home without ambiguous write targets.
 
-### Controlled write surface
+### Agent-facing actions
 
-After read-only parity is stable, consider tools for:
+Agents with appropriate authority should be able to perform the same durable work a human can initiate through the CLI, including:
 
-- create/run a Collection;
-- request durable specialist Tasks;
-- submit structured results from authorized external workers;
-- retry/supersede/revise work;
-- publish/update PRs;
-- respond to human/exec escalation requests;
-- explicitly privileged acceptance actions.
+- start a new Collection from a natural-language objective;
+- revise/retry/supersede work where the equivalent CLI operation exists;
+- request specialist Tasks where authorized;
+- publish/update PR delivery;
+- inspect blocked/failed work and its evidence;
+- respond to durable human/exec attention requests when the caller has the required authority;
+- perform acceptance/other privileged actions only under an explicit stronger authority scope.
 
-Every mutating MCP operation must use the same policy checks and audit/event history as the CLI.
+Every MCP mutation must call the same service/domain operation as CLI, emit the same durable events, and pass the same dependency/planning/review/capability/acceptance checks. MCP must never mutate Dolt tables directly.
 
-### Remote access and authorization
+### Long-running work and MCP Tasks
 
-Before exposing Praector beyond a trusted local process:
+Praector Collections are already durable asynchronous work. A basic `run` tool can return the new `COL-*` immediately and let clients query status/resources. Where client support makes it useful, integrate the official `io.modelcontextprotocol/tasks` extension so long-running tool calls can return a durable MCP task handle, support polling, and represent mid-flight input requirements. The MCP task is an interface handle; the Praector Collection/Task graph remains the source of truth.
 
-- define authentication and identity propagation;
-- scope capabilities by project/action;
-- protect logs/results that may contain sensitive repository information;
-- add audit events for remote reads/writes where appropriate;
-- rate-limit and bound expensive queries/actions;
-- separate ordinary agent authority from human/executive approval authority.
+### Human attention through agents
 
-## 4. Human and executive escalation
+A primary target workflow is:
+
+```text
+Human -> coding/general agent -> Praector MCP -> durable Praector graph
+                                      |
+                                      +-> status / evidence / logs
+                                      +-> start or revise work
+                                      +-> pending attention
+                                              |
+Human <- agent presents decision/evidence <----+
+Human -> agent records authorized response -> Praector resumes graph
+```
+
+This should allow a person to ask an agent “what is Praector doing?”, “start this implementation”, or “what needs my attention?” without opening a shell. Attention responses must still be recorded as durable Praector decisions with responder/authority provenance; conversational prose alone is never approval.
+
+### Authorization and exposure
+
+Before exposing Praector beyond trusted loopback clients:
+
+- define authenticated caller identity and propagate it into audit/event records;
+- scope capabilities by project and operation class (`read`, `work`, `delivery`, `accept`, `respond_human`, `respond_exec`);
+- separate normal agent authority from human/executive approval authority;
+- protect repository logs/results and other potentially sensitive data;
+- bound/rate-limit expensive reads and work-creating mutations;
+- support explicit remote-server configuration rather than changing the safe local default.
+
+## 5. Human and executive escalation
 
 Praector should remain the delegated command layer, with humans or an executive agent above it for choices that exceed delegated authority.
 
@@ -171,7 +211,7 @@ MCP makes this especially useful: an executive/human-facing application can subs
 
 No worker may infer approval from prose or bypass the durable escalation record.
 
-## 5. Broader control-plane evolution
+## 6. Broader control-plane evolution
 
 Later extensions, after the local core and MCP boundary are solid:
 

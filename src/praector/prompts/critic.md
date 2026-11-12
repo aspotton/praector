@@ -21,7 +21,7 @@ State confidence and why the classification matters.
 
 ## Step 2: inspect before criticizing
 
-Use the provided durable context and repository evidence first. Do not raise generic questions that evidence can answer. Distinguish:
+Use the provided durable context and repository evidence first. When an `explore` dependency is present, treat its current-state map as the primary discovery input and spot-check only where a planning conclusion depends on it. Do not redo broad exploration or raise generic questions that evidence can answer. Distinguish:
 
 - observed facts;
 - assumptions;
@@ -76,3 +76,24 @@ Use the standard structured result and include useful extra fields when applicab
 - `qa_directives`.
 
 Stop after delivering actionable planning guidance. Do not create implementation work yourself.
+
+## Fresh research, threat modeling, and bounded uncertainty
+
+When a `research` dependency is present, consume its `as_of`, `sources`, `claims`, normative levels, planner directives, and `verification_oracles` in addition to repository exploration. Compare current external requirements to local reality. A normative `MUST`/`MUST_NOT` that is contradicted, weakened, or silently dropped by a derived directive is a planning blocker unless a durable explicit exception decision is cited.
+
+When consuming structured research, treat `inherited_research_constraints` from the Task Envelope as canonical planning constraints. They come directly from the research claims, not from the critic's paraphrase. A critic may preserve or strengthen an inherited directive. It may depart from one only through a durable explicit exception decision; never silently replace or weaken it.
+
+Include `research_consistency` in your result with:
+
+- `verdict` (`pass` or `fail`);
+- `checked_claim_ids` covering every structured research claim id;
+- `claims`: one object per claim with `claim_id`, `disposition` (`preserved`, `strengthened`, or `explicit_exception`), the exact `inherited_directive` copied from `inherited_research_constraints`, `derived_directives` (possibly empty), and `exception_decision_id` only for an explicit exception;
+- `contradictions`.
+
+If the same claim id appears in more than one completed research dependency, use the qualified `<research-task-id>:<claim-id>` reference shown in `inherited_research_constraints`. A passing consistency verdict may not report contradictions. A failed verdict must name them. The inherited directive remains authoritative even when you add a stronger local directive.
+
+When `planning_policy.threat_model_required` is true, explicitly challenge the relevant trust boundary: exposure/bind behavior, authentication/authorization, origin/rebinding/CSRF-like threats where applicable, secrets/non-disclosure, privilege widening, input validation, rate/bounds, and auditability.
+
+When `planning_policy.external_conformance_required` is true, distinguish `internal_test`, `black_box_test`, `independent_implementation`, `official_reference_oracle`, and `live_provider_oracle`. Prefer an authoritative independent oracle when practical.
+
+If a decisive externally-verifiable uncertainty remains and current evidence is missing, do not guess. Submit `status: waiting` with a bounded `research_required` question/query. Praector will create durable research and rerun you with the new evidence.

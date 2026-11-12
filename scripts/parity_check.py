@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-PROFILES = ["coordinator", "critic", "plan_review", "research", "implement", "review", "advise"]
+PROFILES = ["coordinator", "explore", "critic", "plan_review", "research", "implement", "review", "advise"]
 EXPECTED_COMMANDS = {
     "init", "run", "status", "graph", "daemon", "doctor", "logs", "collection",
     "profile", "project", "task", "context", "coordinator", "result", "memory", "decision",

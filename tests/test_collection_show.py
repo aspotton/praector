@@ -44,6 +44,7 @@ def test_collection_show_includes_planning_policy(monkeypatch, capsys):
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["id"] == "COL-1"
+    assert payload["planning_policy"]["explore_required"] is True
     assert payload["planning_policy"]["critic_required"] is True
     assert payload["planning_policy"]["plan_review_required"] is True
     assert payload["revisions"] == [{"id": "REV-1", "status": "SATISFIED"}]
