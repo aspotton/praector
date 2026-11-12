@@ -18,6 +18,10 @@ Before making architectural or behavioral changes, read:
 
 The documentation index is [`docs/README.md`](docs/README.md).
 
+## Repository skill
+
+Use the repo-local [`$praector`](.agents/skills/praector/SKILL.md) skill whenever a request operates, inspects, or explains the live Praector control plane through the `praector` binary or its MCP surface: Projects, Collections, Tasks, graphs, status, results, logs, revisions, retries, delivery/acceptance plans, or cleanup. Do not load it merely because a task edits Praector's source code; ordinary repository development continues to follow this file and the focused docs above.
+
 ## Central invariant
 
 > **Agents request durable work; they never own child-agent process lifecycle.**
@@ -55,6 +59,7 @@ README.md                    human entry point
 ROADMAP.md                   prioritized hardening/MCP/escalation direction
 CHANGELOG.md                 release history and per-change log
 AGENTS.md                    coding-agent entry point
+.agents/skills/praector/     repo-local skill for operating Praector through the CLI or MCP
 docs/README.md               documentation index
 docs/ARCHITECTURE.md         authoritative design overview
 docs/PROFILES.md            runtime role map and built-in prompt contracts

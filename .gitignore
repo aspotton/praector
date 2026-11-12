@@ -102,4 +102,5 @@ Desktop.ini
 
 .direnv/
 .envrc.local
-
+.opencode
+.omo

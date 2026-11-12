@@ -1,0 +1,13 @@
+interface:
+  display_name: "Praector"
+  short_description: "Operate durable Praector work through MCP or the CLI"
+  default_prompt: "Use $praector to inspect or operate durable Praector work through the connected MCP server or the local praector binary."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "praector"
+      description: "Local Praector durable orchestration control plane"
+      transport: "streamable_http"
+      url: "http://127.0.0.1:8765/mcp"
+policy:
+  allow_implicit_invocation: true
