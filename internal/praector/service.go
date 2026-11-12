@@ -1188,6 +1188,24 @@ func (s *Service) ResultSubmit(ctx context.Context, in ResultSubmitInput) (Resul
 	return ResultSubmitOutput{Status: S(t, "status")}, nil
 }
 
+// projectForScope resolves the owning project for a memory/decision scope. An
+// explicit project id resolves directly; when only a collection id is supplied it
+// resolves the collection's stored owning project via the fail-closed
+// ProjectForCollection store helper; and when neither is given it falls back to
+// the ambient projectFromContext working-directory resolution (unchanged CLI
+// behavior). Unlike a bare projectFromContext("") call, a durable COL-* id is
+// NEVER resolved through the daemon working directory: an unknown or
+// project-less collection fails closed instead of silently inheriting cwd.
+func (s *Service) projectForScope(projectID, collectionID string) (Row, error) {
+	if projectID != "" {
+		return s.store.GetProject(projectID)
+	}
+	if collectionID != "" {
+		return s.store.ProjectForCollection(collectionID)
+	}
+	return projectFromContext(s.store, "")
+}
+
 // MemoryAddInput is the input for `praector memory add`.
 type MemoryAddInput struct {
 	ProjectID    string
@@ -1222,7 +1240,7 @@ func (s *Service) MemoryAdd(ctx context.Context, in MemoryAddInput) (MemoryAddOu
 		}
 		pid, cid = S(t, "project_id"), S(t, "collection_id")
 	} else {
-		pr, e := projectFromContext(s.store, in.ProjectID)
+		pr, e := s.projectForScope(in.ProjectID, in.CollectionID)
 		if e != nil {
 			return MemoryAddOutput{}, e
 		}
@@ -1264,7 +1282,7 @@ type MemoryListOutput struct {
 
 // MemoryList lists durable memory for the resolved project.
 func (s *Service) MemoryList(ctx context.Context, in MemoryListInput) (MemoryListOutput, error) {
-	pr, e := projectFromContext(s.store, in.ProjectID)
+	pr, e := s.projectForScope(in.ProjectID, in.CollectionID)
 	if e != nil {
 		return MemoryListOutput{}, e
 	}
@@ -1310,7 +1328,7 @@ func (s *Service) DecisionAdd(ctx context.Context, in DecisionAddInput) (Decisio
 		}
 		pid, cid = S(t, "project_id"), S(t, "collection_id")
 	} else {
-		pr, e := projectFromContext(s.store, in.ProjectID)
+		pr, e := s.projectForScope(in.ProjectID, in.CollectionID)
 		if e != nil {
 			return DecisionAddOutput{}, e
 		}

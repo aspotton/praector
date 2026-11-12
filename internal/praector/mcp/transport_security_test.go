@@ -39,10 +39,16 @@ func TestRequestAuthorizedLoopback(t *testing.T) {
 		{"127.0.0.1:8765", "http://[::1]:8765"},
 		{"localhost:8765", "http://localhost:8765"},
 		{"[::1]:8765", "http://[::1]:8765"},
-		{"127.0.0.1:8765", "null"},
 	} {
 		if !requestAuthorized(newReq(pair[0], pair[1], body)) {
 			t.Errorf("Host %q + Origin %q must be accepted (loopback + matching port)", pair[0], pair[1])
+		}
+	}
+	// A literal "null" (opaque/unique) origin names no loopback authority and is
+	// refused even on a loopback Host (never treated as an absent Origin).
+	for _, opaque := range []string{"null", "file://", "bad uri", "javascript:alert(1)", "http://:8765", "http://evil.example:8765", "http://127.0.0.1:9999"} {
+		if requestAuthorized(newReq("127.0.0.1:8765", opaque, body)) {
+			t.Errorf("opaque/foreign Origin %q must be refused on a loopback Host", opaque)
 		}
 	}
 	// Foreign authority or Origin, or a port mismatch, is refused.
@@ -57,6 +63,36 @@ func TestRequestAuthorizedLoopback(t *testing.T) {
 	}
 	if requestAuthorized(newReq("127.0.0.1", "http://evil.example", body)) {
 		t.Error("foreign Origin on a loopback Host must be refused")
+	}
+}
+
+// TestServeRejectsOpaqueOriginBeforeDispatch proves a literal Origin "null" is a
+// 403 that never reaches a tool/resource handler, while an absent Origin on a
+// loopback Host is allowed through to dispatch (Host check only).
+func TestServeRejectsOpaqueOriginBeforeDispatch(t *testing.T) {
+	ts := httptest.NewServer(newTestServer().Handler())
+	defer ts.Close()
+	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+	postWithOrigin := func(origin string) int {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+EndpointPath, bytes.NewReader(body))
+		req.Header.Set(ProtocolVersionHeader, ProtocolVersion)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	// httptest serves on a 127.0.0.1 Host, so an absent Origin passes the Host
+	// check and reaches dispatch (200), proving absent Origin is not refused.
+	if code := postWithOrigin(""); code != http.StatusOK {
+		t.Fatalf("absent Origin on a loopback Host must reach dispatch (200), got %d", code)
+	}
+	if code := postWithOrigin("null"); code != http.StatusForbidden {
+		t.Fatalf("Origin \"null\" must be 403 before dispatch, got %d", code)
 	}
 }
 
@@ -81,30 +117,57 @@ func TestServeRejectsForeignAuthorityBeforeDispatch(t *testing.T) {
 	}
 }
 
-// TestVersionNegotiationRefusesUnsupported proves initialize never echoes an
-// unsupported revision: a supported/empty version advertises the implemented
-// revision, while any other revision is refused with -32602 and a supported list.
-func TestVersionNegotiationRefusesUnsupported(t *testing.T) {
+// TestVersionNegotiationCountersOffers proves legacy 2025-06-18 negotiation
+// (DEC-0edf905672): a well-formed initialize for any revision — matching, empty,
+// older, newer, or unknown — is met with a SUCCESSFUL result advertising the one
+// implemented revision (2025-06-18) and NEVER echoes the client's value. The
+// Invalid-params error -32602 is reserved solely for a malformed body or a
+// present-but-non-string protocolVersion.
+func TestVersionNegotiationCountersOffers(t *testing.T) {
 	ts := httptest.NewServer(newTestServer().Handler())
 	defer ts.Close()
-	out := post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": "1999-01-01"}})
-	e, _ := out["error"].(map[string]any)
-	if e == nil || e["code"].(float64) != codeInvalidParams {
-		t.Fatalf("unsupported version must yield -32602, got %v", out)
+	for _, version := range []string{ProtocolVersion, "1999-01-01", "2024-11-05", "2099-12-31", "bogus"} {
+		out := post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": version}})
+		if out["error"] != nil {
+			t.Fatalf("well-formed unsupported version %q must counter-offer (success), got %v", version, out)
+		}
+		res, _ := out["result"].(map[string]any)
+		if res["protocolVersion"] != ProtocolVersion {
+			t.Fatalf("counter-offer for %q must advertise the implemented revision, got %v", version, out)
+		}
+		if res["protocolVersion"] == version && version != ProtocolVersion {
+			t.Fatalf("server must never echo the client revision %q", version)
+		}
 	}
-	data, _ := e["data"].(map[string]any)
-	supported, _ := data["supported"].([]any)
-	if len(supported) != 1 || supported[0].(string) != ProtocolVersion {
-		t.Fatalf("error must advertise the honest supported set, got %v", data)
-	}
-	if data["requested"] != "1999-01-01" {
-		t.Fatalf("error should echo the requested value in data, got %v", data)
-	}
-	// An empty requested version still succeeds and advertises the implemented one.
-	out = post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": map[string]any{}})
+	// Absent protocolVersion still succeeds with the implemented revision.
+	out := post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": map[string]any{}})
 	res, _ := out["result"].(map[string]any)
 	if res["protocolVersion"] != ProtocolVersion {
 		t.Fatalf("empty version must advertise implemented revision, got %v", out)
+	}
+	// A present-but-non-string protocolVersion is a malformed Invalid-params error,
+	// not a counter-offer success.
+	out = post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": map[string]any{"protocolVersion": 12345}})
+	if e, _ := out["error"].(map[string]any); e == nil || e["code"].(float64) != codeInvalidParams {
+		t.Fatalf("non-string protocolVersion must yield -32602, got %v", out)
+	}
+}
+
+// TestVersionNegotiationMalformedBody proves a non-string protocolVersion is a
+// -32602 Invalid-params error and never reaches the counter-offer success path
+// (server.go no longer swallows a malformed body as empty params).
+func TestVersionNegotiationMalformedBody(t *testing.T) {
+	ts := httptest.NewServer(newTestServer().Handler())
+	defer ts.Close()
+	for _, params := range []any{
+		map[string]any{"protocolVersion": []string{"2025-06-18"}},
+		map[string]any{"protocolVersion": map[string]any{"v": "x"}},
+		map[string]any{"protocolVersion": true},
+	} {
+		out := post(t, ts, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params})
+		if e, _ := out["error"].(map[string]any); e == nil || e["code"].(float64) != codeInvalidParams {
+			t.Fatalf("malformed protocolVersion %#v must yield -32602, got %v", params, out)
+		}
 	}
 }
 

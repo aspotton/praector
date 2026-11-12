@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Independent black-box MCP conformance oracle for Praector.
+"""Praector-owned black-box MCP probe (NOT an authoritative conformance oracle).
 
-This is an EXTERNAL client, deliberately independent of Praector's own Go MCP
-core (`internal/praector/mcp`) so the protocol contract is verified by a second
-implementation rather than only by in-process Go tests. It speaks MCP Streamable
-HTTP over the loopback endpoint exactly as a real client would.
+This is a black_box_test written and owned by Praector. It is deliberately
+independent of Praector's own Go MCP core (`internal/praector/mcp`) so the
+protocol contract is exercised by a second, out-of-process implementation rather
+than only by in-process Go tests, and it speaks MCP Streamable HTTP over the
+loopback endpoint exactly as a real client would. It is a helpful smoke probe, but
+it is NOT the authoritative independent conformance oracle: that role belongs to
+an official MCP client — the Inspector CLI (`npx @modelcontextprotocol/inspector
+--cli --transport http`, driven by `TestMCPOfficialClientInteroperability`) or a
+Tier-1 official SDK client. A green run of this script alone must not be presented
+as official protocol conformance.
 
 It is intended to be run against a LIVE loopback Praector MCP listener (the same
 loopback-only server a running `praector daemon` hosts). The Go regression test
@@ -15,16 +21,24 @@ it can also be run by hand against a live daemon:
     # terminal 2:
     python3 scripts/mcp_conformance.py --url http://127.0.0.1:8765/mcp
 
-If the official MCP Inspector CLI is available it can be used as an additional
-authoritative client (see --inspector); the built-in client below already covers
-the required checks with only the Python standard library:
+For the authoritative independent check, run the official Inspector CLI directly
+against the same listener (preferred) or a Tier-1 official SDK client:
+
+    npx @modelcontextprotocol/inspector --cli http://127.0.0.1:8765/mcp \
+        --method tools/list
+
+The built-in client below already covers the required checks with only the Python
+standard library:
 
   * protocol/version negotiation: a supported revision succeeds and advertises
-    exactly 2025-06-18; an unsupported revision is REFUSED (-32602) rather than
-    echoed;
+    exactly 2025-06-18; a well-formed UNSUPPORTED revision is answered with a
+    legacy 2025-06-18 COUNTER-OFFER (a successful result advertising 2025-06-18)
+    and is never echoed back, while a malformed/non-string protocolVersion is
+    refused with -32602;
   * the MCP-Protocol-Version HTTP header contract: a missing header on a
     post-initialize request is a plain HTTP 400;
-  * the DNS-rebinding defense: a foreign Origin is a plain HTTP 403;
+  * the DNS-rebinding defense: a foreign Origin or a literal "null"/opaque Origin
+    is a plain HTTP 403;
   * tools/list, resources/list, and resources/read;
   * a safe read-only tool call (project list);
   * with --caller, a safe durable queue-write (task request) that records a real
@@ -95,8 +109,8 @@ def main() -> int:
     check(res["result"]["protocolVersion"] == PROTOCOL_VERSION, "advertises exactly the implemented protocol revision 2025-06-18")
 
     status, res = c.call("initialize", {"protocolVersion": "1999-01-01", "capabilities": {}, "clientInfo": {"name": "x", "version": "0"}})
-    err = (res or {}).get("error") or {}
-    check(status == 200 and err.get("code") == -32602, "unsupported protocol version is refused with -32602, not echoed")
+    check(status == 200 and res and res.get("error") is None, "a well-formed unsupported protocol version counter-offers (success), not refused")
+    check(res["result"]["protocolVersion"] == PROTOCOL_VERSION, "the counter-offer advertises the implemented revision 2025-06-18, never echoes 1999-01-01")
 
     status, res = c.call("tools/list")
     tools = ((res or {}).get("result") or {}).get("tools") or []
@@ -123,6 +137,9 @@ def main() -> int:
 
     status, _ = c.call("tools/list", origin="http://evil.example")
     check(status == 403, "a request carrying a foreign Origin is rejected with HTTP 403 before dispatch")
+
+    status, _ = c.call("tools/list", origin="null")
+    check(status == 403, "a request carrying a literal \"null\"/opaque Origin is rejected with HTTP 403 before dispatch")
 
     if ns.caller:
         status, res = c.call("tools/call", {"name": "praector_task_request", "arguments": {
