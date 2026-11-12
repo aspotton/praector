@@ -25,8 +25,10 @@ import (
 // The exposed surface is COMMAND-HELP DRIVEN: every commandHelp key maps to
 // exactly one MCP item — a tool (for a leaf domain command) or a resource (for a
 // command namespace / launch-only command) — through the shared serviceOps
-// registry, so the CLI and MCP surfaces cannot drift apart ("now and always").
-// Privileged collection-finalizing tools (accept/pr/cleanup) are additionally
+// registry, giving command/surface coverage parity so the CLI and MCP surfaces
+// cannot drift apart ("now and always"), rather than a claim of unrestricted
+// behavioral parity. Privileged write tools (collection accept/pr/cleanup and
+// explicit-root init/registration) are additionally
 // gated behind the independent, default-off Privileged opt-in.
 type mcpBridge struct {
 	svc        *Service
@@ -76,16 +78,24 @@ type mcpSurfaceEntry struct {
 // call exactly one typed Service op each and never launch a process.
 var mcpSurface = map[string]mcpSurfaceEntry{
 	// --- top-level commands ---
-	"init": {toolName: "praector_init", desc: "Register the current Git repository as a Praector project.",
-		schema: objectSchema(map[string]any{"name": stringProp, "base_branch": stringProp, "opencode": stringProp}),
+	"init": {toolName: "praector_init", privileged: true, desc: "Register the requested target repository as a Praector project. Requires an explicit root_path (never operates on the daemon cwd); privileged project registration.",
+		schema: objectSchema(map[string]any{"root_path": stringProp, "name": stringProp, "base_branch": stringProp, "opencode": stringProp}, "root_path"),
 		call: func(s *Service, raw json.RawMessage) (string, error) {
-			var a struct{ Name, BaseBranch, OpenCode string }
+			var a struct {
+				RootPath   string `json:"root_path"`
+				Name       string `json:"name"`
+				BaseBranch string `json:"base_branch"`
+				OpenCode   string `json:"opencode"`
+			}
 			if err := bindArgs(raw, &a); err != nil {
 				return "", err
 			}
+			if strings.TrimSpace(a.RootPath) == "" {
+				return "", fmt.Errorf("root_path is required")
+			}
 			// Clone the Service so Init's internal store re-registration never
 			// mutates the daemon's shared store connection.
-			out, e := (&Service{store: s.store, cfg: s.cfg}).Init(context.Background(), InitInput{Name: a.Name, BaseBranch: a.BaseBranch, OpenCode: a.OpenCode})
+			out, e := (&Service{store: s.store, cfg: s.cfg}).Init(context.Background(), InitInput{Root: a.RootPath, Name: a.Name, BaseBranch: a.BaseBranch, OpenCode: a.OpenCode})
 			if e != nil {
 				return "", e
 			}

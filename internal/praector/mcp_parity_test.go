@@ -112,9 +112,9 @@ func TestMCPPrivilegedToolsDefaultOff(t *testing.T) {
 	for key, e := range mcpSurface {
 		if e.privileged && e.toolName != "" {
 			privilegedTools[e.toolName] = true
-			// Sanity: privileged tools are exactly the acceptance/PR/cleanup trio.
-			if !strings.HasPrefix(key, "collection ") {
-				t.Errorf("unexpected privileged command %q (only collection pr/accept/cleanup are privileged)", key)
+			// Sanity: privileged tools are the acceptance/PR/cleanup trio plus init.
+			if key != "init" && !strings.HasPrefix(key, "collection ") {
+				t.Errorf("unexpected privileged command %q (only init and collection pr/accept/cleanup are privileged)", key)
 			}
 		}
 	}

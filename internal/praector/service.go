@@ -13,9 +13,11 @@ import (
 )
 
 // Service is the shared typed domain seam used by BOTH the CLI adapters (cmd*
-// funcs in cli.go) and the future MCP adapter. Every durable domain operation
-// the CLI performs flows through a Service method so the two adapters can never
-// diverge in behavior ("now and always").
+// funcs in cli.go) and the MCP adapter. Every durable domain operation the CLI
+// performs flows through a Service method, giving command/surface coverage parity
+// ("now and always") rather than a claim of unrestricted behavioral parity: a few
+// privileged ops (collection pr/accept, explicit-root init) return validation
+// results or plans and leave final push/merge/acceptance to the operator adapter.
 //
 // Ownership boundary (decision DEC-28fcd38435 / DEC-aacb7bfc23):
 //   - A Service op owns domain work only: Store reads/durable mutations via the
@@ -1326,10 +1328,16 @@ func (s *Service) DecisionAdd(ctx context.Context, in DecisionAddInput) (Decisio
 // ---------------------------------------------------------------------------
 
 // InitInput is the input for `praector init`.
+//
+// Root is an optional explicit target repository path. The CLI leaves it empty and
+// keeps its cwd-based behavior; the MCP adapter requires an explicit root so a
+// remote-init request is scoped to that requested target rather than the daemon
+// process working directory.
 type InitInput struct {
 	Name       string
 	BaseBranch string
 	OpenCode   string
+	Root       string
 }
 
 // InitOutput carries the registered project fields for display.
@@ -1341,8 +1349,11 @@ type InitOutput struct {
 	OpenCodeCommand string
 }
 
-// Init registers the current Git repository as a Praector project. Store
-// registration is performed here at the same point the CLI does it today.
+// Init registers a Git repository as a Praector project. When InitInput.Root is
+// set, every filesystem/git write is scoped to that explicitly requested target;
+// when it is empty the operation resolves the current working directory, matching
+// the CLI's cwd-based behavior. Store registration is performed here at the same
+// point the CLI does it today.
 func (s *Service) Init(ctx context.Context, in InitInput) (InitOutput, error) {
 	git, e := RequireBinary("git")
 	if e != nil {
@@ -1351,11 +1362,21 @@ func (s *Service) Init(ctx context.Context, in InitInput) (InitOutput, error) {
 	if _, e = RequireBinary("dolt"); e != nil {
 		return InitOutput{}, e
 	}
-	r, e := Run(ctx, []string{git, "rev-parse", "--show-toplevel"}, "", nil, "", true)
+	rootArgs := []string{git, "rev-parse", "--show-toplevel"}
+	if in.Root != "" {
+		rootArgs = []string{git, "-C", in.Root, "rev-parse", "--show-toplevel"}
+	}
+	r, e := Run(ctx, rootArgs, "", nil, "", true)
+	if e != nil {
+		if in.Root != "" {
+			return InitOutput{}, fmt.Errorf("target %q is not inside a Git work tree: %w", in.Root, e)
+		}
+		return InitOutput{}, e
+	}
+	root, e := filepath.Abs(strings.TrimSpace(r.Stdout))
 	if e != nil {
 		return InitOutput{}, e
 	}
-	root, _ := filepath.Abs(strings.TrimSpace(r.Stdout))
 	marker := filepath.Join(root, ".praector", "project.toml")
 	var cfg ProjectConfig
 	if _, e = os.Stat(marker); e == nil {

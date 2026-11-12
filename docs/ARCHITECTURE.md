@@ -566,11 +566,13 @@ The design leaves room for later additions without making them current dependenc
   disabled by default, binds loopback only, and defers auth/identity to the
   remote boundary. The surface is **commandHelp-driven**: each CLI command maps
   to exactly one MCP tool (leaf command) or resource (command namespace /
-  launch-only command) through the shared `serviceOps` registry, so the two
-  surfaces cannot drift. Read-only commands and pass-through queue writes reuse
-  the identical gated `Store`/workspace methods; privileged collection-finalizing
-  tools (`collection pr`/`accept`/`cleanup`, which only run the durable
-  acceptance/PR validation and never push, merge, or implicitly accept) sit
+  launch-only command) through the shared `serviceOps` registry, giving
+  **command/surface coverage parity** (the surfaces cannot drift) rather than a
+  claim of unrestricted behavioral parity. Read-only commands and pass-through
+  queue writes reuse the identical gated `Store`/workspace methods; privileged
+  write tools (`collection pr`/`accept`/`cleanup`, which only run the durable
+  acceptance/PR validation and never push, merge, or implicitly accept, plus
+  explicit-root project `init`/registration) sit
   behind a separate, default-off `privileged` opt-in
   (decisions DEC-1580dff0e0 / DEC-9997d2394f / DEC-28fcd38435 / DEC-aacb7bfc23);
 - **durable human/executive escalation** above Projects/Collections, with blocked work waiting on recorded decisions rather than live session continuity;

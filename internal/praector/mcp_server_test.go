@@ -193,7 +193,7 @@ func TestMCPPrivilegedToolsUnavailableWhileDisabled(t *testing.T) {
 	tl := call(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 	res, _ := tl["result"].(map[string]any)
 	tools, _ := res["tools"].([]any)
-	for _, want := range []string{"praector_collection_pr", "praector_collection_accept", "praector_collection_cleanup"} {
+	for _, want := range []string{"praector_collection_pr", "praector_collection_accept", "praector_collection_cleanup", "praector_init"} {
 		if hasToolNamed(tools, want) {
 			t.Fatalf("privileged tool %q must not be listed while disabled", want)
 		}

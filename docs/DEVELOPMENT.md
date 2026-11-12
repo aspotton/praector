@@ -73,8 +73,9 @@ Avoid:
 ### `internal/praector/service.go`
 
 `Service` is the shared typed domain seam that BOTH the CLI `cmd*` adapters and
-the future MCP adapter call for the same domain operations, so the two
-surfaces can never diverge ("now and always", decision DEC-28fcd38435). Each
+the future MCP adapter call for the same domain operations, giving command/surface
+coverage parity ("now and always", decision DEC-28fcd38435) rather than a claim of
+unrestricted behavioral parity. Each
 `commandHelp` entry in `help.go` maps 1:1 to one typed `Op(ctx, Input) -> Output`
 method via the `serviceOps` registry; `service_parity_test.go` enforces that
 mapping in both directions.
@@ -109,11 +110,13 @@ The bridge enumerates `commandHelp`/`serviceOps` (the same registry the CLI
 parity test binds to) rather than a hand-maintained list, so every CLI command
 projects to exactly one MCP surface item — a callable tool for a leaf command, a
 readable resource for a command namespace or the launch-only `daemon` command —
-and the two surfaces cannot drift ("now and always"). Read-only commands and
+giving command/surface coverage parity (the two surfaces cannot drift, "now and
+always") rather than a claim of unrestricted behavioral parity. Read-only commands and
 pass-through queue writes reuse the identical gated `Store`/workspace methods;
-privileged collection-finalizing tools (`collection pr`/`accept`/`cleanup`,
+privileged write tools (`collection pr`/`accept`/`cleanup`,
 which only run the durable validation and return the plan, never push/merge/
-accept) are gated behind a separate default-off `privileged` opt-in.
+accept, plus explicit-root project `init`/registration) are gated behind a
+separate default-off `privileged` opt-in.
 
 Good place for:
 
