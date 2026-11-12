@@ -258,10 +258,11 @@ operator-side actions.
 
 The listener implements a single MCP protocol revision and is honest about it: it
 advertises only the revision it actually implements, and meets an `initialize`
-request for any other well-formed revision with a legacy **counter-offer** — a
-successful result advertising the implemented revision — rather than echoing the
+request naming any other well-formed non-empty revision with a **counter-offer** —
+a successful result advertising the implemented revision — rather than echoing the
 client's request back as if it were supported (a JSON-RPC Invalid-params error is
-reserved only for a malformed or non-string version). On
+reserved for a missing/empty/non-string/malformed version, the missing/empty edge
+being a documented fail-closed hardening). On
 every request after `initialize`, the client must send an `MCP-Protocol-Version`
 HTTP header equal to that revision; a missing or unsupported header is rejected
 with HTTP 400 (Praector does not implement — and therefore does not assume — any

@@ -16,9 +16,13 @@ import "encoding/json"
 
 // Supported protocol revisions. The server advertises ONLY ProtocolVersion: it
 // implements exactly one MCP revision and never claims support for a revision it
-// does not implement. A client requesting any other revision is refused (see
-// Server.initializeResult) rather than echoed, per the authoritative research
-// (DEC-92e6ae36d4: advertise ONLY 2025-06-18; never echo unsupported versions).
+// does not implement (never echoes an unsupported version back as if supported).
+// Per the 2025-06-18 Lifecycle Version Negotiation requirement (DEC-0edf905672),
+// a well-formed initialize naming an older, newer, or otherwise-unknown revision
+// receives a successful counter-offer advertising only 2025-06-18. The JSON-RPC
+// Invalid-params error -32602 is reserved for a missing/empty, non-string, or
+// malformed protocolVersion — the missing/empty edge being an explicit fail-closed
+// hardening beyond the spec floor (DEC-12a3ff57db), not a spec mandate.
 const (
 	// ProtocolVersion is the single MCP revision this server implements and
 	// advertises.

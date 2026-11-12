@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // Tool describes one callable MCP tool advertised by tools/list.
@@ -109,36 +110,46 @@ func (s *Server) handle(req rpcRequest) *rpcResponse {
 	}
 }
 
-// initialize answers the MCP initialize request with legacy 2025-06-18 version
+// initialize answers the MCP initialize request with 2025-06-18 version
 // negotiation (DEC-0edf905672, superseding the earlier refuse-on-mismatch
-// stance): a well-formed request — matching, empty/absent, older, newer, or an
-// otherwise-unknown revision — is met with a SUCCESSFUL result advertising the
-// one revision this server actually implements (2025-06-18), i.e. a counter-offer.
-// It never echoes the client's requested revision back as if it were supported
-// (never advertise a revision this server does not implement). The JSON-RPC
-// Invalid-params error -32602 is reserved solely for a malformed request body or
-// a present-but-non-string protocolVersion, which are protocol errors rather than
-// a version this server could ever agree to speak.
+// stance). A well-formed request naming a non-empty protocolVersion — matching,
+// older, newer, or an otherwise-unknown revision — is met with a SUCCESSFUL
+// result advertising the one revision this server actually implements
+// (2025-06-18), i.e. a counter-offer. It never echoes the client's requested
+// revision back as if it were supported (never advertise a revision this server
+// does not implement). The JSON-RPC Invalid-params error -32602 is returned for
+// a missing or empty protocolVersion, for a present-but-non-string
+// protocolVersion, or for a body that is not a JSON object — none of which name
+// a revision this server could ever agree to speak. The missing/empty edge is an
+// explicit fail-closed hardening beyond the 2025-06-18 counter-offer floor
+// (DEC-12a3ff57db), not a spec mandate; the well-formed counter-offer path is
+// preserved and must not be weakened to satisfy it.
 func (s *Server) initialize(id json.RawMessage, params json.RawMessage) *rpcResponse {
-	// Distinguish ABSENT params (or an empty protocolVersion) from a PRESENT but
-	// malformed/non-string protocolVersion field. Absent/empty requests proceed to
-	// the counter-offer; a body that is not a JSON object, or whose protocolVersion
-	// is not a string, is a genuine Invalid-params error and must never reach the
-	// success path.
-	if len(bytes.TrimSpace(params)) > 0 {
-		var fields map[string]json.RawMessage
-		if json.Unmarshal(params, &fields) != nil {
-			return s.err(id, codeInvalidParams, "Invalid params: initialize body must be a JSON object", nil)
-		}
-		if raw, ok := fields["protocolVersion"]; ok {
-			var requested string
-			if json.Unmarshal(raw, &requested) != nil {
-				return s.err(id, codeInvalidParams, "Invalid params: protocolVersion must be a string", nil)
-			}
-			// A well-formed but unsupported revision (requested != "") is answered
-			// below by the counter-offer, exactly like a matching or absent one.
-		}
+	// A protocolVersion is required, must be a string, and must be non-empty.
+	// Absent params, a non-object body, a missing field, an empty string, or a
+	// non-string value are all Invalid-params; only a well-formed non-empty
+	// revision proceeds to the counter-offer (or matching success) below.
+	if len(bytes.TrimSpace(params)) == 0 {
+		return s.err(id, codeInvalidParams, "Invalid params: initialize requires a protocolVersion", nil)
 	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(params, &fields) != nil {
+		return s.err(id, codeInvalidParams, "Invalid params: initialize body must be a JSON object", nil)
+	}
+	raw, ok := fields["protocolVersion"]
+	if !ok {
+		return s.err(id, codeInvalidParams, "Invalid params: initialize requires a protocolVersion", nil)
+	}
+	var requested string
+	if json.Unmarshal(raw, &requested) != nil {
+		return s.err(id, codeInvalidParams, "Invalid params: protocolVersion must be a string", nil)
+	}
+	if strings.TrimSpace(requested) == "" {
+		return s.err(id, codeInvalidParams, "Invalid params: protocolVersion must be a non-empty string", nil)
+	}
+	// A matching, older, newer, or otherwise-unknown well-formed revision is
+	// answered by the counter-offer below, which always advertises only
+	// ProtocolVersion and never echoes requested.
 	return s.result(id, map[string]any{
 		"protocolVersion": ProtocolVersion,
 		"capabilities": map[string]any{

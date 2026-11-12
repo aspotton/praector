@@ -122,9 +122,11 @@ registration/filesystem changes.
 
 Protocol honesty and local security live at deterministic seams: `mcp/server.go`
 advertises only the implemented protocol revision and answers a well-formed
-`initialize` for any other revision with a legacy counter-offer — a successful
-result advertising the implemented revision, never echoing the client's request
-(Invalid-params is reserved for a malformed/non-string `protocolVersion`);
+`initialize` naming a non-empty older/newer/unknown revision with a counter-offer —
+a successful result advertising the implemented revision, never echoing the
+client's request (Invalid-params is returned for a missing/empty, non-string, or
+malformed `protocolVersion`, the missing/empty edge being a documented fail-closed
+hardening);
 `mcp/transport.go` requires a matching `MCP-Protocol-Version` header on
 post-`initialize` requests and validates the request Host/Origin as a loopback
 authority before dispatch (HTTP 400 / 403 respectively), rejecting a foreign,

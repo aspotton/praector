@@ -581,10 +581,12 @@ The design leaves room for later additions without making them current dependenc
     and never push, merge, or implicitly accept, while `cleanup` performs real
     worktree/branch removal and `init` performs real project registration.
     The listener advertises only the single MCP protocol revision it implements
-    and meets a well-formed request for any other revision with a legacy
-    **counter-offer** — a successful result advertising the implemented revision,
-    never echoing an unsupported one (Invalid-params is reserved for a malformed
-    version), requires a matching `MCP-Protocol-Version` header on
+    and meets a well-formed request naming a non-empty older/newer/unknown
+    revision with a **counter-offer** — a successful result advertising the
+    implemented revision, never echoing an unsupported one (Invalid-params is
+    reserved for a missing/empty/non-string/malformed version, the missing/empty
+    edge being a documented fail-closed hardening), requires a matching
+    `MCP-Protocol-Version` header on
     post-`initialize` requests (HTTP 400 otherwise), and — because it is
     loopback-only and unauthenticated — validates each request's Host/Origin as a
     loopback authority before dispatch (HTTP 403 on a foreign, literal `null`, or
