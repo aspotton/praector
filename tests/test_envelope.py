@@ -2,6 +2,9 @@ from praector.envelope import build_task_envelope
 
 
 class FakeStore:
+    def research_ancestors(self, task_id):
+        return []
+
     def dependencies(self, task_id):
         return [{
             "id": "T-DEP", "profile": "research", "title": "Research", "status": "COMPLETE",
@@ -129,3 +132,38 @@ def test_read_only_profiles_get_workspace_hygiene_contract_but_implement_does_no
     implement = _envelope_for_profile("implement")
     assert "Treat **no net workspace mutation**" not in implement
     assert "write capability within its assigned implementation scope" in implement
+
+
+class ResearchConstraintStore(FakeStore):
+    def research_ancestors(self, task_id):
+        return self.dependencies(task_id)
+
+    def dependencies(self, task_id):
+        return [{
+            "id": "T-R", "profile": "research", "title": "Fresh external research preflight", "status": "COMPLETE",
+            "objective": "Research MCP", "result_json": (
+                '{"summary":"verified","claims":[{"id":"C1","claim":"initialize requires version",'
+                '"source":"spec","authority":"official specification","normative_level":"MUST",'
+                '"planner_directive":"Missing protocolVersion MUST return Invalid Params.",'
+                '"directive_effect":"preserve","confidence":"high"}]}'
+            ),
+        }]
+
+    def list_tasks(self, collection_id):
+        return []
+
+    def list_edges(self, collection_id):
+        return []
+
+
+def test_envelope_projects_inherited_research_constraints():
+    prompt = build_task_envelope(
+        ResearchConstraintStore(),
+        {"id": "PRJ-1", "name": "demo", "root_path": "/repo", "base_branch": "main"},
+        {"id": "COL-1", "title": "MCP", "objective": "Implement current MCP protocol support", "status": "RUNNING"},
+        {"id": "T-C", "profile": "critic", "title": "Critic", "objective": "Critique", "reason": "policy", "workspace_mode": "collection"},
+        {"id": "A-C", "attempt_no": 1},
+    )
+    assert '"inherited_research_constraints"' in prompt
+    assert '"claim_id": "C1"' in prompt
+    assert "Missing protocolVersion MUST return Invalid Params." in prompt

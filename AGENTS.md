@@ -42,7 +42,7 @@ Preserve these unless the change explicitly redesigns them and updates the archi
 - A blocking delegation ends the current attempt and later resumes the same durable Task in a fresh attempt/session.
 - Every completed implementation needs independent passing review before acceptance.
 - Completed reviews require an explicit `verdict: pass|fail`. A read-only capability violation or missing reviewer verdict is an execution/protocol failure, not a semantic rejection: retry the same durable Task within its attempt budget before any graph-level repair or coordinator escalation.
-- Deterministic planning policy is a safety floor: non-trivial implementation work requires `plan_review`, and higher-risk categories such as external integration may also require `critic`; mandatory gates may not be waived by coordinator preference.
+- Deterministic planning policy is a safety floor: implementation receives repository exploration and critic preflight; freshness-sensitive external work also receives fresh research before critique; non-trivial/higher-risk work requires `plan_review`; mandatory gates may not be waived by coordinator preference.
 - `COMPLETE` does not mean merged to the base branch. Pull-request delivery and direct acceptance are explicit, separate, and audited.
 - External PRs use the Collection integration branch as the head; never publish an individual Task branch as the Collection PR boundary.
 - Safe acceptance is fast-forward-only by default.
@@ -178,6 +178,10 @@ A `WAITING` coordinator has already handed control to a blocking child/review an
 `depends_on` is an acyclic DAG invariant. Before any hard edge is committed, Praector checks whether the dependent already reaches the proposed prerequisite transitively; if so the edge is rejected. This applies to ordinary graph mutations and to the atomic initial edge batch published with a new task.
 
 `plan_review` remains a pre-write gate over durable implementation contracts. It may wait for prerequisite evidence (`explore`, `critic`, `research`, `advise`) but must not depend on `implement` execution or on a coordinator that is itself waiting, directly or transitively, on that review. Reconciliation repairs legacy coordinator/review cycles and collapses multiple unstarted final plan reviews to one newest surviving gate, rewiring waiting coordinators and implementations to that gate.
+
+Fresh external evidence is a first-class planning input. When `planning_policy.research_required` is true, Praector creates fresh research alongside exploration, requires the critic to consume both, carries structured source/claim/oracle provenance in Task Envelopes, and includes completed research evidence in material-plan fingerprints. `RESEARCH_REQUIRED` is the durable escape hatch for critic/plan-review/review/advise uncertainty; workers must not substitute model memory for current evidence. Project capability `[capabilities] current_external_research = false` intentionally blocks such work.
+
+Task attempts also record input lineage. If material planning/research/prerequisite lineage changes while implementation is running, its independent review is promoted to a reconciliation review against the current accepted state; do not bypass `RECONCILIATION_REQUIRED` by treating the old implementation assumptions as authoritative.
 
 ### Semantic review repair lineage
 

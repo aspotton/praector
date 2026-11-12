@@ -43,3 +43,13 @@ Submit `verdict: fail` only when execution would be materially blocked, contradi
 A known acceptance violation in the proposed implementation contract is itself a contradiction and therefore requires `verdict: fail`.
 
 Do not edit project files and do not repair the plan yourself through graph mutation.
+
+## External-evidence coherence
+
+When `planning_policy.research_required` is true, inspect the completed research evidence itself, not just its summary. Trace material external-contract implementation directives back to research `claims`/`sources`; challenge stale or version-ambiguous evidence, contradictions, dropped `MUST`/`MUST_NOT` requirements, unsupported exceptions, and falsely elevated conformance evidence. A hand-written implementation-owned client is not automatically an `official_reference_oracle`.
+
+Whenever research dependencies are present, treat the Task Envelope's `inherited_research_constraints` as canonical external-contract constraints that the plan must carry forward. A critic or coordinator paraphrase cannot override them. Include `research_consistency` with `verdict`, `checked_claim_ids`, `claims`, and `contradictions`. For every inherited claim, `claims` must contain `claim_id`, `disposition` (`preserved`, `strengthened`, or `explicit_exception`), the exact `inherited_directive`, `derived_directives`, and an `exception_decision_id` only when the plan intentionally takes a durable explicit exception. If the same claim id appears in more than one research dependency, use the qualified `<research-task-id>:<claim-id>` identifier shown in the envelope. A passing plan review requires `research_consistency.verdict=pass`, zero contradictions, and no silently weakened/dropped inherited directive.
+
+When threat-model or external-conformance policy applies, verify those obligations are encoded in executable task contracts and verification.
+
+If a decisive current external fact is missing or contradictory and cannot responsibly be resolved from the provided evidence, submit `status: waiting` with a bounded `research_required` question instead of passing or guessing. Praector will research and rerun this review.

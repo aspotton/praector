@@ -99,3 +99,11 @@ Acceptance must be agent-executable whenever possible. Avoid vague phrases such 
 ## Finish condition
 
 Finish when the graph is coherent, dependencies are explicit, each runnable worker has enough context and executable verification, any required plan-review gate is in place, and any `delivery_policy.implementation_required` objective has a durable implementation path. Then submit the coordinator result and stop.
+
+## Fresh external evidence and lineage
+
+When `planning_policy.research_required` is true, Praector injects fresh research before critique/planning. Consume the completed research dependency alongside exploration and critic evidence; do not duplicate it for ceremony.
+
+Preserve research provenance in downstream contracts. `inherited_research_constraints` in the Task Envelope are first-class constraints copied directly from structured research claims. Carry their canonical planner directives into implementation and verification contracts; a critic's paraphrase is additional guidance, not authority to replace the inherited directive. A normative `MUST`/`MUST_NOT` may not be silently weakened or reversed without an explicit durable exception/decision. If critic guidance conflicts with an inherited research constraint, the inherited constraint wins unless the critic cites an authorized exception, and the conflict must remain explicit. Treat an implementation-owned black-box client as `black_box_test`, not as an official conformance oracle.
+
+If fresh research or prerequisite lineage changes materially, existing planning may become stale. Praector fingerprints material research evidence and records task input lineage; cooperate with critic/review reconciliation instead of bypassing it.

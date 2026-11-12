@@ -1000,19 +1000,127 @@ func (s *Store) CriticRevalidationState(cid string) (Row, error) {
 	if err != nil {
 		return nil, err
 	}
+	tasksForCompat, err := s.ListTasks(cid)
+	if err != nil {
+		return nil, err
+	}
+	edgesForCompat, err := s.ListEdges(cid)
+	if err != nil {
+		return nil, err
+	}
+	collForCompat, err := s.GetCollection(cid)
+	if err != nil {
+		return nil, err
+	}
+	v021 := MaterialPlanFingerprintV021(S(collForCompat, "objective"), tasksForCompat, edgesForCompat, false)
+	v021Legacy := MaterialPlanFingerprintV021(S(collForCompat, "objective"), tasksForCompat, edgesForCompat, true)
 	var base Row
 	if latest != nil {
 		base, _ = s.CriticPlanBaseline(S(latest, "id"))
 	}
 	sealed := S(base, "fingerprint")
 	compatible := ""
-	if sealed != "" && sealed != cur && sealed == legacy {
-		compatible = "legacy_raw_base_commit"
+	if sealed != "" && sealed != cur {
+		switch {
+		case sealed == legacy:
+			compatible = "legacy_raw_base_commit"
+		case sealed == v021:
+			compatible = "v0.2.1_material_plan"
+		case sealed == v021Legacy:
+			compatible = "v0.2.1_legacy_raw_base_commit"
+		}
 	}
 	return Row{"latest_critic_task_id": S(latest, "id"), "latest_critic_status": S(latest, "status"), "current_material_plan_fingerprint": cur, "sealed_fingerprint": sealed, "baseline_source": S(base, "source"), "compatible_via": nullable(compatible), "stale": latest != nil && sealed != "" && sealed != cur && compatible == ""}, nil
 }
 func (s *Store) Dependencies(tid string) (Rows, error) {
 	return s.Query("SELECT t.* FROM task_edges e JOIN tasks t ON t.id=e.from_task_id WHERE e.to_task_id=" + SQLLiteral(tid) + " AND e.relation='depends_on' ORDER BY e.created_at")
+}
+
+// ResearchAncestors returns every completed research Task reachable through the
+// hard dependency DAG. Research constraints are lineage properties: an
+// implementation that depends on a plan review which depends on research must
+// inherit that research even when the research Task is not a direct dependency.
+func (s *Store) ResearchAncestors(tid string) (Rows, error) {
+	seen := map[string]bool{tid: true}
+	queue := []string{tid}
+	byID := map[string]Row{}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		deps, err := s.Dependencies(cur)
+		if err != nil {
+			return nil, err
+		}
+		for _, dep := range deps {
+			id := S(dep, "id")
+			if id == "" {
+				continue
+			}
+			if S(dep, "profile") == "research" && S(dep, "status") == TaskComplete {
+				dep["result"] = JSONMap(S(dep, "result_json"))
+				byID[id] = dep
+			}
+			if !seen[id] {
+				seen[id] = true
+				queue = append(queue, id)
+			}
+		}
+	}
+	out := make(Rows, 0, len(byID))
+	for _, row := range byID {
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := S(out[i], "created_at"), S(out[j], "created_at")
+		if a == b {
+			return S(out[i], "id") < S(out[j], "id")
+		}
+		return a < b
+	})
+	return out, nil
+}
+
+// researchAncestorsLocked is the claim-time variant used while the Store lock
+// is already held. It mirrors ResearchAncestors without recursively acquiring
+// the filesystem lock.
+func (s *Store) researchAncestorsLocked(tid string) (Rows, error) {
+	seen := map[string]bool{tid: true}
+	queue := []string{tid}
+	byID := map[string]Row{}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		deps, err := s.queryLocked("SELECT t.* FROM task_edges e JOIN tasks t ON t.id=e.from_task_id WHERE e.to_task_id=" + SQLLiteral(cur) + " AND e.relation='depends_on' ORDER BY e.created_at")
+		if err != nil {
+			return nil, err
+		}
+		for _, dep := range deps {
+			id := S(dep, "id")
+			if id == "" {
+				continue
+			}
+			if S(dep, "profile") == "research" && S(dep, "status") == TaskComplete {
+				dep["result"] = JSONMap(S(dep, "result_json"))
+				byID[id] = dep
+			}
+			if !seen[id] {
+				seen[id] = true
+				queue = append(queue, id)
+			}
+		}
+	}
+	out := make(Rows, 0, len(byID))
+	for _, row := range byID {
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := S(out[i], "created_at"), S(out[j], "created_at")
+		if a == b {
+			return S(out[i], "id") < S(out[j], "id")
+		}
+		return a < b
+	})
+	return out, nil
 }
 func (s *Store) Dependents(tid string) (Rows, error) {
 	return s.Query("SELECT t.* FROM task_edges e JOIN tasks t ON t.id=e.to_task_id WHERE e.from_task_id=" + SQLLiteral(tid) + " AND e.relation='depends_on' ORDER BY e.created_at")
@@ -1278,6 +1386,10 @@ func (s *Store) SetTaskStatus(tid, status, msg string) error {
 	return s.Mutate("UPDATE tasks SET status="+SQLLiteral(status)+",updated_at="+SQLLiteral(UTCNow())+" WHERE id="+SQLLiteral(tid), msg)
 }
 func (s *Store) SubmitResult(tid string, result Row) (Row, error) {
+	before, err := s.GetTask(tid)
+	if err != nil {
+		return nil, err
+	}
 	st := strings.ToLower(strings.TrimSpace(S(result, "status")))
 	if st == "" {
 		st = "complete"
@@ -1286,6 +1398,90 @@ func (s *Store) SubmitResult(tid string, result Row) (Row, error) {
 	to, ok := mapping[st]
 	if !ok {
 		return nil, errors.New("result status must be one of: complete, waiting, failed")
+	}
+	if S(before, "profile") == "research" && (st == "complete" || st == "completed") {
+		strict := strings.Contains(strings.ToLower(S(before, "title")), "fresh external research") || strings.Contains(strings.ToLower(S(before, "reason")), "fresh external evidence") || strings.HasPrefix(strings.ToLower(S(before, "title")), "research requested by")
+		if strict {
+			collection, e := s.GetCollection(S(before, "collection_id"))
+			if e != nil {
+				return nil, e
+			}
+			policy := ClassifyPlanningPolicy(S(collection, "objective"))
+			if e := ValidateDeterministicResearchResult(result, policy.ExternalConformanceRequired); e != nil {
+				return nil, e
+			}
+			if exceptionIDs := ResearchExceptionDecisionIDs(result); len(exceptionIDs) > 0 {
+				decisions, e := s.ListDecisions(S(before, "project_id"), S(before, "collection_id"))
+				if e != nil {
+					return nil, e
+				}
+				known := map[string]bool{}
+				for _, decision := range decisions {
+					known[S(decision, "id")] = true
+				}
+				for _, decisionID := range exceptionIDs {
+					if !known[decisionID] {
+						return nil, fmt.Errorf("research exception_decision_id %s is not a durable decision in this Collection", decisionID)
+					}
+				}
+			}
+		}
+	}
+	if st == "complete" || st == "completed" {
+		profile := S(before, "profile")
+		collection, e := s.GetCollection(S(before, "collection_id"))
+		if e != nil {
+			return nil, e
+		}
+		policy := ClassifyPlanningPolicy(S(collection, "objective"))
+		if profile == "critic" || profile == "plan_review" || profile == "review" {
+			researchDeps, e := s.ResearchAncestors(tid)
+			if e != nil {
+				return nil, e
+			}
+			if len(researchDeps) > 0 {
+				requirePass := (profile == "plan_review" || profile == "review") && strings.ToLower(strings.TrimSpace(S(result, "verdict"))) == "pass"
+				if e := ValidateResearchConsumerResult(result, researchDeps, requirePass); e != nil {
+					return nil, e
+				}
+				if exceptionIDs := ResearchConsumerExceptionDecisionIDs(result); len(exceptionIDs) > 0 {
+					decisions, e := s.ListDecisions(S(before, "project_id"), S(before, "collection_id"))
+					if e != nil {
+						return nil, e
+					}
+					known := map[string]bool{}
+					for _, decision := range decisions {
+						known[S(decision, "id")] = true
+					}
+					for _, decisionID := range exceptionIDs {
+						if !known[decisionID] {
+							return nil, fmt.Errorf("research consistency exception_decision_id %s is not a durable decision in this Collection", decisionID)
+						}
+					}
+				}
+			}
+		}
+		if profile == "review" && policy.ExternalConformanceRequired {
+			if e := ValidateExternalConformanceReviewResult(result); e != nil {
+				return nil, e
+			}
+			if decisionID := strings.TrimSpace(S(result, "oracle_exception_decision_id")); decisionID != "" {
+				decisions, e := s.ListDecisions(S(before, "project_id"), S(before, "collection_id"))
+				if e != nil {
+					return nil, e
+				}
+				found := false
+				for _, decision := range decisions {
+					if S(decision, "id") == decisionID {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return nil, fmt.Errorf("oracle_exception_decision_id %s is not a durable decision in this Collection", decisionID)
+				}
+			}
+		}
 	}
 	if err := s.Mutate("UPDATE tasks SET status="+SQLLiteral(to)+",result_json="+SQLLiteral(JSONDumps(result))+",updated_at="+SQLLiteral(UTCNow())+" WHERE id="+SQLLiteral(tid), "task "+tid+": result "+strings.ToLower(to)); err != nil {
 		return nil, err
@@ -1542,6 +1738,18 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 		if S(c, "status") != TaskComplete {
 			return false, nil
 		}
+		if policy.ResearchRequired {
+			research, e := s.researchAncestorsLocked(S(c, "id"))
+			if e != nil {
+				return false, e
+			}
+			if len(research) == 0 {
+				return false, nil
+			}
+			if e := ValidateResearchConsumerResult(JSONMap(S(c, "result_json")), research, false); e != nil {
+				return false, nil
+			}
+		}
 		ed, err := s.queryLocked("SELECT 1 AS ok FROM task_edges WHERE from_task_id=" + SQLLiteral(S(c, "id")) + " AND to_task_id=" + SQLLiteral(S(task, "id")) + " AND relation='depends_on' LIMIT 1")
 		if err != nil || len(ed) == 0 {
 			return false, err
@@ -1575,6 +1783,22 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 	if S(review, "status") != TaskComplete || S(review, "updated_at") < S(task, "created_at") {
 		return false, nil
 	}
+	reviewResult := JSONMap(S(review, "result_json"))
+	if strings.ToLower(strings.TrimSpace(S(reviewResult, "verdict"))) != "pass" {
+		return false, nil
+	}
+	if policy.ResearchRequired {
+		research, e := s.researchAncestorsLocked(S(review, "id"))
+		if e != nil {
+			return false, e
+		}
+		if len(research) == 0 {
+			return false, nil
+		}
+		if e := ValidateResearchConsumerResult(reviewResult, research, true); e != nil {
+			return false, nil
+		}
+	}
 	edge, err := s.queryLocked("SELECT 1 AS ok FROM task_edges WHERE from_task_id=" + SQLLiteral(S(review, "id")) + " AND to_task_id=" + SQLLiteral(S(task, "id")) + " AND relation='depends_on' LIMIT 1")
 	if err != nil || len(edge) == 0 {
 		return false, err
@@ -1590,6 +1814,18 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 		c := crit[len(crit)-1]
 		if S(c, "status") != TaskComplete {
 			return false, nil
+		}
+		if policy.ResearchRequired {
+			research, er := s.researchAncestorsLocked(S(c, "id"))
+			if er != nil {
+				return false, er
+			}
+			if len(research) == 0 {
+				return false, nil
+			}
+			if er := ValidateResearchConsumerResult(JSONMap(S(c, "result_json")), research, false); er != nil {
+				return false, nil
+			}
 		}
 		base, er := s.criticPlanBaselineLocked(S(c, "id"))
 		if er != nil || base == nil || S(base, "fingerprint") == "" {
@@ -1801,6 +2037,21 @@ func (s *Store) Event(pid, cid, tid, aid, eventType string, payload any) error {
 	q := fmt.Sprintf("INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", SQLLiteral(MakeID("EVT")), nullString(pid), nullString(cid), nullString(tid), nullString(aid), SQLLiteral(eventType), SQLLiteral(JSONDumps(payload)), SQLLiteral(UTCNow()))
 	return s.Mutate(q, "")
 }
+func (s *Store) TaskInputLineage(tid string) (Row, error) {
+	r, err := s.Query("SELECT payload_json,attempt_id,created_at FROM events WHERE task_id=" + SQLLiteral(tid) + " AND event_type='TASK_INPUT_LINEAGE' ORDER BY created_at DESC LIMIT 1")
+	if err != nil || len(r) == 0 {
+		return nil, err
+	}
+	p := JSONMap(S(r[0], "payload_json"))
+	if _, ok := p["attempt_id"]; !ok {
+		p["attempt_id"] = r[0]["attempt_id"]
+	}
+	if _, ok := p["created_at"]; !ok {
+		p["created_at"] = r[0]["created_at"]
+	}
+	return p, nil
+}
+
 func (s *Store) EventsForCollection(cid string, limit int) (Rows, error) {
 	return s.Query("SELECT * FROM events WHERE collection_id=" + SQLLiteral(cid) + " ORDER BY created_at DESC LIMIT " + strconv.Itoa(limit))
 }

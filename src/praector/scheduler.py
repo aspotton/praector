@@ -15,8 +15,19 @@ from .db import DependencyCycleError, DoltStore
 from .envelope import build_task_envelope
 from .harness import create_harness
 from .models import AttemptStatus, TaskStatus
-from .planning_policy import classify_delivery_policy, classify_planning_policy, material_plan_fingerprint
+from .planning_policy import (
+    classify_delivery_policy, classify_planning_policy, dependency_lineage_digest, material_plan_fingerprint, material_plan_fingerprint_v021,
+    validate_research_consumer_result,
+)
 from .workspace import GitWorkspace
+
+
+class ResearchCapabilityError(RuntimeError):
+    def __init__(self, collection_id: str):
+        super().__init__(
+            f"collection {collection_id} requires fresh external research, but project capability current_external_research=false"
+        )
+        self.collection_id = collection_id
 
 
 class Scheduler:
@@ -73,6 +84,44 @@ class Scheduler:
             "max_attempts_per_task": cfg.limits.max_attempts_per_task,
         }
 
+    def _record_task_input_lineage(self, task: dict[str, Any], attempt: dict[str, Any]) -> None:
+        fingerprint = self.store.material_plan_fingerprint(task["collection_id"])
+        dependencies = self.store.dependencies(task["id"])
+        self.store.event(
+            task["project_id"], task["collection_id"], task["id"], attempt["id"],
+            "TASK_INPUT_LINEAGE",
+            {
+                "material_plan_fingerprint": fingerprint,
+                "dependency_lineage_digest": dependency_lineage_digest(dependencies),
+                "dependency_ids": [str(dep.get("id") or "") for dep in dependencies],
+                "profile": str(task.get("profile") or ""),
+            },
+        )
+
+    def _task_input_lineage_changed(self, task: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+        lineage_reader = getattr(self.store, "task_input_lineage", None)
+        if not callable(lineage_reader):
+            return None, False
+        start = lineage_reader(task["id"])
+        if not start:
+            return None, False
+        fingerprint = self.store.material_plan_fingerprint(task["collection_id"])
+        dependencies = self.store.dependencies(task["id"])
+        current_dep = dependency_lineage_digest(dependencies)
+        changed = (
+            str(start.get("material_plan_fingerprint") or "") != fingerprint
+            or str(start.get("dependency_lineage_digest") or "") != current_dep
+        )
+        if not changed:
+            return start, False
+        return {
+            "start_material_plan_fingerprint": str(start.get("material_plan_fingerprint") or ""),
+            "current_material_plan_fingerprint": fingerprint,
+            "start_dependency_lineage_digest": str(start.get("dependency_lineage_digest") or ""),
+            "current_dependency_lineage_digest": current_dep,
+            "attempt_id": str(start.get("attempt_id") or ""),
+        }, True
+
     def _material_plan_fingerprint(
         self, collection: dict[str, Any], tasks: list[dict[str, Any]], *, legacy_raw_base_commit: bool = False
     ) -> str:
@@ -111,7 +160,16 @@ class Scheduler:
         legacy_fingerprint = self._material_plan_fingerprint(
             collection, active, legacy_raw_base_commit=True
         )
-        if str(baseline.get("fingerprint")) in {current_fingerprint, legacy_fingerprint}:
+        edges = self.store.list_edges(collection["id"])
+        v021_fingerprint = material_plan_fingerprint_v021(
+            str(collection.get("objective") or ""), active, edges
+        )
+        v021_legacy_fingerprint = material_plan_fingerprint_v021(
+            str(collection.get("objective") or ""), active, edges, legacy_raw_base_commit=True
+        )
+        if str(baseline.get("fingerprint")) in {
+            current_fingerprint, legacy_fingerprint, v021_fingerprint, v021_legacy_fingerprint
+        }:
             return critic, False
 
         # Let a currently-running/ready coordinator finish publishing its repair
@@ -130,6 +188,7 @@ class Scheduler:
             return critic, False
 
         parent = next((task for task in reversed(active) if task["profile"] == "coordinator"), None)
+        research_deps = [task["id"] for task in active if task["profile"] == "research"]
         fresh_critic, created = self.store.create_task(
             project_id=collection["project_id"],
             collection_id=collection["id"],
@@ -137,7 +196,8 @@ class Scheduler:
             title="Revalidate materially changed plan",
             objective=(
                 "Re-run the independent planning preflight because the durable material plan changed after the previous critic was sealed. "
-                "Inspect the CURRENT implementation/research/advice contracts and dependencies. Identify any new hidden requirements, "
+                "Inspect the CURRENT implementation/research/advice contracts and dependencies. Consume all current research dependencies and explicitly "
+                "check their structured claim ids for evidence-to-directive consistency. Identify any new hidden requirements, "
                 "security/state/concurrency hazards, scope changes, assumptions, and executable QA changes introduced by the new plan. "
                 "Return concrete MUST/MUST NOT/VERIFY guidance. Do not implement or mutate the graph."
             ),
@@ -147,6 +207,7 @@ class Scheduler:
             ),
             parent_task_id=parent["id"] if parent else None,
             requested_by_task_id=None,
+            depends_on=research_deps,
             workspace_mode="collection",
             depth=(int(parent.get("depth") or 0) + 1) if parent else 1,
             allow_dedupe=False,
@@ -203,6 +264,55 @@ class Scheduler:
         )
         return fresh_critic, True
 
+    @staticmethod
+    def _research_request_question(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            return str(value.get("question") or value.get("query") or "").strip()
+        return ""
+
+    def _enforce_research_requests(self, collection_id: str) -> bool:
+        tasks = self.store.list_tasks(collection_id)
+        collection = self.store.get_collection(collection_id)
+        policy = classify_planning_policy(collection.get("objective") or "")
+        changed = False
+        for caller in tasks:
+            if caller.get("status") != TaskStatus.WAITING.value or caller.get("profile") not in {"critic", "review", "plan_review", "advise"}:
+                continue
+            result = caller.get("result") or {}
+            requests = result.get("research_required")
+            if not isinstance(requests, list) or not requests:
+                continue
+            if any(task.get("profile") == "research" and task.get("requested_by_task_id") == caller["id"] and task.get("status") not in {TaskStatus.CANCELLED.value, TaskStatus.SUPERSEDED.value} for task in tasks):
+                continue
+            project_cfg = project_config_from_row(self.store.get_project(collection["project_id"]))
+            if not project_cfg.capabilities.current_external_research:
+                raise ResearchCapabilityError(collection_id)
+            question = self._research_request_question(requests[0]) or "Resolve the externally-verifiable uncertainty identified by the requesting task."
+            self.store.create_task(
+                project_id=collection["project_id"], collection_id=collection_id,
+                profile="research", title=f"Research requested by {caller['id']}",
+                objective=(
+                    f"Resolve this bounded fresh external research question before {caller['profile']} {caller['id']} resumes: {question} "
+                    "Use current authoritative retrieval rather than model memory. Return structured as_of, sources, claims, verification_oracles, risks, unresolved, summary. "
+                    "Each source must include id, authority, authority_level, reference, and version/publication_date when available; authority_level must be one of "
+                    "official_specification, official_standard, official_release_notes, official_sdk, first_party, vendor_documentation, secondary, community. "
+                    "Each material claim must have a stable id, reference one source id, and include claim, authority, normative_level, planner_directive, directive_effect, confidence. "
+                    "Any legacy top-level planner_directives must exactly match structured claim planner_directives. Classify verification oracles and surface contradictions explicitly."
+                ),
+                reason=f"Structured RESEARCH_REQUIRED escalation from {caller['profile']}",
+                parent_task_id=caller["id"], requested_by_task_id=caller["id"], workspace_mode="collection",
+                depth=int(caller.get("depth") or 0)+1, allow_dedupe=False,
+                spawned_by_task_id=caller["id"], blocking_caller_task_id=caller["id"],
+            )
+            self.store.event(collection["project_id"], collection_id, caller["id"], None, "RESEARCH_REQUIRED", {
+                "requesting_profile": caller["profile"], "question": question,
+                "external_conformance_required": policy.external_conformance_required,
+            })
+            changed = True
+        return changed
+
     def _enforce_planning_policy(self, collection_id: str) -> bool:
         """Ensure deterministic discovery, critique, and pre-write planning gates.
 
@@ -212,7 +322,7 @@ class Scheduler:
         """
         collection = self.store.get_collection(collection_id)
         policy = classify_planning_policy(collection.get("objective") or "")
-        if not (policy.explore_required or policy.critic_required or policy.plan_review_required):
+        if not (policy.explore_required or policy.research_required or policy.critic_required or policy.plan_review_required):
             return False
 
         tasks = self.store.list_tasks(collection_id)
@@ -226,17 +336,23 @@ class Scheduler:
         # Implementation Collections begin with deterministic discovery and
         # critique before the coordinator shapes a material plan. Because this
         # runs during reconciliation it also applies to acceptance revisions.
-        latest_coordinator = next(
-            (
-                task for task in reversed(active)
-                if task["profile"] == "coordinator"
-                and task.get("title") in {"Initial coordination", "Acceptance revision"}
-                and task["status"] in {
-                    TaskStatus.PENDING.value, TaskStatus.READY.value, TaskStatus.WAITING.value,
-                }
-            ),
-            None,
-        )
+        def select_generation_coordinator(rows):
+            if collection.get("status") == "COMPLETE":
+                return None
+            return next(
+                (
+                    task for task in reversed(rows)
+                    if task["profile"] == "coordinator"
+                    and task.get("title") in {"Initial coordination", "Acceptance revision"}
+                    and (
+                        task["status"] in {TaskStatus.PENDING.value, TaskStatus.READY.value, TaskStatus.WAITING.value}
+                        or (policy.research_required and task["status"] == TaskStatus.COMPLETE.value)
+                    )
+                ),
+                None,
+            )
+
+        latest_coordinator = select_generation_coordinator(active)
         def latest_for_coordinator(profile: str):
             for task in reversed(active):
                 if task["profile"] != profile:
@@ -275,20 +391,138 @@ class Scheduler:
                 task for task in tasks
                 if task["status"] not in {TaskStatus.CANCELLED.value, TaskStatus.SUPERSEDED.value}
             ]
-            latest_coordinator = next(
-                (
-                    task for task in reversed(active)
-                    if task["profile"] == "coordinator"
-                    and task.get("title") in {"Initial coordination", "Acceptance revision"}
-                    and task["status"] in {
-                        TaskStatus.PENDING.value, TaskStatus.READY.value, TaskStatus.WAITING.value,
-                    }
-                ),
-                None,
-            )
+            latest_coordinator = select_generation_coordinator(active)
             latest_explore = latest_for_coordinator("explore")
 
+        latest_research = latest_for_coordinator("research")
+        if policy.research_required and latest_coordinator is not None and latest_research is None:
+            project_cfg = project_config_from_row(self.store.get_project(collection["project_id"]))
+            if not project_cfg.capabilities.current_external_research:
+                raise ResearchCapabilityError(collection_id)
+            parent_id = latest_coordinator["id"]
+            depth = int(latest_coordinator.get("depth") or 0) + 1
+            blocking = parent_id if latest_coordinator["status"] in {
+                TaskStatus.PENDING.value, TaskStatus.READY.value, TaskStatus.WAITING.value,
+            } else None
+            oracle_text = (
+                "Classify verification oracles as internal_test, black_box_test, independent_implementation, "
+                "official_reference_oracle, or live_provider_oracle."
+            )
+            if policy.external_conformance_required:
+                oracle_text += (
+                    " At least one authoritative independent oracle is required when practical; an implementation-owned "
+                    "hand-written client is black_box_test, not official conformance."
+                )
+            self.store.create_task(
+                project_id=collection["project_id"], collection_id=collection_id,
+                profile="research", title="Fresh external research preflight",
+                objective=(
+                    "Before critique/material planning, research the CURRENT external facts that can change correctness for this Collection. "
+                    "Use fresh retrieval from authoritative first-party/standards sources rather than model memory. Deterministic policy categories: "
+                    f"{', '.join(policy.categories)}. Return structured JSON with as_of, sources, claims, verification_oracles, risks, unresolved, and summary. "
+                    "Each source MUST be an object with id, authority, authority_level, reference, and version/publication_date when available; authority_level must be one of "
+                    "official_specification, official_standard, official_release_notes, official_sdk, first_party, vendor_documentation, secondary, community. "
+                    "Each material claim MUST have a stable id, MUST reference one source id, and MUST include claim, authority, normative_level (MUST/MUST_NOT/SHOULD/MAY/FACT/INFERENCE), "
+                    "planner_directive, directive_effect (preserve/strengthen/exception), confidence, and exception_decision_id when directive_effect=exception. "
+                    "Structured claims are authoritative; any legacy top-level planner_directives MUST exactly match claim planner_directives. "
+                    "Prefer current official specifications/standards, official release notes, official SDK/reference implementations, then other primary sources. "
+                    f"Explicitly surface source conflicts and version/date scope. {oracle_text} If no authoritative independent oracle is practical, state "
+                    "authoritative_oracle_unavailable_reason rather than misclassifying an implementation-owned black-box test. Do not implement or mutate the graph."
+                ),
+                reason="Deterministic planning policy: fresh external evidence is required before critique/planning.",
+                parent_task_id=parent_id, requested_by_task_id=parent_id,
+                workspace_mode="collection", depth=depth, allow_dedupe=False,
+                spawned_by_task_id=parent_id, blocking_caller_task_id=blocking,
+            )
+            changed = True
+            tasks = self.store.list_tasks(collection_id)
+            active = [task for task in tasks if task["status"] not in {TaskStatus.CANCELLED.value, TaskStatus.SUPERSEDED.value}]
+            latest_coordinator = select_generation_coordinator(active)
+            latest_explore = latest_for_coordinator("explore")
+            latest_research = latest_for_coordinator("research")
+
+        critic_objective = (
+            "Independently preflight the Collection objective before material planning. Consume completed repository exploration and fresh external research "
+            "as primary evidence when present; explicitly compare local reality to authoritative external requirements and challenge evidence->directive contradictions. "
+            "Deterministic policy categories: "
+            f"{', '.join(policy.categories) or 'implementation'}. Treat inherited_research_constraints as canonical: for every research claim, preserve the exact "
+            "inherited directive, strengthen it without replacing it, or cite a durable explicit exception. research_consistency.claims must record one disposition "
+            "per inherited claim. Identify hidden requirements, scope hazards, security/state/concurrency semantics, assumptions, executable QA directives, and any "
+            "acceptance contradiction. For network/security trust boundaries, explicitly threat-model exposure/bind behavior, authn/authz, origin/rebinding/CSRF-style "
+            "threats where applicable, secrets/non-disclosure, privilege boundaries, input validation, rate/bounds, and auditability. For external protocol/provider work, "
+            "require an authoritative independent oracle when practical and distinguish official reference evidence from implementation-owned black-box tests. Return "
+            "concrete MUST/MUST NOT/VERIFY guidance for the coordinator; do not implement or mutate the graph."
+        )
+
         latest_critic = latest_for_coordinator("critic")
+        if policy.research_required and latest_coordinator is not None and latest_critic is not None and latest_critic["status"] == TaskStatus.COMPLETE.value:
+            research_deps = self.store.research_ancestors(latest_critic["id"])
+            if research_deps:
+                result = latest_critic.get("result")
+                if not isinstance(result, dict):
+                    try:
+                        result = json.loads(latest_critic.get("result_json") or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        result = {}
+                try:
+                    validate_research_consumer_result(result or {}, research_deps, require_pass=False)
+                except ValueError as consistency_error:
+                    deps = []
+                    if latest_explore:
+                        deps.append(latest_explore["id"])
+                    if latest_research:
+                        deps.append(latest_research["id"])
+                    replacement_critic, _ = self.store.create_task(
+                        project_id=collection["project_id"], collection_id=collection_id,
+                        profile="critic", title="Revalidate inherited research constraints", objective=critic_objective,
+                        reason=(
+                            "Current planning policy requires per-claim inherited research dispositions; prior critic result is not valid under "
+                            f"the active generation contract: {consistency_error}"
+                        ),
+                        parent_task_id=latest_coordinator["id"], requested_by_task_id=latest_coordinator["id"],
+                        depends_on=deps, workspace_mode="collection", depth=int(latest_coordinator.get("depth") or 0) + 1, allow_dedupe=False,
+                    )
+                    self.store.supersede_task(
+                        latest_critic["id"], replacement_critic["id"],
+                        "Revalidate active-generation critic under the current inherited research-constraint contract.",
+                    )
+                    repair_coordinator_id = None
+                    if latest_coordinator["status"] == TaskStatus.COMPLETE.value:
+                        repair_coordinator, _ = self.store.create_task(
+                            project_id=collection["project_id"], collection_id=collection_id,
+                            profile="coordinator", title="Apply inherited research revalidation",
+                            objective=(
+                                f"Consume replacement critic {replacement_critic['id']} after engine-contract revalidation. "
+                                "Reconcile the CURRENT material task contracts against inherited_research_constraints. Remove or correct any "
+                                "task-objective prose that conflicts with canonical research directives. Preserve scope otherwise. Ensure a "
+                                "fresh final plan-review gate evaluates the reconciled graph before any write task runs."
+                            ),
+                            reason=(
+                                "The original planning coordinator had already completed before the stronger research-constraint contract was applied; "
+                                "a fresh coordinator must reconcile its material contracts."
+                            ),
+                            parent_task_id=replacement_critic["id"], requested_by_task_id=replacement_critic["id"],
+                            depends_on=[replacement_critic["id"]], workspace_mode="collection",
+                            depth=int(replacement_critic.get("depth") or 0) + 1, allow_dedupe=False,
+                        )
+                        repair_coordinator_id = repair_coordinator["id"]
+                    self.store.event(
+                        collection["project_id"], collection_id, latest_critic["id"], None,
+                        "RESEARCH_CONSISTENCY_REVALIDATION_REQUIRED",
+                        {
+                            "replacement_critic_task_id": replacement_critic["id"],
+                            "repair_coordinator_task_id": repair_coordinator_id,
+                            "reason": str(consistency_error),
+                        },
+                    )
+                    changed = True
+                    tasks = self.store.list_tasks(collection_id)
+                    active = [task for task in tasks if task["status"] not in {TaskStatus.CANCELLED.value, TaskStatus.SUPERSEDED.value}]
+                    latest_critic = next(
+                        (task for task in reversed(active) if task["profile"] == "critic" and task["status"] not in {TaskStatus.CANCELLED.value, TaskStatus.SUPERSEDED.value}),
+                        None,
+                    )
+
         if policy.critic_required and latest_coordinator is not None and latest_critic is None:
             parent_id = latest_coordinator["id"] if latest_coordinator else None
             depth = int(latest_coordinator.get("depth") or 0) + 1 if latest_coordinator else 1
@@ -297,17 +531,15 @@ class Scheduler:
                 TaskStatus.PENDING.value, TaskStatus.READY.value, TaskStatus.WAITING.value,
             }:
                 blocking = latest_coordinator["id"]
-            deps = [latest_explore["id"]] if latest_explore else []
+            deps = []
+            if latest_explore:
+                deps.append(latest_explore["id"])
+            if latest_research:
+                deps.append(latest_research["id"])
             self.store.create_task(
                 project_id=collection["project_id"], collection_id=collection_id,
                 profile="critic", title="Preflight implementation plan",
-                objective=(
-                    "Independently preflight the Collection objective before material planning. Consume the completed repository exploration "
-                    "as primary evidence when present. Deterministic policy categories: "
-                    f"{', '.join(policy.categories) or 'implementation'}. Identify hidden requirements, scope hazards, security/state/concurrency "
-                    "semantics, assumptions, executable QA directives, and any acceptance contradiction. Return concrete MUST/MUST NOT/VERIFY "
-                    "guidance for the coordinator; do not implement or mutate the graph."
-                ),
+                objective=critic_objective,
                 reason="Deterministic planning policy: every implementation Collection receives an independent critic.",
                 parent_task_id=parent_id, requested_by_task_id=parent_id,
                 depends_on=deps, workspace_mode="collection", depth=depth, allow_dedupe=False,
@@ -430,8 +662,36 @@ class Scheduler:
 
         critics = [task for task in active if task["profile"] == "critic"]
         critic = critics[-1] if critics else None
+        researches = [task for task in active if task["profile"] == "research"]
+        research_task = researches[-1] if researches else None
+        if policy.research_required and research_task is None:
+            project_cfg = project_config_from_row(self.store.get_project(collection["project_id"]))
+            if not project_cfg.capabilities.current_external_research:
+                raise ResearchCapabilityError(collection_id)
+            parent = next((task for task in reversed(active) if task["profile"] == "coordinator"), None)
+            research_task, _ = self.store.create_task(
+                project_id=collection["project_id"], collection_id=collection_id,
+                profile="research", title="Policy fresh external research",
+                objective=(
+                    f"Research current authoritative external facts required by this Collection before write work. Categories: {', '.join(policy.categories)}. "
+                    "Use fresh retrieval, not model memory. Return structured as_of, sources, claims, verification_oracles, risks, unresolved, summary. "
+                    "Sources require id, authority, authority_level, reference; claims require stable id, source, authority, normative_level, planner_directive, directive_effect, confidence. "
+                    "Structured claims are authoritative; any top-level planner_directives must exactly match claim directives. Distinguish black-box tests "
+                    "from official_reference_oracle/live_provider_oracle and surface contradictions explicitly. If no authoritative independent oracle is practical, "
+                    "state authoritative_oracle_unavailable_reason."
+                ),
+                reason="Deterministic planning policy: fresh external evidence required",
+                parent_task_id=parent["id"] if parent else None, requested_by_task_id=None,
+                workspace_mode="collection", depth=(int(parent.get("depth") or 0)+1) if parent else 1,
+                allow_dedupe=False,
+            )
+            researches.append(research_task)
+            changed = True
         if policy.critic_required and critic is None:
             parent = next((task for task in reversed(active) if task["profile"] == "coordinator"), None)
+            critic_deps = [task["id"] for task in researches]
+            if research_task is not None and research_task["id"] not in critic_deps:
+                critic_deps.append(research_task["id"])
             critic, critic_created = self.store.create_task(
                 project_id=collection["project_id"],
                 collection_id=collection_id,
@@ -439,7 +699,9 @@ class Scheduler:
                 title="Policy preflight critic",
                 objective=(
                     "Independently preflight the Collection objective and current work graph before write work begins. "
-                    f"Deterministic policy categories: {', '.join(policy.categories) or 'risk'}. "
+                    f"Deterministic policy categories: {', '.join(policy.categories) or 'risk'}. Consume fresh research when required and trace normative external requirements into MUST/MUST NOT/VERIFY guidance. "
+                    "Challenge evidence-to-directive contradictions and unsupported assumptions. For network/security work, perform an explicit threat-model challenge. "
+                    "For external protocols/providers, distinguish implementation-owned black-box tests from authoritative official/live conformance oracles. "
                     "Identify hidden requirements, security/state semantics, scope hazards, assumptions, executable QA directives, and any task contract that knowingly violates a Collection MUST/MUST NOT or acceptance requirement. "
                     "Treat known acceptance violations as planning blockers; do not accept a plan merely because a later review could catch or repair them. "
                     "Return concrete MUST/MUST NOT/VERIFY guidance for the planner and plan reviewer; do not implement or mutate the graph."
@@ -447,6 +709,7 @@ class Scheduler:
                 reason=f"Deterministic planning policy: {reason_text}",
                 parent_task_id=parent["id"] if parent else None,
                 requested_by_task_id=None,
+                depends_on=critic_deps,
                 workspace_mode="collection",
                 depth=(int(parent.get("depth") or 0) + 1) if parent else 1,
                 allow_dedupe=False,
@@ -492,6 +755,8 @@ class Scheduler:
             ]
             critics = [task for task in active if task["profile"] == "critic"]
             critic = critics[-1] if critics else critic
+            researches = [task for task in active if task["profile"] == "research"]
+            research_task = researches[-1] if researches else research_task
             plan_reviews = [task for task in active if task["profile"] == "plan_review"]
             plan_review = plan_reviews[-1] if plan_reviews else plan_review
             write_tasks = [
@@ -519,7 +784,14 @@ class Scheduler:
                 policy.critic_required and critic is not None
                 and (critic["status"] != TaskStatus.COMPLETE.value or str(critic.get("updated_at") or "") > reviewed_at)
             )
-            if reviewed_at < newest_write_created or reviewed_at < newest_coordinator_update or critic_not_included:
+            research_not_included = bool(
+                policy.research_required
+                and any(
+                    task["status"] != TaskStatus.COMPLETE.value or str(task.get("updated_at") or "") > reviewed_at
+                    for task in researches
+                )
+            )
+            if reviewed_at < newest_write_created or reviewed_at < newest_coordinator_update or critic_not_included or research_not_included:
                 plan_review = None
 
         # A plan review that depends on implementation is post-write review, not
@@ -536,6 +808,12 @@ class Scheduler:
         # it is itself blocked on this plan review.
         if plan_review and plan_review["status"] != TaskStatus.COMPLETE.value:
             review_deps = {dep["id"] for dep in self.store.dependencies(plan_review["id"])}
+            if policy.research_required:
+                for research in researches:
+                    if research["id"] not in review_deps:
+                        self.store.add_dependency(plan_review["id"], research["id"])
+                        review_deps.add(research["id"])
+                        changed = True
             if policy.critic_required and critic is not None and critic["id"] not in review_deps:
                 self.store.add_dependency(plan_review["id"], critic["id"])
                 review_deps.add(critic["id"])
@@ -597,8 +875,10 @@ class Scheduler:
         if policy.plan_review_required and plan_review is None and not active_coordinators:
             deps: list[str] = []
             if critic is not None:
-                deps.append(critic["id"]
-                )
+                deps.append(critic["id"])
+            for research in researches:
+                if research["id"] not in deps:
+                    deps.append(research["id"])
             parent = next(
                 (task for task in reversed(active) if task["profile"] == "coordinator"), None
             )
@@ -622,11 +902,11 @@ class Scheduler:
                 objective=(
                     "Independently review the current durable work graph before any implementation runs. "
                     f"Deterministic policy categories: {', '.join(policy.categories) or 'risk'}. "
-                    "Use completed critic directives as required input. Verify that implementation tasks are decision-complete, "
-                    "security/state semantics are explicit, dependencies are coherent, verification is executable, and executing "
-                    "the graph exactly as written can satisfy every Collection MUST/MUST NOT and acceptance requirement without "
-                    "knowingly requiring a later repair for an already-visible defect. Return verdict pass/fail; a known acceptance "
-                    "violation is a true blocker. Name at most three actionable blockers."
+                    "Use completed critic directives and required fresh research as authoritative planning inputs. Trace material external-contract directives back to research claims/sources; "
+                    "independently challenge contradictions, dropped MUST/MUST_NOT requirements, unsupported assumptions, stale evidence, and misclassified conformance oracles. "
+                    "Verify that implementation tasks are decision-complete, security/threat-model semantics are explicit, dependencies are coherent, verification is executable, and executing "
+                    "the graph exactly as written can satisfy every Collection MUST/MUST NOT and acceptance requirement without knowingly requiring a later repair for an already-visible defect. "
+                    "Return verdict pass/fail; a known acceptance violation is a true blocker. Name at most three actionable blockers."
                 ),
                 reason=f"Deterministic planning policy: {reason_text}",
                 parent_task_id=parent["id"] if parent else None,
@@ -658,8 +938,11 @@ class Scheduler:
                 "PLANNING_POLICY_ENFORCED",
                 {
                     "explore_required": policy.explore_required,
+                    "research_required": policy.research_required,
                     "critic_required": policy.critic_required,
                     "plan_review_required": policy.plan_review_required,
+                    "external_conformance_required": policy.external_conformance_required,
+                    "threat_model_required": policy.threat_model_required,
                     "categories": list(policy.categories),
                     "critic_task_id": critic["id"] if critic else None,
                     "plan_review_task_id": plan_review["id"] if plan_review else None,
@@ -882,7 +1165,17 @@ class Scheduler:
         existing = self.store.find_related_review(implement_task["id"])
         if existing:
             return
+        lineage, reconciliation_required = self._task_input_lineage_changed(implement_task)
         dependencies = [implement_task["id"]]
+        policy = classify_planning_policy(collection.get("objective") or "")
+        if policy.research_required:
+            for task in self.store.list_tasks(collection["id"]):
+                if (
+                    task.get("profile") == "research"
+                    and task.get("status") == TaskStatus.COMPLETE.value
+                    and task["id"] not in dependencies
+                ):
+                    dependencies.append(task["id"])
         title = f"Review {implement_task['title']}"
         objective = (
             f"Independently review implementation task {implement_task['id']} against its objective and acceptance intent. "
@@ -906,6 +1199,24 @@ class Scheduler:
                 "the prior review's conclusions. Return verdict pass/fail."
             )
             reason = "A semantic review failure was repaired; policy requires a fresh independent review task/context."
+        if reconciliation_required and lineage is not None:
+            prior_title = title
+            title = f"Reconcile and review {implement_task['title']}"
+            objective = (
+                f"Input lineage changed while implementation {implement_task['id']} was running. Reconcile the completed/integrated "
+                "work against the CURRENT accepted material plan, fresh research evidence, and prerequisite state before returning "
+                "verdict pass/fail. Do not assume the implementation's starting evidence is still valid. "
+                f"Starting material fingerprint={lineage['start_material_plan_fingerprint']}; "
+                f"current={lineage['current_material_plan_fingerprint']}; "
+                f"starting dependency digest={lineage['start_dependency_lineage_digest']}; "
+                f"current={lineage['current_dependency_lineage_digest']}. Re-run relevant verification against the current integrated "
+                "candidate. If compatibility requires code changes, request a blocking repair implementation rather than changing code "
+                f"yourself. This reconciliation also satisfies the normal independent review obligation. Prior review framing: {prior_title}"
+            )
+            reason = (
+                "The implementation ran against prerequisite/planning evidence that changed before integration; durable reconciliation "
+                "is required before acceptance."
+            )
         review, _ = self.store.create_task(
             project_id=implement_task["project_id"],
             collection_id=implement_task["collection_id"],
@@ -931,6 +1242,12 @@ class Scheduler:
                     "repair_task_id": implement_task["id"],
                     "original_implementation_task_ids": original_verification_sources,
                 },
+            )
+        if reconciliation_required and lineage is not None:
+            self.store.event(
+                implement_task["project_id"], implement_task["collection_id"], implement_task["id"], None,
+                "RECONCILIATION_REQUIRED",
+                {**lineage, "implementation_task_id": implement_task["id"], "reconciliation_review_task_id": review["id"]},
             )
         # If this implementation was a blocking inherited child, the parent must
         # wait for the review too, not resume immediately after code integration.
@@ -1060,6 +1377,7 @@ class Scheduler:
         protocol_failure: str | None = None
 
         try:
+            self._record_task_input_lineage(task, attempt)
             workdir = self.workspace.prepare_task(project, collection, task)
             task = self.store.get_task(task_id)
             session_row = self.store.create_session(attempt["id"], project_cfg.harness, str(workdir))
@@ -1264,8 +1582,10 @@ class Scheduler:
                 f"Existing hard-dependency cycle in {collection_id}: {cycle_text}"
             )
         self.store.ensure_collection_entrypoint(collection_id)
+        self._enforce_research_requests(collection_id)
         self.store.refresh_waiting_tasks(collection_id)
         self._enforce_planning_policy(collection_id)
+        self._enforce_research_requests(collection_id)
         self.store.refresh_waiting_tasks(collection_id)
         self._enforce_delivery_policy(collection_id)
         self.store.refresh_waiting_tasks(collection_id)
@@ -1283,6 +1603,15 @@ class Scheduler:
             state = self._reconcile_collection(collection_id)
             self._quarantined_collections.discard(collection_id)
             return state
+        except ResearchCapabilityError as exc:
+            self._quarantined_collections.add(collection_id)
+            collection = self.store.get_collection(collection_id)
+            if collection.get("status") != "BLOCKED":
+                self.store.set_collection_status(collection_id, "BLOCKED", commit=True)
+            prior = self.store.events_for_collection(collection_id, limit=50)
+            if not any(event.get("event_type") == "RESEARCH_CAPABILITY_REQUIRED" and json.loads(event.get("payload_json") or "{}").get("error") == str(exc) for event in prior):
+                self.store.event(collection["project_id"], collection_id, None, None, "RESEARCH_CAPABILITY_REQUIRED", {"error": str(exc), "required_capability": "current_external_research"})
+            return "BLOCKED"
         except DependencyCycleError as exc:
             self._quarantined_collections.add(collection_id)
             collection = self.store.get_collection(collection_id)

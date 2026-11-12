@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import re
+from typing import Any
 
 from .util import normalize_text
 
@@ -11,139 +12,72 @@ from .util import normalize_text
 @dataclass(frozen=True, slots=True)
 class PlanningPolicy:
     explore_required: bool
+    research_required: bool
     critic_required: bool
     plan_review_required: bool
+    external_conformance_required: bool
+    threat_model_required: bool
     categories: tuple[str, ...]
     reasons: tuple[str, ...]
 
     def as_dict(self) -> dict[str, object]:
         return {
             "explore_required": self.explore_required,
+            "research_required": self.research_required,
             "critic_required": self.critic_required,
             "plan_review_required": self.plan_review_required,
+            "external_conformance_required": self.external_conformance_required,
+            "threat_model_required": self.threat_model_required,
             "categories": list(self.categories),
             "reasons": list(self.reasons),
         }
 
 
 _SECURITY_PATTERNS = (
-    r"\bauth(?:entication|orization)?\b",
-    r"\bapi[-_ ]?key(?:s)?\b",
-    r"\bcredential(?:s)?\b",
-    r"\bsecret(?:s)?\b",
-    r"\bpassword(?:s)?\b",
-    r"\boauth\b",
-    r"\btoken(?:s)?\b",
-    r"\baccess[ -]?control\b",
-    r"\bpermission(?:s)?\b",
-    r"\bencrypt(?:ion|ed)?\b",
-    r"\bsecurity\b",
+    r"\bauth(?:entication|orization)?\b", r"\bapi[-_ ]?key(?:s)?\b", r"\bcredential(?:s)?\b",
+    r"\bsecret(?:s)?\b", r"\bpassword(?:s)?\b", r"\boauth\b", r"\btoken(?:s)?\b",
+    r"\baccess[ -]?control\b", r"\bpermission(?:s)?\b", r"\bencrypt(?:ion|ed)?\b", r"\bsecurity\b",
 )
-
 _STATEFUL_PATTERNS = (
-    r"\brate[ -]?limit(?:ing)?\b",
-    r"\bstateful\b",
-    r"\bsession(?:s)?\b",
-    r"\bcache(?:d|s|ing)?\b",
-    r"\bqueue(?:s)?\b",
-    r"\bretr(?:y|ies)\b",
-    r"\bidempoten(?:t|cy)\b",
-    r"\bconcurren(?:t|cy)\b",
-    r"\block(?:ing|s)?\b",
-    r"\btransaction(?:s)?\b",
+    r"\brate[ -]?limit(?:ing)?\b", r"\bstateful\b", r"\bsession(?:s)?\b", r"\bcache(?:d|s|ing)?\b",
+    r"\bqueue(?:s)?\b", r"\bretr(?:y|ies)\b", r"\bidempoten(?:t|cy)\b", r"\bconcurren(?:t|cy)\b",
+    r"\block(?:ing|s)?\b", r"\btransaction(?:s)?\b",
 )
-
-_MIGRATION_PATTERNS = (
-    r"\bmigrat(?:e|ion|ions)\b",
-    r"\bschema\b",
-    r"\bdatabase\b",
-    r"\bbackfill\b",
-    r"\bdata conversion\b",
-)
-
-_DESTRUCTIVE_PATTERNS = (
-    r"\bdelete\b",
-    r"\bdrop\b",
-    r"\bpurge\b",
-    r"\bdestructive\b",
-    r"\birreversible\b",
-)
-
-_EXTERNAL_CONTRACT_PATTERNS = (
-    r"\bapi\b",
-    r"\bwebhook(?:s)?\b",
-    r"\bpublic endpoint\b",
-    r"\bbackward compatib(?:le|ility)\b",
-)
-
+_MIGRATION_PATTERNS = (r"\bmigrat(?:e|ion|ions)\b", r"\bschema\b", r"\bdatabase\b", r"\bbackfill\b", r"\bdata conversion\b")
+_DESTRUCTIVE_PATTERNS = (r"\bdelete\b", r"\bdrop\b", r"\bpurge\b", r"\bdestructive\b", r"\birreversible\b")
+_EXTERNAL_CONTRACT_PATTERNS = (r"\bapi\b", r"\bwebhook(?:s)?\b", r"\bpublic endpoint\b", r"\bbackward compatib(?:le|ility)\b")
 _EXTERNAL_INTEGRATION_PATTERNS = (
-    r"\bgateway(?:s)?\b",
-    r"\bintegration(?:s)?\b",
-    r"\bthird[- ]party\b",
-    r"\bexternal service\b",
-    r"\bprovider(?:s)?\b",
-    r"\bsdk\b",
-    r"\btwilio\b",
-    r"\btelephony\b",
-    r"\btwiml\b",
+    r"\bgateway(?:s)?\b", r"\bintegration(?:s)?\b", r"\bthird[- ]party\b", r"\bexternal service\b",
+    r"\bexternal api\b", r"\bprovider(?:s)?\b", r"\bsdk\b", r"\btwilio\b", r"\btelephony\b",
+    r"\btwiml\b", r"\bcloud\b",
 )
+_PROTOCOL_PATTERNS = (r"\bprotocol\b", r"\bspecification\b", r"\bstandard\b", r"\brfc\b", r"\bwire format\b", r"\bcompatibility matrix\b", r"\bmcp\b", r"\bmodel context protocol\b", r"\bopenapi\b")
+_FRESHNESS_PATTERNS = (r"\blatest\b", r"\brecent\b", r"\bas[- ]of\b", r"\btoday\b", r"\bthis week\b", r"\bnewest\b", r"\bup[- ]to[- ]date\b", r"\bnews\b", r"\bcurrent events?\b", r"\bcurrent\s+(?:version|release|specification|standard|api|sdk|law|regulation|policy|events?|news|pricing|availability|support)\b")
+_REGULATION_PATTERNS = (r"\blaw\b", r"\blegal\b", r"\bregulat(?:ion|ory|ions)\b", r"\bcompliance\b", r"\bpolicy requirement\b", r"\bhipaa\b", r"\bgdpr\b", r"\bsec rule\b")
+_EVOLVING_DEPENDENCY_PATTERNS = (
+    r"\blibrar(?:y|ies)\b", r"\bframework\b", r"\bvendor\b", r"\bsupport matrix\b",
+    r"\b(?:package|dependency|library|framework)\s+(?:version|release|compatibility|support)\b",
+    r"\b(?:upgrade|update)\s+(?:a\s+)?(?:package|dependency|library|framework)\b",
+)
+_NETWORK_BOUNDARY_PATTERNS = (r"\blistener\b", r"\bhttp server\b", r"\bserver\b", r"\bnetwork\b", r"\bbind\b", r"\bsocket\b", r"\bremote\b", r"\bwebhook\b", r"\binbound\b", r"\bpublic endpoint\b")
 
-# Delivery classification is intentionally deterministic, but normal user
-# requests are often phrased conversationally rather than beginning with an
-# imperative verb. Keep the mutation vocabulary centralized so planning and
-# delivery policy classify the same intent.
 _MUTATION_VERBS = (
     "add|implement|build|create|modify|change|update|fix|repair|refactor|"
-    "remove|delete|migrate|extend|introduce|replace|upgrade|convert|make|"
-    "enforce|support"
+    "remove|delete|migrate|extend|introduce|replace|upgrade|convert|make|enforce|support"
 )
-_IMPLEMENTATION_FIRST_LINE = re.compile(
-    rf"^(?:please\s+)?(?:{_MUTATION_VERBS})\b",
-    flags=re.IGNORECASE,
-)
+_IMPLEMENTATION_FIRST_LINE = re.compile(rf"^(?:please\s+)?(?:{_MUTATION_VERBS})\b", flags=re.IGNORECASE)
 _IMPLEMENTATION_REQUEST_PATTERNS = (
     rf"\b(?:i(?:'|’)d|i would|we would)\s+like\s+to\s+(?:{_MUTATION_VERBS})\b",
     rf"\b(?:i|we)\s+(?:want|need)\s+(?:you\s+)?to\s+(?:{_MUTATION_VERBS})\b",
     rf"\b(?:can|could|would)\s+you\s+(?:please\s+)?(?:{_MUTATION_VERBS})\b",
-    rf"\bplease\s+(?:{_MUTATION_VERBS})\b",
-    rf"\blet(?:'|’)s\s+(?:{_MUTATION_VERBS})\b",
+    rf"\bplease\s+(?:{_MUTATION_VERBS})\b", rf"\blet(?:'|’)s\s+(?:{_MUTATION_VERBS})\b",
 )
-
-# Preserve a low-ceremony escape hatch for clearly documentation-only edits.
-# The test is deliberately narrow: if the objective also names code/runtime
-# surfaces, it is no longer considered trivial documentation work.
-_DOCUMENTATION_PATTERNS = (
-    r"\breadme(?:\.md)?\b",
-    r"\bdocumentation\b",
-    r"\bdocs?\b",
-    r"\btypo\b",
-    r"\bspelling\b",
-    r"\bwording\b",
-    r"\bexample sentence\b",
-)
+_DOCUMENTATION_PATTERNS = (r"\breadme(?:\.md)?\b", r"\bdocumentation\b", r"\bdocs?\b", r"\btypo\b", r"\bspelling\b", r"\bwording\b", r"\bexample sentence\b")
 _CODE_OR_RUNTIME_PATTERNS = (
-    r"\bfeature\b",
-    r"\bbug\b",
-    r"\bcode(?:base)?\b",
-    r"\bfunction\b",
-    r"\bmethod\b",
-    r"\bclass\b",
-    r"\bendpoint\b",
-    r"\broute\b",
-    r"\bhandler\b",
-    r"\bgateway\b",
-    r"\btemplate\b",
-    r"\bservice\b",
-    r"\bclient\b",
-    r"\bserver\b",
-    r"\btest(?:s|ing)?\b",
-    r"\bapi\b",
-    r"\bwebhook\b",
-    r"\btransfer\b",
-    r"\bdtmf\b",
-    r"\btwiml\b",
-    r"\bdial\b",
-    r"\b(?:py|js|ts|java|go|rs|rb|php|cs|cpp|c|h)\b",
+    r"\bfeature\b", r"\bbug\b", r"\bcode(?:base)?\b", r"\bfunction\b", r"\bmethod\b", r"\bclass\b",
+    r"\bendpoint\b", r"\broute\b", r"\bhandler\b", r"\bgateway\b", r"\btemplate\b", r"\bservice\b",
+    r"\bclient\b", r"\bserver\b", r"\btest(?:s|ing)?\b", r"\bapi\b", r"\bwebhook\b", r"\btransfer\b",
+    r"\bdtmf\b", r"\btwiml\b", r"\bdial\b", r"\b(?:py|js|ts|java|go|rs|rb|php|cs|cpp|c|h)\b",
     r"\.(?:py|pyi|js|jsx|ts|tsx|java|go|rs|rb|php|cs|cpp|cc|cxx|c|h|hpp|sql|sh)\b",
 )
 
@@ -153,13 +87,6 @@ def _matches_any(text: str, patterns: tuple[str, ...]) -> bool:
 
 
 def _requires_implementation_delivery(objective: str) -> bool:
-    """Return whether the objective is an explicit request to mutate delivery.
-
-    Direct imperatives are recognized from the first meaningful line, while
-    common conversational forms ("I'd like to add...", "Can you fix...") are
-    recognized anywhere in the objective. This avoids treating explanatory or
-    research prompts that merely mention implementation verbs as write work.
-    """
     text = objective or ""
     first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
     if _IMPLEMENTATION_FIRST_LINE.search(first_line):
@@ -169,29 +96,13 @@ def _requires_implementation_delivery(objective: str) -> bool:
 
 def _is_trivial_documentation_change(objective: str) -> bool:
     text = objective or ""
-    return _matches_any(text, _DOCUMENTATION_PATTERNS) and not _matches_any(
-        text, _CODE_OR_RUNTIME_PATTERNS
-    )
+    return _matches_any(text, _DOCUMENTATION_PATTERNS) and not _matches_any(text, _CODE_OR_RUNTIME_PATTERNS)
 
 
 def classify_planning_policy(objective: str) -> PlanningPolicy:
-    """Return deterministic planning gates for a Collection objective.
-
-    This intentionally uses conservative lexical signals instead of an LLM so
-    the planner cannot silently opt out of independent planning controls. The
-    policy is a floor, not a ceiling: the coordinator may still add critic,
-    advice, research, or plan review for work that is not caught here.
-
-    Any non-trivial explicit implementation request receives an independent
-    plan-review floor. Externally integrated/contract-sensitive implementation
-    changes additionally require a critic. This prevents conversationally
-    worded feature requests from bypassing gates merely because they do not
-    begin with an imperative verb.
-    """
     text = objective or ""
     categories: list[str] = []
     reasons: list[str] = []
-
     implementation = _requires_implementation_delivery(text)
     trivial_docs = implementation and _is_trivial_documentation_change(text)
     security = _matches_any(text, _SECURITY_PATTERNS)
@@ -200,6 +111,11 @@ def classify_planning_policy(objective: str) -> PlanningPolicy:
     destructive = _matches_any(text, _DESTRUCTIVE_PATTERNS)
     external_contract = _matches_any(text, _EXTERNAL_CONTRACT_PATTERNS)
     external_integration = _matches_any(text, _EXTERNAL_INTEGRATION_PATTERNS)
+    protocol = _matches_any(text, _PROTOCOL_PATTERNS)
+    freshness = _matches_any(text, _FRESHNESS_PATTERNS)
+    regulation = _matches_any(text, _REGULATION_PATTERNS)
+    evolving = _matches_any(text, _EVOLVING_DEPENDENCY_PATTERNS)
+    network_boundary = _matches_any(text, _NETWORK_BOUNDARY_PATTERNS)
 
     if implementation:
         categories.append("implementation_change")
@@ -224,36 +140,42 @@ def classify_planning_policy(objective: str) -> PlanningPolicy:
     if external_integration:
         categories.append("external_integration")
         reasons.append("External provider/gateway integration behavior requires an independent critic before write work.")
+    if protocol:
+        categories.append("external_protocol_or_standard")
+    if freshness:
+        categories.append("freshness_sensitive")
+    if regulation:
+        categories.append("law_regulation_or_compliance")
+    if evolving:
+        categories.append("evolving_dependency_or_vendor")
+    if network_boundary:
+        categories.append("network_trust_boundary")
 
-    integration_sensitive_change = bool(
-        implementation and (external_contract or external_integration)
-    )
+    research_required = bool(protocol or freshness or regulation or external_integration or (implementation and evolving))
+    if research_required:
+        reasons.append("Correctness depends on fresh external evidence; current authoritative research is required before critique/planning.")
+    external_conformance_required = bool(implementation and (protocol or external_integration))
+    if external_conformance_required:
+        reasons.append("External protocol/provider work requires an authoritative independent verification oracle when practical.")
+    threat_model_required = bool(implementation and (security or network_boundary))
+    if threat_model_required:
+        reasons.append("A network/security trust boundary requires explicit threat-model directives before write work.")
+
+    integration_sensitive_change = bool(implementation and (external_contract or external_integration or protocol))
     explore_required = implementation
-    critic_required = (
-        implementation
-        or security
-        or migration
-        or destructive
-        or (stateful and external_contract)
-        or integration_sensitive_change
-    )
-    plan_review_required = (
-        stateful
-        or migration
-        or destructive
-        or integration_sensitive_change
-        or (implementation and not trivial_docs)
-    )
-
+    critic_required = bool(implementation or security or migration or destructive or (stateful and external_contract) or integration_sensitive_change)
+    plan_review_required = bool(stateful or migration or destructive or integration_sensitive_change or external_conformance_required or threat_model_required or (implementation and not trivial_docs))
     if plan_review_required and not any("plan-review" in reason.lower() or "plan review" in reason.lower() for reason in reasons):
         reasons.append("The objective crosses the deterministic threshold for an independent plan-review gate before write work.")
 
     return PlanningPolicy(
         explore_required=explore_required,
+        research_required=research_required,
         critic_required=critic_required,
         plan_review_required=plan_review_required,
-        categories=tuple(categories),
-        reasons=tuple(reasons),
+        external_conformance_required=external_conformance_required,
+        threat_model_required=threat_model_required,
+        categories=tuple(categories), reasons=tuple(reasons),
     )
 
 
@@ -261,78 +183,327 @@ _MATERIAL_PLAN_PROFILES = {"implement", "research", "advise"}
 _MATERIAL_PLAN_RELATIONS = {"depends_on", "blocks", "supersedes", "superseded_by"}
 
 
-def material_plan_fingerprint(
-    objective: str,
-    tasks: list[dict[str, object]],
-    edges: list[dict[str, object]],
-    *,
-    legacy_raw_base_commit: bool = False,
-) -> str:
-    """Return a stable fingerprint for critic-relevant plan material.
+def _research_result_digest(task: dict[str, object]) -> str:
+    if str(task.get("profile") or "") != "research":
+        return ""
+    value: object | None = task.get("result")
+    if value is None:
+        raw = str(task.get("result_json") or "").strip()
+        if raw:
+            try:
+                value = json.loads(raw)
+            except Exception:
+                value = raw
+    if value is None:
+        return ""
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
-    The initial critic is a preflight critic, so ordinary construction of the
-    first plan must not immediately invalidate it. Praector seals that critic to
-    the first final plan-review handoff. After that seal, this fingerprint is
-    used to detect genuinely new plan material.
 
-    Status/timestamps, mutable workspace Git pointers, coordinator/reviewer
-    bookkeeping, and orchestration-only edges are deliberately excluded. New or
-    replaced implementation/research/advice contracts and their meaningful
-    dependencies are included.
 
-    ``base_commit`` is only material for ``inherit`` workspaces, where it is an
-    explicit delegation checkpoint. Collection/isolated workspaces historically
-    had base_commit populated lazily during workspace preparation, so hashing that
-    runtime value produced false critic staleness. ``legacy_raw_base_commit`` is
-    retained only to recognize pre-0.1.23 seals that legitimately captured an
-    explicit raw value.
+
+def dependency_lineage_digest(dependencies: list[dict[str, object]]) -> str:
+    """Hash the direct prerequisite state a task started from.
+
+    This complements the material-plan fingerprint by catching a prerequisite
+    task that is reopened or whose integrated head/result changes in place.
     """
-    material_tasks = [
-        task for task in tasks
-        if str(task.get("profile") or "") in _MATERIAL_PLAN_PROFILES
-        and str(task.get("status") or "") not in {"CANCELLED", "SUPERSEDED"}
-    ]
+    payload: list[dict[str, str]] = []
+    for dep in sorted(dependencies, key=lambda item: str(item.get("id") or "")):
+        raw = str(dep.get("result_json") or "").strip()
+        payload.append({
+            "id": str(dep.get("id") or ""),
+            "status": str(dep.get("status") or ""),
+            "current_head": str(dep.get("current_head") or ""),
+            "result_digest": hashlib.sha256(raw.encode("utf-8")).hexdigest() if raw else "",
+        })
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _material_plan_fingerprint(objective: str, tasks: list[dict[str, object]], edges: list[dict[str, object]], *, legacy_raw_base_commit: bool = False, include_research_digest: bool = True) -> str:
+    material_tasks = [task for task in tasks if str(task.get("profile") or "") in _MATERIAL_PLAN_PROFILES and str(task.get("status") or "") not in {"CANCELLED", "SUPERSEDED"}]
     material_tasks.sort(key=lambda task: (str(task.get("profile") or ""), str(task.get("id") or "")))
     material_ids = {str(task.get("id") or "") for task in material_tasks}
-
-    task_payload = []
+    task_payload: list[dict[str, object]] = []
     for task in material_tasks:
         workspace_mode = str(task.get("workspace_mode") or "collection")
         raw_base_commit = str(task.get("base_commit") or "")
-        canonical_base_commit = (
-            raw_base_commit
-            if legacy_raw_base_commit or workspace_mode == "inherit"
-            else ""
-        )
-        task_payload.append({
-            "id": str(task.get("id") or ""),
-            "profile": str(task.get("profile") or ""),
-            "title": normalize_text(str(task.get("title") or "")),
-            "objective": normalize_text(str(task.get("objective") or "")),
-            "reason": normalize_text(str(task.get("reason") or "")),
-            "workspace_mode": workspace_mode,
-            "base_commit": canonical_base_commit,
-        })
-
-    edge_payload = []
+        canonical_base_commit = raw_base_commit if legacy_raw_base_commit or workspace_mode == "inherit" else ""
+        row: dict[str, object] = {
+            "id": str(task.get("id") or ""), "profile": str(task.get("profile") or ""),
+            "title": normalize_text(str(task.get("title") or "")), "objective": normalize_text(str(task.get("objective") or "")),
+            "reason": normalize_text(str(task.get("reason") or "")), "workspace_mode": workspace_mode, "base_commit": canonical_base_commit,
+        }
+        if include_research_digest:
+            digest = _research_result_digest(task)
+            if digest:
+                row["research_result_digest"] = digest
+        task_payload.append(row)
+    edge_payload: list[tuple[str, str, str]] = []
     for edge in edges:
         relation = str(edge.get("relation") or "")
-        from_id = str(edge.get("from_task_id") or "")
-        to_id = str(edge.get("to_task_id") or "")
-        if relation not in _MATERIAL_PLAN_RELATIONS:
-            continue
-        if from_id not in material_ids or to_id not in material_ids:
-            continue
-        edge_payload.append((from_id, to_id, relation))
+        from_id, to_id = str(edge.get("from_task_id") or ""), str(edge.get("to_task_id") or "")
+        if relation in _MATERIAL_PLAN_RELATIONS and from_id in material_ids and to_id in material_ids:
+            edge_payload.append((from_id, to_id, relation))
     edge_payload.sort()
-
-    payload = {
-        "objective": normalize_text(objective or ""),
-        "tasks": task_payload,
-        "edges": edge_payload,
-    }
+    payload = {"objective": normalize_text(objective or ""), "tasks": task_payload, "edges": edge_payload}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def material_plan_fingerprint(objective: str, tasks: list[dict[str, object]], edges: list[dict[str, object]], *, legacy_raw_base_commit: bool = False) -> str:
+    return _material_plan_fingerprint(
+        objective, tasks, edges,
+        legacy_raw_base_commit=legacy_raw_base_commit,
+        include_research_digest=True,
+    )
+
+
+def material_plan_fingerprint_v021(objective: str, tasks: list[dict[str, object]], edges: list[dict[str, object]], *, legacy_raw_base_commit: bool = False) -> str:
+    """Reproduce the 0.2.1 fingerprint contract for upgrade compatibility."""
+    return _material_plan_fingerprint(
+        objective, tasks, edges,
+        legacy_raw_base_commit=legacy_raw_base_commit,
+        include_research_digest=False,
+    )
+
+
+def validate_deterministic_research_result(result: dict[str, Any], *, require_oracle: bool) -> None:
+    if not str(result.get("as_of") or "").strip():
+        raise ValueError("deterministic fresh research result requires as_of")
+    sources = result.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("deterministic fresh research result requires non-empty sources")
+    source_ids: set[str] = set()
+    allowed_authority = {
+        "official_specification", "official_standard", "official_release_notes", "official_sdk",
+        "first_party", "vendor_documentation", "secondary", "community",
+    }
+    for idx, source in enumerate(sources):
+        if not isinstance(source, dict):
+            raise ValueError(f"research source {idx} must be an object")
+        source_id = str(source.get("id") or "").strip()
+        authority_level = str(source.get("authority_level") or "").strip().lower()
+        if not source_id or not str(source.get("authority") or "").strip() or not str(source.get("reference") or "").strip() or not authority_level:
+            raise ValueError(f"research source {idx} requires id, authority, authority_level, and reference")
+        if authority_level not in allowed_authority:
+            raise ValueError(f"research source {idx} has unsupported authority_level {authority_level!r}")
+        if source_id in source_ids:
+            raise ValueError(f"research source id {source_id!r} is duplicated")
+        source_ids.add(source_id)
+    claims = result.get("claims")
+    if not isinstance(claims, list) or not claims:
+        raise ValueError("deterministic fresh research result requires non-empty claims")
+    allowed_norm = {"MUST", "MUST_NOT", "SHOULD", "MAY", "FACT", "INFERENCE"}
+    allowed_effect = {"preserve", "strengthen", "exception"}
+    claim_ids: set[str] = set()
+    claim_directives: set[str] = set()
+    for idx, claim in enumerate(claims):
+        if not isinstance(claim, dict):
+            raise ValueError(f"research claim {idx} must be an object")
+        for key in ("id", "claim", "source", "authority", "normative_level", "planner_directive", "directive_effect", "confidence"):
+            if not str(claim.get(key) or "").strip():
+                raise ValueError(f"research claim {idx} requires {key}")
+        claim_id = str(claim.get("id") or "").strip()
+        if claim_id in claim_ids:
+            raise ValueError(f"research claim id {claim_id!r} is duplicated")
+        claim_ids.add(claim_id)
+        source_id = str(claim.get("source") or "").strip()
+        if source_id not in source_ids:
+            raise ValueError(f"research claim {idx} references unknown source {source_id!r}")
+        norm = str(claim["normative_level"]).strip().upper()
+        if norm not in allowed_norm:
+            raise ValueError(f"research claim {idx} has unsupported normative_level {norm!r}")
+        effect = str(claim["directive_effect"]).strip().lower()
+        if effect not in allowed_effect:
+            raise ValueError(f"research claim {idx} directive_effect must be preserve, strengthen, or exception")
+        if effect == "exception" and not str(claim.get("exception_decision_id") or "").strip():
+            raise ValueError(f"research claim {idx} exception requires exception_decision_id")
+        claim_directives.add(normalize_text(str(claim.get("planner_directive") or "")))
+
+    for idx, directive in enumerate(result.get("planner_directives") or []):
+        normalized = normalize_text(str(directive or ""))
+        if not normalized or normalized not in claim_directives:
+            raise ValueError(f"research planner_directive {idx} is not backed by a structured claim")
+
+    oracles = result.get("verification_oracles")
+    if require_oracle and (not isinstance(oracles, list) or not oracles):
+        raise ValueError("external-conformance research requires at least one verification_oracle")
+    allowed_oracles = {"internal_test", "black_box_test", "independent_implementation", "official_reference_oracle", "live_provider_oracle"}
+    authoritative_oracle = False
+    if isinstance(oracles, list):
+        for idx, oracle in enumerate(oracles):
+            if not isinstance(oracle, dict):
+                raise ValueError(f"verification_oracle {idx} must be an object")
+            kind = str(oracle.get("kind") or "").strip().lower()
+            if kind not in allowed_oracles or not str(oracle.get("name") or "").strip():
+                raise ValueError(f"verification_oracle {idx} requires a supported kind and name")
+            if kind in {"independent_implementation", "official_reference_oracle", "live_provider_oracle"}:
+                authoritative_oracle = True
+    if require_oracle and not authoritative_oracle and not str(result.get("authoritative_oracle_unavailable_reason") or "").strip():
+        raise ValueError("external-conformance research requires an authoritative independent oracle or authoritative_oracle_unavailable_reason")
+
+
+def research_claim_constraints(tasks: list[dict[str, Any]]) -> list[dict[str, str]]:
+    refs: list[dict[str, str]] = []
+    counts: dict[str, int] = {}
+    for task in tasks:
+        if str(task.get("profile") or "") != "research" or str(task.get("status") or "") != "COMPLETE":
+            continue
+        result = task.get("result")
+        if not isinstance(result, dict):
+            if task.get("result_json"):
+                try:
+                    result = json.loads(str(task.get("result_json")))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    result = {}
+            else:
+                result = {}
+        claims = result.get("claims") or []
+        for index, claim in enumerate(claims):
+            if not isinstance(claim, dict):
+                raise ValueError(f"research task {task.get('id')} claim {index} must be an object")
+            claim_id = str(claim.get("id") or "").strip()
+            directive = str(claim.get("planner_directive") or "").strip()
+            if not claim_id:
+                raise ValueError(f"research task {task.get('id')} claim {index} is missing id")
+            if not directive:
+                raise ValueError(f"research task {task.get('id')} claim {claim_id} is missing planner_directive")
+            refs.append({
+                "task_id": str(task.get("id") or ""),
+                "claim_id": claim_id,
+                "planner_directive": directive,
+                "normative_level": str(claim.get("normative_level") or "").strip().upper(),
+                "authority": str(claim.get("authority") or "").strip(),
+                "source": str(claim.get("source") or "").strip(),
+            })
+            counts[claim_id] = counts.get(claim_id, 0) + 1
+    out: list[dict[str, str]] = []
+    for ref in refs:
+        item = dict(ref)
+        item["claim_ref"] = (
+            f"{ref['task_id']}:{ref['claim_id']}" if counts[ref["claim_id"]] > 1 else ref["claim_id"]
+        )
+        out.append(item)
+    return sorted(out, key=lambda item: item["claim_ref"])
+
+
+def research_claim_ids(tasks: list[dict[str, Any]]) -> list[str]:
+    return [item["claim_ref"] for item in research_claim_constraints(tasks)]
+
+
+def research_exception_decision_ids(result: dict[str, Any]) -> list[str]:
+    out: set[str] = set()
+    for claim in result.get("claims") or []:
+        if not isinstance(claim, dict):
+            continue
+        if str(claim.get("directive_effect") or "").strip().lower() != "exception":
+            continue
+        decision_id = str(claim.get("exception_decision_id") or "").strip()
+        if decision_id:
+            out.add(decision_id)
+    return sorted(out)
+
+
+def research_consumer_exception_decision_ids(result: dict[str, Any]) -> list[str]:
+    consistency = result.get("research_consistency")
+    if not isinstance(consistency, dict):
+        return []
+    out: set[str] = set()
+    for item in consistency.get("claims") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("disposition") or "").strip().lower() != "explicit_exception":
+            continue
+        decision_id = str(item.get("exception_decision_id") or "").strip()
+        if decision_id:
+            out.add(decision_id)
+    return sorted(out)
+
+
+def validate_research_consumer_result(result: dict[str, Any], research_tasks: list[dict[str, Any]], *, require_pass: bool) -> None:
+    constraints = research_claim_constraints(research_tasks)
+    if not constraints:
+        return
+    consistency = result.get("research_consistency")
+    if not isinstance(consistency, dict):
+        raise ValueError("result requires research_consistency for fresh research evidence")
+    verdict = str(consistency.get("verdict") or "").strip().lower()
+    if verdict not in {"pass", "fail"}:
+        raise ValueError("research_consistency.verdict must be pass or fail")
+
+    entries = consistency.get("claims")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("research_consistency.claims must map every structured research claim to an inherited directive disposition")
+    by_ref: dict[str, dict[str, Any]] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"research_consistency.claims[{index}] must be an object")
+        claim_ref = str(entry.get("claim_id") or "").strip()
+        if not claim_ref:
+            raise ValueError(f"research_consistency.claims[{index}] requires claim_id")
+        if claim_ref in by_ref:
+            raise ValueError(f"research_consistency claim_id {claim_ref!r} is duplicated")
+        by_ref[claim_ref] = entry
+
+    expected = {item["claim_ref"]: item for item in constraints}
+    missing = [claim_ref for claim_ref in expected if claim_ref not in by_ref]
+    if missing:
+        raise ValueError(f"research_consistency did not disposition claim ids: {','.join(missing)}")
+    unknown = [claim_ref for claim_ref in by_ref if claim_ref not in expected]
+    if unknown:
+        raise ValueError(f"research_consistency references unknown claim ids: {','.join(sorted(unknown))}")
+
+    allowed_dispositions = {"preserved", "strengthened", "explicit_exception"}
+    for claim_ref, constraint in expected.items():
+        entry = by_ref[claim_ref]
+        disposition = str(entry.get("disposition") or "").strip().lower()
+        if disposition not in allowed_dispositions:
+            raise ValueError(
+                f"research_consistency claim {claim_ref} disposition must be preserved, strengthened, or explicit_exception"
+            )
+        inherited = str(entry.get("inherited_directive") or "").strip()
+        if normalize_text(inherited) != normalize_text(constraint["planner_directive"]):
+            raise ValueError(f"research_consistency claim {claim_ref} must preserve the exact inherited research directive")
+        derived = entry.get("derived_directives") or []
+        if not isinstance(derived, list) or any(not str(value or "").strip() for value in derived):
+            raise ValueError(f"research_consistency claim {claim_ref} derived_directives must be a list of non-empty strings")
+        decision_id = str(entry.get("exception_decision_id") or "").strip()
+        if disposition == "explicit_exception" and not decision_id:
+            raise ValueError(f"research_consistency claim {claim_ref} explicit_exception requires exception_decision_id")
+        if disposition != "explicit_exception" and decision_id:
+            raise ValueError(f"research_consistency claim {claim_ref} may cite exception_decision_id only for explicit_exception")
+
+    checked_raw = consistency.get("checked_claim_ids")
+    if checked_raw is not None:
+        checked = {str(value or "").strip() for value in checked_raw if str(value or "").strip()}
+        missing_checked = [claim_ref for claim_ref in expected if claim_ref not in checked]
+        if missing_checked:
+            raise ValueError(f"research_consistency did not check claim ids: {','.join(missing_checked)}")
+
+    contradictions = list(consistency.get("contradictions") or [])
+    if verdict == "fail" and not contradictions:
+        raise ValueError("failed research_consistency requires contradictions")
+    if verdict == "pass" and contradictions:
+        raise ValueError("passing research_consistency cannot report contradictions")
+    if require_pass and verdict != "pass":
+        raise ValueError("passing plan/review requires research_consistency verdict=pass")
+
+
+def validate_external_conformance_review_result(result: dict[str, Any]) -> None:
+    if str(result.get("verdict") or "").strip().lower() != "pass":
+        return
+    for oracle in result.get("verification_oracles") or []:
+        if not isinstance(oracle, dict):
+            continue
+        kind = str(oracle.get("kind") or "").strip().lower()
+        used = bool(oracle.get("used", True))
+        if used and kind in {"independent_implementation", "official_reference_oracle", "live_provider_oracle"}:
+            return
+    if str(result.get("authoritative_oracle_unavailable_reason") or "").strip() and str(result.get("oracle_exception_decision_id") or "").strip():
+        return
+    raise ValueError("passing external-conformance review requires an authoritative oracle actually used, or a durable oracle exception decision")
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,31 +513,14 @@ class DeliveryPolicy:
     reasons: tuple[str, ...]
 
     def as_dict(self) -> dict[str, object]:
-        return {
-            "implementation_required": self.implementation_required,
-            "categories": list(self.categories),
-            "reasons": list(self.reasons),
-        }
+        return {"implementation_required": self.implementation_required, "categories": list(self.categories), "reasons": list(self.reasons)}
 
 
 def classify_delivery_policy(objective: str) -> DeliveryPolicy:
-    """Return a deterministic minimum delivery requirement for a Collection.
-
-    Recognize both imperative requests ("Add...") and common conversational
-    requests ("I'd like to add...", "Can you fix..."). Research/review/
-    explanation objectives are not forced through a write path merely because
-    they mention implementation details.
-    """
     implementation_required = _requires_implementation_delivery(objective)
     categories: list[str] = []
     reasons: list[str] = []
     if implementation_required:
         categories.append("implementation_delivery")
-        reasons.append(
-            "The Collection objective is a direct change request; at least one completed implementation with passing independent review is required before COMPLETE."
-        )
-    return DeliveryPolicy(
-        implementation_required=implementation_required,
-        categories=tuple(categories),
-        reasons=tuple(reasons),
-    )
+        reasons.append("The Collection objective is a direct change request; at least one completed implementation with passing independent review is required before COMPLETE.")
+    return DeliveryPolicy(implementation_required=implementation_required, categories=tuple(categories), reasons=tuple(reasons))

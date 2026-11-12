@@ -57,7 +57,7 @@ Role prompts reinforce these rules rather than duplicating them. The coordinator
 | `critic` | pre-plan gap analysis, hidden intent, scope/QA hazards | read-only | Metis / plan-consultant |
 | `plan_review` | practical executability review of the proposed task graph | read-only | Momus / plan-reviewer |
 | `advise` | deep technical/architecture recommendation | read-only | Oracle / architect consult lane |
-| `research` | bounded evidence gathering | read-only | Explore + Librarian responsibilities combined in the current release |
+| `research` | bounded fresh/authoritative evidence gathering with source, claim, version/date, and oracle provenance | read-only | Librarian / external-evidence lane |
 | `implement` | bounded code/file execution and self-verification | write | Sisyphus-Junior / implementation worker concept |
 | `review` | independent verification of integrated implementation | read-only | post-implementation QA/gate reviewer, not Momus |
 
@@ -85,7 +85,8 @@ The coordinator owns the work graph, not product implementation. Its prompt requ
 - make task objectives decision-complete with DELIVERABLE / SCOPE / MUST HAVE / MUST NOT / VERIFY context;
 - submit its result and exit instead of waiting for workers.
 
-Every implementation Collection receives a deterministic read-only `explore -> critic` preflight before its initial/revision coordinator plans material work. `explore` establishes what exists; `critic` challenges what the plan must not miss. Clearly trivial documentation-only work may still skip final `plan_review`; non-trivial implementation work retains the deterministic `plan_review` floor. `advise` and bounded `research` remain conditional on architecture/tradeoff or specific evidence needs.
+Every implementation Collection receives deterministic read-only repository exploration before its initial/revision coordinator plans material work. Purely local implementation follows `explore -> critic`. When policy classifies current external evidence as material, `explore` and fresh `research` run independently and the critic depends on both, giving it local reality plus current external truth before coordination. Clearly trivial documentation-only work may still skip final `plan_review`; non-trivial implementation retains the deterministic `plan_review` floor. `advise` remains conditional on architecture/tradeoff needs.
+Freshness classification is also usable outside implementation: current-news/events/pricing/availability/support objectives can receive deterministic research while skipping repository exploration, implementation critic, and write-work gates that do not apply.
 
 Unlike an interactive planning agent, Praector does not let managed workers ask the operator live questions. If evidence, critic, and advice still leave a requirement-defining ambiguity with no safe reversible default, the coordinator should block/fail planning with the exact unresolved choice rather than inventing an answer. A future durable operator-input gate can add interview-style clarification without making session continuity part of correctness.
 
@@ -103,7 +104,7 @@ The critic is deliberately pre-planning. It does not judge code quality or imple
 
 It returns actionable planner directives and clearly separates observed facts, assumptions, and unresolved choices.
 
-For required-critic collections, the initial critic is a preflight, not a permanent approval. Praector seals it to the first critic-informed material plan at final plan-review handoff. Later changes to implementation/research/advice contracts or their meaningful dependencies require a revalidation critic. A fresh coordinator consumes that revalidation; if incorporation changes the material plan again, another critic round is required before plan review.
+For required-critic collections, the initial critic is a preflight, not a permanent approval. Praector seals it to the first critic-informed material plan at final plan-review handoff. Later changes to implementation/research/advice contracts or their meaningful dependencies require a revalidation critic. A fresh coordinator consumes that revalidation; if incorporation changes the material plan again, another critic round is required before plan review. Completed fresh-research result digests are part of the material fingerprint, so materially refreshed external evidence can stale that seal as well.
 
 ## Plan reviewer
 
@@ -133,7 +134,9 @@ It also signals confidence and coarse implementation investment when those facto
 
 ## Researcher
 
-The researcher answers one bounded evidence question and distinguishes observed fact from inference. It prefers reproducible source/test/config evidence and stops when the question is answered rather than broadening indefinitely.
+The researcher answers one bounded evidence question and distinguishes observed fact from inference. For deterministic fresh research it must use current retrieval rather than model memory and return machine-checkable provenance: an `as_of` date; source ids/authority/references; material claims with normative level and derived directive; confidence; and classified verification oracles. Sources are prioritized toward current official specifications/standards, first-party release notes and SDK/reference implementations. A directive may preserve or strengthen a normative claim, or cite a durable exception decision; it may not silently weaken the evidence.
+
+Oracle kinds distinguish `internal_test`, `black_box_test`, `independent_implementation`, `official_reference_oracle`, and `live_provider_oracle`. Out-of-process does not automatically mean authoritative. For external-conformance work, a passing final review must actually exercise an `independent_implementation`, `official_reference_oracle`, or `live_provider_oracle`, unless a durable exception decision records why none is practical. Research claims are also projected into each downstream Task Envelope as `inherited_research_constraints`; these canonical directives remain authoritative even when a critic adds local guidance. Research consumers must include `research_consistency` with one disposition per stable claim (`preserved`, `strengthened`, or `explicit_exception`), repeat the exact inherited directive, and cite an actual durable Collection decision for any exception. Claim ids that collide across research tasks are referenced as `<research-task-id>:<claim-id>`. When current external evidence is unavailable but required, critic/plan-review/review/advise may submit `RESEARCH_REQUIRED` and resume after bounded research rather than guessing.
 
 ## Implementation worker
 

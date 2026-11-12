@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+type ResearchCapabilityError struct{ CollectionID string }
+
+func (e *ResearchCapabilityError) Error() string {
+	return fmt.Sprintf("collection %s requires fresh external research, but project capability current_external_research=false", e.CollectionID)
+}
+
 type Scheduler struct {
 	Store               *Store
 	Cfg                 GlobalConfig
@@ -77,6 +83,58 @@ func activeTasks(tasks Rows) Rows {
 	return out
 }
 
+func (s *Scheduler) recordTaskInputLineage(task, attempt Row) error {
+	collection, err := s.Store.GetCollection(S(task, "collection_id"))
+	if err != nil {
+		return err
+	}
+	fp, err := s.Store.MaterialPlanFingerprint(S(collection, "id"), false)
+	if err != nil {
+		return err
+	}
+	deps, err := s.Store.Dependencies(S(task, "id"))
+	if err != nil {
+		return err
+	}
+	depIDs := make([]any, 0, len(deps))
+	for _, dep := range deps {
+		depIDs = append(depIDs, S(dep, "id"))
+	}
+	return s.Store.Event(S(task, "project_id"), S(task, "collection_id"), S(task, "id"), S(attempt, "id"), "TASK_INPUT_LINEAGE", Row{
+		"material_plan_fingerprint": fp,
+		"dependency_lineage_digest": DependencyLineageDigest(deps),
+		"dependency_ids":            depIDs,
+		"profile":                   S(task, "profile"),
+	})
+}
+
+func (s *Scheduler) taskInputLineageChanged(task Row) (Row, bool, error) {
+	start, err := s.Store.TaskInputLineage(S(task, "id"))
+	if err != nil || start == nil {
+		return start, false, err
+	}
+	fp, err := s.Store.MaterialPlanFingerprint(S(task, "collection_id"), false)
+	if err != nil {
+		return start, false, err
+	}
+	deps, err := s.Store.Dependencies(S(task, "id"))
+	if err != nil {
+		return start, false, err
+	}
+	currentDep := DependencyLineageDigest(deps)
+	changed := S(start, "material_plan_fingerprint") != fp || S(start, "dependency_lineage_digest") != currentDep
+	if !changed {
+		return start, false, nil
+	}
+	return Row{
+		"start_material_plan_fingerprint":   S(start, "material_plan_fingerprint"),
+		"current_material_plan_fingerprint": fp,
+		"start_dependency_lineage_digest":   S(start, "dependency_lineage_digest"),
+		"current_dependency_lineage_digest": currentDep,
+		"attempt_id":                        S(start, "attempt_id"),
+	}, true, nil
+}
+
 func (s *Scheduler) materialFingerprint(collection Row, tasks Rows, legacy bool) (string, error) {
 	edges, err := s.Store.ListEdges(S(collection, "id"))
 	if err != nil {
@@ -104,7 +162,14 @@ func (s *Scheduler) ensureMaterialCriticRevalidation(collection Row, active Rows
 	if err != nil {
 		return critic, false, err
 	}
-	if S(baseline, "fingerprint") == current || S(baseline, "fingerprint") == legacy {
+	edges, err := s.Store.ListEdges(S(collection, "id"))
+	if err != nil {
+		return critic, false, err
+	}
+	v021 := MaterialPlanFingerprintV021(S(collection, "objective"), active, edges, false)
+	v021Legacy := MaterialPlanFingerprintV021(S(collection, "objective"), active, edges, true)
+	sealed := S(baseline, "fingerprint")
+	if sealed == current || sealed == legacy || sealed == v021 || sealed == v021Legacy {
 		return critic, false, nil
 	}
 	for _, task := range active {
@@ -120,11 +185,17 @@ func (s *Scheduler) ensureMaterialCriticRevalidation(collection Row, active Rows
 		depth = I(parent, "depth") + 1
 		parentID = S(parent, "id")
 	}
+	researchDeps := []string{}
+	for _, task := range active {
+		if S(task, "profile") == "research" {
+			researchDeps = append(researchDeps, S(task, "id"))
+		}
+	}
 	fresh, created, err := s.Store.CreateTask(CreateTaskOptions{
 		ProjectID: S(collection, "project_id"), CollectionID: S(collection, "id"), Profile: "critic", Title: "Revalidate materially changed plan",
-		Objective: "Re-run the independent planning preflight because the durable material plan changed after the previous critic was sealed. Inspect the CURRENT implementation/research/advice contracts and dependencies. Identify any new hidden requirements, security/state/concurrency hazards, scope changes, assumptions, and executable QA changes introduced by the new plan. Return concrete MUST/MUST NOT/VERIFY guidance. Do not implement or mutate the graph.",
+		Objective: "Re-run the independent planning preflight because the durable material plan changed after the previous critic was sealed. Inspect the CURRENT implementation/research/advice contracts and dependencies. Consume all current research dependencies and explicitly check their structured claim ids for evidence-to-directive consistency. Identify any new hidden requirements, security/state/concurrency hazards, scope changes, assumptions, and executable QA changes introduced by the new plan. Return concrete MUST/MUST NOT/VERIFY guidance. Do not implement or mutate the graph.",
 		Reason:    fmt.Sprintf("Material plan fingerprint changed after critic %s: %s -> %s", S(critic, "id"), S(baseline, "fingerprint"), current), ParentTaskID: parentID,
-		WorkspaceMode: "collection", Depth: depth, AllowDedupe: false,
+		DependsOn: researchDeps, WorkspaceMode: "collection", Depth: depth, AllowDedupe: false,
 	})
 	if err != nil {
 		return critic, false, err
@@ -248,13 +319,88 @@ func depsIDSet(rows Rows) map[string]bool {
 	return m
 }
 
+func researchRequestQuestion(v any) string {
+	switch x := v.(type) {
+	case string:
+		return strings.TrimSpace(x)
+	case map[string]any:
+		q := strings.TrimSpace(fmt.Sprint(x["question"]))
+		if q == "" {
+			q = strings.TrimSpace(fmt.Sprint(x["query"]))
+		}
+		return q
+	case Row:
+		q := strings.TrimSpace(S(x, "question"))
+		if q == "" {
+			q = strings.TrimSpace(S(x, "query"))
+		}
+		return q
+	}
+	return ""
+}
+
+func (s *Scheduler) enforceResearchRequests(collectionID string) (bool, error) {
+	tasks, err := s.Store.ListTasks(collectionID)
+	if err != nil {
+		return false, err
+	}
+	collection, err := s.Store.GetCollection(collectionID)
+	if err != nil {
+		return false, err
+	}
+	policy := ClassifyPlanningPolicy(S(collection, "objective"))
+	changed := false
+	for _, caller := range tasks {
+		if S(caller, "status") != TaskWaiting {
+			continue
+		}
+		profile := S(caller, "profile")
+		if profile != "critic" && profile != "review" && profile != "plan_review" && profile != "advise" {
+			continue
+		}
+		requests := Slice(M(caller, "result"), "research_required")
+		if len(requests) == 0 {
+			continue
+		}
+		existing := Row(nil)
+		for i := len(tasks) - 1; i >= 0; i-- {
+			if S(tasks[i], "profile") == "research" && S(tasks[i], "requested_by_task_id") == S(caller, "id") && S(tasks[i], "status") != TaskCancelled && S(tasks[i], "status") != TaskSuperseded {
+				existing = tasks[i]
+				break
+			}
+		}
+		if existing != nil {
+			continue
+		}
+		projectRow, e := s.Store.GetProject(S(collection, "project_id"))
+		if e != nil {
+			return false, e
+		}
+		if !ProjectConfigFromRow(projectRow).Capabilities.CurrentExternalResearch {
+			return changed, &ResearchCapabilityError{CollectionID: collectionID}
+		}
+		q := researchRequestQuestion(requests[0])
+		if q == "" {
+			q = "Resolve the externally-verifiable uncertainty identified by the requesting task."
+		}
+		objective := fmt.Sprintf("Resolve this bounded fresh external research question before %s %s resumes: %s Use current authoritative retrieval rather than model memory. Return structured as_of, sources, claims, verification_oracles, risks, unresolved, summary. Each source must include id, authority, authority_level, reference, and version/publication_date when available; authority_level must be one of official_specification, official_standard, official_release_notes, official_sdk, first_party, vendor_documentation, secondary, community. Each claim must have a stable id, reference one source id, and include claim, authority, normative_level, planner_directive, directive_effect, confidence. Any legacy top-level planner_directives must exactly match structured claim planner_directives. Classify verification oracles and surface contradictions explicitly.", profile, S(caller, "id"), q)
+		_, _, e = s.Store.CreateTask(CreateTaskOptions{ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "research", Title: "Research requested by " + S(caller, "id"), Objective: objective, Reason: "Structured RESEARCH_REQUIRED escalation from " + profile, ParentTaskID: S(caller, "id"), RequestedByTaskID: S(caller, "id"), WorkspaceMode: "collection", Depth: I(caller, "depth") + 1, AllowDedupe: false, SpawnedByTaskID: S(caller, "id"), BlockingCallerTaskID: S(caller, "id")})
+		if e != nil {
+			return changed, e
+		}
+		_ = s.Store.Event(S(collection, "project_id"), collectionID, S(caller, "id"), "", "RESEARCH_REQUIRED", Row{"requesting_profile": profile, "question": q, "external_conformance_required": policy.ExternalConformanceRequired})
+		changed = true
+	}
+	return changed, nil
+}
+
 func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 	collection, err := s.Store.GetCollection(collectionID)
 	if err != nil {
 		return false, err
 	}
 	policy := ClassifyPlanningPolicy(S(collection, "objective"))
-	if !policy.ExploreRequired && !policy.CriticRequired && !policy.PlanReviewRequired {
+	if !policy.ExploreRequired && !policy.ResearchRequired && !policy.CriticRequired && !policy.PlanReviewRequired {
 		return false, nil
 	}
 	tasks, err := s.Store.ListTasks(collectionID)
@@ -273,14 +419,35 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 	// current-system understanding a durable input instead of incidental planner
 	// behavior. Reconciliation also applies to revisions, so the preflight is
 	// refreshed when a completed Collection is reopened for additional work.
-	var latestCoordinator Row
-	for i := len(active) - 1; i >= 0; i-- {
-		st := S(active[i], "status")
-		if S(active[i], "profile") == "coordinator" && (S(active[i], "title") == "Initial coordination" || S(active[i], "title") == "Acceptance revision") && (st == TaskPending || st == TaskReady || st == TaskWaiting) {
-			latestCoordinator = active[i]
-			break
+	selectGenerationCoordinator := func(rows Rows) Row {
+		// A RUNNING Collection keeps its latest initial/revision coordinator as
+		// the generation anchor even after that coordinator completed. This is
+		// required for upgrade reconciliation: an old critic may only become
+		// invalid under a stronger engine contract after the coordinator already
+		// handed off to plan review. Historical COMPLETE Collections are never
+		// reopened by this compatibility path. Avoid mutating an actively executing
+		// coordinator; claim-time gates keep downstream write work stopped until
+		// it reaches a stable READY/WAITING/COMPLETE state.
+		if S(collection, "status") == "COMPLETE" {
+			return nil
 		}
+		for i := len(rows) - 1; i >= 0; i-- {
+			st := S(rows[i], "status")
+			stableGenerationState := st == TaskPending || st == TaskReady || st == TaskWaiting
+			// Only research-bound generations need a completed coordinator to remain
+			// addressable after an engine upgrade. Keeping COMPLETE coordinators as
+			// anchors for every implementation policy changes the established
+			// material-plan revalidation semantics of ordinary non-research work.
+			if policy.ResearchRequired && st == TaskComplete {
+				stableGenerationState = true
+			}
+			if S(rows[i], "profile") == "coordinator" && (S(rows[i], "title") == "Initial coordination" || S(rows[i], "title") == "Acceptance revision") && stableGenerationState {
+				return rows[i]
+			}
+		}
+		return nil
 	}
+	latestCoordinator := selectGenerationCoordinator(active)
 	latestForCoordinator := func(profile string) Row {
 		for i := len(active) - 1; i >= 0; i-- {
 			if S(active[i], "profile") != profile {
@@ -319,18 +486,111 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		changed = true
 		tasks, _ = s.Store.ListTasks(collectionID)
 		active = activeTasks(tasks)
-		latestCoordinator = nil
-		for i := len(active) - 1; i >= 0; i-- {
-			st := S(active[i], "status")
-			if S(active[i], "profile") == "coordinator" && (S(active[i], "title") == "Initial coordination" || S(active[i], "title") == "Acceptance revision") && (st == TaskPending || st == TaskReady || st == TaskWaiting) {
-				latestCoordinator = active[i]
-				break
-			}
-		}
+		latestCoordinator = selectGenerationCoordinator(active)
 		latestExplore = latestForCoordinator("explore")
 	}
 
+	latestResearch := latestForCoordinator("research")
+	if policy.ResearchRequired && latestCoordinator != nil && latestResearch == nil {
+		projectRow, e := s.Store.GetProject(S(collection, "project_id"))
+		if e != nil {
+			return false, e
+		}
+		if !ProjectConfigFromRow(projectRow).Capabilities.CurrentExternalResearch {
+			return false, &ResearchCapabilityError{CollectionID: collectionID}
+		}
+		pid := S(latestCoordinator, "id")
+		depth := I(latestCoordinator, "depth") + 1
+		blocking := ""
+		st := S(latestCoordinator, "status")
+		if st == TaskPending || st == TaskReady || st == TaskWaiting {
+			blocking = pid
+		}
+		oracleText := "Classify verification oracles as internal_test, black_box_test, independent_implementation, official_reference_oracle, or live_provider_oracle."
+		if policy.ExternalConformanceRequired {
+			oracleText += " At least one authoritative independent oracle is required when practical; an implementation-owned hand-written client is black_box_test, not official conformance."
+		}
+		_, _, e = s.Store.CreateTask(CreateTaskOptions{
+			ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "research",
+			Title:        "Fresh external research preflight",
+			Objective:    fmt.Sprintf("Before critique/material planning, research the CURRENT external facts that can change correctness for this Collection. Use fresh retrieval from authoritative first-party/standards sources rather than model memory. Deterministic policy categories: %s. Return structured JSON with as_of, sources, claims, verification_oracles, risks, unresolved, and summary. Each source MUST be an object with id, authority, authority_level, reference, and version/publication_date when available; authority_level must be one of official_specification, official_standard, official_release_notes, official_sdk, first_party, vendor_documentation, secondary, community. Each claim MUST have a stable id, MUST reference one source id, and MUST include claim, authority, normative_level (MUST/MUST_NOT/SHOULD/MAY/FACT/INFERENCE), planner_directive, directive_effect (preserve/strengthen/exception), confidence, and exception_decision_id when directive_effect=exception. Structured claims are authoritative; any legacy top-level planner_directives MUST exactly match claim planner_directives. Prefer current official specifications/standards, official release notes, official SDK/reference implementations, then other primary sources. Explicitly surface source conflicts and version/date scope. %s If no authoritative independent oracle is practical, state authoritative_oracle_unavailable_reason rather than misclassifying an implementation-owned black-box test. Do not implement or mutate the graph.", strings.Join(policy.Categories, ", "), oracleText),
+			Reason:       "Deterministic planning policy: fresh external evidence is required before critique/planning.",
+			ParentTaskID: pid, RequestedByTaskID: pid, WorkspaceMode: "collection", Depth: depth, AllowDedupe: false,
+			SpawnedByTaskID: pid, BlockingCallerTaskID: blocking,
+		})
+		if e != nil {
+			return false, e
+		}
+		changed = true
+		tasks, _ = s.Store.ListTasks(collectionID)
+		active = activeTasks(tasks)
+		latestCoordinator = selectGenerationCoordinator(active)
+		latestExplore = latestForCoordinator("explore")
+		latestResearch = latestForCoordinator("research")
+	}
+
+	criticObjective := fmt.Sprintf("Independently preflight the Collection objective before material planning. Consume completed repository exploration and fresh external research as primary evidence when present; explicitly compare local reality to authoritative external requirements and challenge any evidence->directive contradiction. Deterministic policy categories: %s. Treat inherited_research_constraints as canonical: for every research claim, preserve the exact inherited directive, strengthen it without replacing it, or cite a durable explicit exception. research_consistency.claims must record one disposition per inherited claim. Identify hidden requirements, scope hazards, security/state/concurrency semantics, assumptions, executable QA directives, and any acceptance contradiction. For network/security trust boundaries, explicitly threat-model exposure/bind behavior, authn/authz, origin/rebinding/CSRF-style threats where applicable, secrets/non-disclosure, privilege boundaries, input validation, rate/bounds, and auditability. For external protocol/provider work, require an authoritative independent oracle when practical and distinguish official reference evidence from implementation-owned black-box tests. Return concrete MUST/MUST NOT/VERIFY guidance for the coordinator; do not implement or mutate the graph.", func() string {
+		if len(policy.Categories) > 0 {
+			return strings.Join(policy.Categories, ", ")
+		}
+		return "implementation"
+	}())
+
 	latestCritic := latestForCoordinator("critic")
+	if policy.ResearchRequired && latestCoordinator != nil && latestCritic != nil && S(latestCritic, "status") == TaskComplete {
+		researchDeps, e := s.Store.ResearchAncestors(S(latestCritic, "id"))
+		if e != nil {
+			return false, e
+		}
+		if len(researchDeps) > 0 {
+			if consistencyErr := ValidateResearchConsumerResult(M(latestCritic, "result"), researchDeps, false); consistencyErr != nil {
+				deps := []string{}
+				if latestExplore != nil {
+					deps = append(deps, S(latestExplore, "id"))
+				}
+				if latestResearch != nil {
+					deps = append(deps, S(latestResearch, "id"))
+				}
+				replacement, _, createErr := s.Store.CreateTask(CreateTaskOptions{
+					ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "critic",
+					Title: "Revalidate inherited research constraints", Objective: criticObjective,
+					Reason:       "Current planning policy requires per-claim inherited research dispositions; prior critic result is not valid under the active generation contract: " + consistencyErr.Error(),
+					ParentTaskID: S(latestCoordinator, "id"), RequestedByTaskID: S(latestCoordinator, "id"), DependsOn: deps, WorkspaceMode: "collection", Depth: I(latestCoordinator, "depth") + 1, AllowDedupe: false,
+				})
+				if createErr != nil {
+					return false, createErr
+				}
+				if e := s.Store.SupersedeTask(S(latestCritic, "id"), S(replacement, "id"), "Revalidate active-generation critic under the current inherited research-constraint contract."); e != nil {
+					return false, e
+				}
+				repairCoordinatorID := ""
+				if S(latestCoordinator, "status") == TaskComplete {
+					repair, _, repairErr := s.Store.CreateTask(CreateTaskOptions{
+						ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "coordinator", Title: "Apply inherited research revalidation",
+						Objective:    fmt.Sprintf("Consume replacement critic %s after engine-contract revalidation. Reconcile the CURRENT material task contracts against inherited_research_constraints. Remove or correct any task-objective prose that conflicts with canonical research directives. Preserve scope otherwise. Ensure a fresh final plan-review gate evaluates the reconciled graph before any write task runs.", S(replacement, "id")),
+						Reason:       "The original planning coordinator had already completed before the stronger research-constraint contract was applied; a fresh coordinator must reconcile its material contracts.",
+						ParentTaskID: S(replacement, "id"), RequestedByTaskID: S(replacement, "id"), DependsOn: []string{S(replacement, "id")}, WorkspaceMode: "collection", Depth: I(replacement, "depth") + 1, AllowDedupe: false,
+					})
+					if repairErr != nil {
+						return false, repairErr
+					}
+					repairCoordinatorID = S(repair, "id")
+				}
+				_ = s.Store.Event(S(collection, "project_id"), collectionID, S(latestCritic, "id"), "", "RESEARCH_CONSISTENCY_REVALIDATION_REQUIRED", Row{"replacement_critic_task_id": S(replacement, "id"), "repair_coordinator_task_id": nullable(repairCoordinatorID), "reason": consistencyErr.Error()})
+				changed = true
+				tasks, _ = s.Store.ListTasks(collectionID)
+				active = activeTasks(tasks)
+				latestCritic = nil
+				for i := len(active) - 1; i >= 0; i-- {
+					if S(active[i], "profile") == "critic" && S(active[i], "status") != TaskSuperseded && S(active[i], "status") != TaskCancelled {
+						latestCritic = active[i]
+						break
+					}
+				}
+			}
+		}
+	}
+
 	if policy.CriticRequired && latestCoordinator != nil && latestCritic == nil {
 		pid := ""
 		depth := 1
@@ -347,15 +607,13 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		if latestExplore != nil {
 			deps = append(deps, S(latestExplore, "id"))
 		}
+		if latestResearch != nil {
+			deps = append(deps, S(latestResearch, "id"))
+		}
 		_, _, err = s.Store.CreateTask(CreateTaskOptions{
 			ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "critic",
-			Title: "Preflight implementation plan",
-			Objective: fmt.Sprintf("Independently preflight the Collection objective before material planning. Consume the completed repository exploration as primary evidence when present. Deterministic policy categories: %s. Identify hidden requirements, scope hazards, security/state/concurrency semantics, assumptions, executable QA directives, and any acceptance contradiction. Return concrete MUST/MUST NOT/VERIFY guidance for the coordinator; do not implement or mutate the graph.", func() string {
-				if len(policy.Categories) > 0 {
-					return strings.Join(policy.Categories, ", ")
-				}
-				return "implementation"
-			}()),
+			Title:        "Preflight implementation plan",
+			Objective:    criticObjective,
 			Reason:       "Deterministic planning policy: every implementation Collection receives an independent critic.",
 			ParentTaskID: pid, RequestedByTaskID: pid, DependsOn: deps, WorkspaceMode: "collection", Depth: depth, AllowDedupe: false,
 			SpawnedByTaskID: pid, BlockingCallerTaskID: blocking,
@@ -471,6 +729,38 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 	if len(critics) > 0 {
 		critic = critics[len(critics)-1]
 	}
+	researches := Rows{}
+	for _, t := range active {
+		if S(t, "profile") == "research" {
+			researches = append(researches, t)
+		}
+	}
+	var researchTask Row
+	if len(researches) > 0 {
+		researchTask = researches[len(researches)-1]
+	}
+	if policy.ResearchRequired && researchTask == nil {
+		projectRow, e := s.Store.GetProject(S(collection, "project_id"))
+		if e != nil {
+			return false, e
+		}
+		if !ProjectConfigFromRow(projectRow).Capabilities.CurrentExternalResearch {
+			return false, &ResearchCapabilityError{CollectionID: collectionID}
+		}
+		parent := reverseProfile(active, "coordinator")
+		pid := ""
+		depth := 1
+		if parent != nil {
+			pid = S(parent, "id")
+			depth = I(parent, "depth") + 1
+		}
+		researchTask, _, err = s.Store.CreateTask(CreateTaskOptions{ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "research", Title: "Policy fresh external research", Objective: fmt.Sprintf("Research current authoritative external facts required by this Collection before write work. Categories: %s. Use fresh retrieval, not model memory. Return structured as_of, sources, claims, verification_oracles, risks, unresolved, summary. Sources require id, authority, authority_level, reference; claims require stable id, source, authority, normative_level, planner_directive, directive_effect, confidence. Structured claims are authoritative; any top-level planner_directives must exactly match claim directives. Distinguish black-box tests from official_reference_oracle/live_provider_oracle and surface contradictions explicitly. If no authoritative independent oracle is practical, state authoritative_oracle_unavailable_reason.", strings.Join(policy.Categories, ", ")), Reason: "Deterministic planning policy: fresh external evidence required", ParentTaskID: pid, WorkspaceMode: "collection", Depth: depth, AllowDedupe: false})
+		if err != nil {
+			return false, err
+		}
+		researches = append(researches, researchTask)
+		changed = true
+	}
 	if policy.CriticRequired && critic == nil {
 		parent := reverseProfile(active, "coordinator")
 		depth := 1
@@ -479,12 +769,19 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 			depth = I(parent, "depth") + 1
 			pid = S(parent, "id")
 		}
-		critic, _, err = s.Store.CreateTask(CreateTaskOptions{ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "critic", Title: "Policy preflight critic", Objective: fmt.Sprintf("Independently preflight the Collection objective and current work graph before write work begins. Deterministic policy categories: %s. Identify hidden requirements, security/state semantics, scope hazards, assumptions, executable QA directives, and any task contract that knowingly violates a Collection MUST/MUST NOT or acceptance requirement. Treat known acceptance violations as planning blockers; do not accept a plan merely because a later review could catch or repair them. Return concrete MUST/MUST NOT/VERIFY guidance for the planner and plan reviewer; do not implement or mutate the graph.", func() string {
+		criticDeps := []string{}
+		for _, research := range researches {
+			criticDeps = append(criticDeps, S(research, "id"))
+		}
+		if researchTask != nil && !containsString(criticDeps, S(researchTask, "id")) {
+			criticDeps = append(criticDeps, S(researchTask, "id"))
+		}
+		critic, _, err = s.Store.CreateTask(CreateTaskOptions{ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "critic", Title: "Policy preflight critic", Objective: fmt.Sprintf("Independently preflight the Collection objective and current work graph before write work begins. Deterministic policy categories: %s. Consume fresh research when required and trace normative external requirements into MUST/MUST NOT/VERIFY guidance. Challenge evidence-to-directive contradictions and unsupported assumptions. For network/security work, perform an explicit threat-model challenge. For external protocols/providers, distinguish implementation-owned black-box tests from authoritative official/live conformance oracles. Identify hidden requirements, security/state semantics, scope hazards, assumptions, executable QA directives, and any task contract that knowingly violates a Collection MUST/MUST NOT or acceptance requirement. Treat known acceptance violations as planning blockers; do not accept a plan merely because a later review could catch or repair them. Return concrete guidance; do not implement or mutate the graph.", func() string {
 			if len(policy.Categories) > 0 {
 				return strings.Join(policy.Categories, ", ")
 			}
 			return "risk"
-		}()), Reason: "Deterministic planning policy: " + reasonText, ParentTaskID: pid, WorkspaceMode: "collection", Depth: depth, AllowDedupe: false})
+		}()), Reason: "Deterministic planning policy: " + reasonText, ParentTaskID: pid, DependsOn: criticDeps, WorkspaceMode: "collection", Depth: depth, AllowDedupe: false})
 		if err != nil {
 			return false, err
 		}
@@ -564,7 +861,16 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 			}
 		}
 		criticNotIncluded := policy.CriticRequired && critic != nil && (S(critic, "status") != TaskComplete || S(critic, "updated_at") > reviewed)
-		if reviewed < newestWrite || reviewed < newestCoord || criticNotIncluded {
+		researchNotIncluded := false
+		if policy.ResearchRequired {
+			for _, research := range researches {
+				if S(research, "status") != TaskComplete || S(research, "updated_at") > reviewed {
+					researchNotIncluded = true
+					break
+				}
+			}
+		}
+		if reviewed < newestWrite || reviewed < newestCoord || criticNotIncluded || researchNotIncluded {
 			planReview = nil
 		}
 	}
@@ -581,6 +887,17 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 	if planReview != nil && S(planReview, "status") != TaskComplete {
 		deps, _ := s.Store.Dependencies(S(planReview, "id"))
 		reviewDeps := depsIDSet(deps)
+		if policy.ResearchRequired {
+			for _, research := range researches {
+				if !reviewDeps[S(research, "id")] {
+					if err := s.Store.AddDependency(S(planReview, "id"), S(research, "id")); err != nil {
+						return false, err
+					}
+					reviewDeps[S(research, "id")] = true
+					changed = true
+				}
+			}
+		}
 		if policy.CriticRequired && critic != nil && !reviewDeps[S(critic, "id")] {
 			if err := s.Store.AddDependency(S(planReview, "id"), S(critic, "id")); err != nil {
 				return false, err
@@ -623,6 +940,11 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		if critic != nil {
 			deps = append(deps, S(critic, "id"))
 		}
+		for _, research := range researches {
+			if !containsString(deps, S(research, "id")) {
+				deps = append(deps, S(research, "id"))
+			}
+		}
 		parent := reverseProfile(active, "coordinator")
 		depth := 1
 		pid := ""
@@ -640,7 +962,7 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 				source = "initial_policy_plan_seal"
 			}
 		}
-		planReview, _, err = s.Store.CreateTask(CreateTaskOptions{ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "plan_review", Title: "Policy plan review", Objective: fmt.Sprintf("Independently review the current durable work graph before any implementation runs. Deterministic policy categories: %s. Use completed critic directives as required input. Verify that implementation tasks are decision-complete, security/state semantics are explicit, dependencies are coherent, verification is executable, and executing the graph exactly as written can satisfy every Collection MUST/MUST NOT and acceptance requirement without knowingly requiring a later repair for an already-visible defect. Return verdict pass/fail; a known acceptance violation is a true blocker. Name at most three actionable blockers.", func() string {
+		planReview, _, err = s.Store.CreateTask(CreateTaskOptions{ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "plan_review", Title: "Policy plan review", Objective: fmt.Sprintf("Independently review the current durable work graph before any implementation runs. Deterministic policy categories: %s. Use completed critic directives and required fresh research as authoritative planning inputs. Trace material external-contract directives back to research claims/sources; independently challenge contradictions, dropped MUST/MUST_NOT requirements, unsupported assumptions, stale evidence, and misclassified conformance oracles. Verify that implementation tasks are decision-complete, security/threat-model semantics are explicit, dependencies are coherent, verification is executable, and executing the graph exactly as written can satisfy every Collection MUST/MUST NOT and acceptance requirement without knowingly requiring a later repair for an already-visible defect. Return verdict pass/fail; a known acceptance violation is a true blocker. Name at most three actionable blockers.", func() string {
 			if len(policy.Categories) > 0 {
 				return strings.Join(policy.Categories, ", ")
 			}
@@ -666,7 +988,7 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		}
 	}
 	if changed {
-		_ = s.Store.Event(S(collection, "project_id"), collectionID, "", "", "PLANNING_POLICY_ENFORCED", Row{"explore_required": policy.ExploreRequired, "critic_required": policy.CriticRequired, "plan_review_required": policy.PlanReviewRequired, "categories": policy.Categories, "critic_task_id": func() any {
+		_ = s.Store.Event(S(collection, "project_id"), collectionID, "", "", "PLANNING_POLICY_ENFORCED", Row{"explore_required": policy.ExploreRequired, "research_required": policy.ResearchRequired, "critic_required": policy.CriticRequired, "plan_review_required": policy.PlanReviewRequired, "external_conformance_required": policy.ExternalConformanceRequired, "threat_model_required": policy.ThreatModelRequired, "categories": policy.Categories, "critic_task_id": func() any {
 			if critic != nil {
 				return S(critic, "id")
 			}
@@ -814,7 +1136,23 @@ func (s *Scheduler) ensureReview(project, collection, impl Row) error {
 	if existing != nil {
 		return nil
 	}
+	lineage, reconciliationRequired, err := s.taskInputLineageChanged(impl)
+	if err != nil {
+		return err
+	}
 	deps := []string{S(impl, "id")}
+	policy := ClassifyPlanningPolicy(S(collection, "objective"))
+	if policy.ResearchRequired {
+		tasks, e := s.Store.ListTasks(S(collection, "id"))
+		if e != nil {
+			return e
+		}
+		for _, task := range tasks {
+			if S(task, "profile") == "research" && S(task, "status") == TaskComplete && !containsString(deps, S(task, "id")) {
+				deps = append(deps, S(task, "id"))
+			}
+		}
+	}
 	title := "Review " + S(impl, "title")
 	objective := fmt.Sprintf("Independently review implementation task %s against its objective and acceptance intent. Inspect the integrated code, run appropriate checks, and return verdict pass/fail. If repair is required, request a blocking implement task rather than changing code yourself.", S(impl, "id"))
 	reason := "Praector policy requires independent review of every implementation task."
@@ -837,6 +1175,12 @@ func (s *Scheduler) ensureReview(project, collection, impl Row) error {
 		objective = fmt.Sprintf("Perform a fresh independent post-repair review. Repair implementation %s was created because review %s returned verdict=fail. Re-evaluate the repaired integrated candidate from scratch against the original acceptance intent and the repair objective; do not rely on the prior review's conclusions. Return verdict pass/fail.", S(impl, "id"), S(failedParentReview, "id"))
 		reason = "A semantic review failure was repaired; policy requires a fresh independent review task/context."
 	}
+	if reconciliationRequired {
+		baseTitle := title
+		title = "Reconcile and review " + S(impl, "title")
+		objective = fmt.Sprintf("Input lineage changed while implementation %s was running. Reconcile the completed/integrated work against the CURRENT accepted material plan, fresh research evidence, and prerequisite state before returning verdict pass/fail. Do not assume the implementation's starting evidence is still valid. Starting material fingerprint=%s; current=%s; starting dependency digest=%s; current=%s. Re-run the relevant verification against the current integrated candidate. If compatibility requires code changes, request a blocking repair implementation rather than changing code yourself. This reconciliation also satisfies the normal independent review obligation. Prior review framing: %s", S(impl, "id"), S(lineage, "start_material_plan_fingerprint"), S(lineage, "current_material_plan_fingerprint"), S(lineage, "start_dependency_lineage_digest"), S(lineage, "current_dependency_lineage_digest"), baseTitle)
+		reason = "The implementation ran against prerequisite/planning evidence that changed before integration; durable reconciliation is required before acceptance."
+	}
 	review, _, err := s.Store.CreateTask(CreateTaskOptions{
 		ProjectID: S(impl, "project_id"), CollectionID: S(impl, "collection_id"), Profile: "review", Title: title,
 		Objective: objective,
@@ -855,6 +1199,15 @@ func (s *Scheduler) ensureReview(project, collection, impl Row) error {
 	}
 	if failedParentReview != nil {
 		_ = s.Store.Event(S(impl, "project_id"), S(impl, "collection_id"), S(review, "id"), "", "POST_REPAIR_REVIEW_CREATED", Row{"failed_review_task_id": S(failedParentReview, "id"), "repair_task_id": S(impl, "id"), "original_implementation_task_ids": originalVerificationSources})
+	}
+	if reconciliationRequired {
+		payload := Row{}
+		for k, v := range lineage {
+			payload[k] = v
+		}
+		payload["implementation_task_id"] = S(impl, "id")
+		payload["reconciliation_review_task_id"] = S(review, "id")
+		_ = s.Store.Event(S(impl, "project_id"), S(impl, "collection_id"), S(impl, "id"), "", "RECONCILIATION_REQUIRED", payload)
 	}
 	if S(impl, "workspace_mode") == "inherit" && S(impl, "parent_task_id") != "" {
 		parent, err := s.Store.GetTask(S(impl, "parent_task_id"))
@@ -1017,6 +1370,11 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 		}
 		_ = s.Store.FinishAttempt(S(attempt, "id"), AttemptFailed, nil, Row{"error": execErr.Error()}, "", logPath)
 		_ = s.Store.Event(S(task, "project_id"), S(task, "collection_id"), taskID, S(attempt, "id"), "EXECUTOR_ERROR", Row{"error": execErr.Error()})
+	}
+
+	if err = s.recordTaskInputLineage(task, attempt); err != nil {
+		handleErr(fmt.Errorf("record task input lineage: %w", err))
+		return
 	}
 
 	workdir, err = s.Workspace.PrepareTask(project, collection, task)
@@ -1198,10 +1556,16 @@ func (s *Scheduler) reconcileCollection(collectionID string) (string, error) {
 	if _, err = s.Store.EnsureCollectionEntrypoint(collectionID); err != nil {
 		return "", err
 	}
+	if _, err = s.enforceResearchRequests(collectionID); err != nil {
+		return "", err
+	}
 	if _, err = s.Store.RefreshWaitingTasks(collectionID); err != nil {
 		return "", err
 	}
 	if _, err = s.enforcePlanningPolicy(collectionID); err != nil {
+		return "", err
+	}
+	if _, err = s.enforceResearchRequests(collectionID); err != nil {
 		return "", err
 	}
 	if _, err = s.Store.RefreshWaitingTasks(collectionID); err != nil {
@@ -1221,6 +1585,30 @@ func (s *Scheduler) reconcileCollectionSafely(collectionID string) string {
 	if err == nil {
 		delete(s.quarantined, collectionID)
 		return state
+	}
+	var capErr *ResearchCapabilityError
+	if errors.As(err, &capErr) {
+		s.quarantined[collectionID] = true
+		c, _ := s.Store.GetCollection(collectionID)
+		if S(c, "status") != "BLOCKED" {
+			_ = s.Store.SetCollectionStatus(collectionID, "BLOCKED", true)
+		}
+		events, _ := s.Store.EventsForCollection(collectionID, 50)
+		recorded := false
+		for _, e := range events {
+			if S(e, "event_type") == "RESEARCH_CAPABILITY_REQUIRED" && S(JSONMap(S(e, "payload_json")), "error") == err.Error() {
+				recorded = true
+				break
+			}
+		}
+		if !recorded {
+			_ = s.Store.Event(S(c, "project_id"), collectionID, "", "", "RESEARCH_CAPABILITY_REQUIRED", Row{"error": err.Error(), "required_capability": "current_external_research"})
+		}
+		if !s.reportedQuarantines[collectionID] {
+			fmt.Printf("praector: collection %s blocked: %v\n", collectionID, err)
+			s.reportedQuarantines[collectionID] = true
+		}
+		return "BLOCKED"
 	}
 	var cyc *DependencyCycleError
 	if !errors.As(err, &cyc) {

@@ -24,6 +24,11 @@ class Limits:
 
 
 @dataclass(slots=True)
+class ProjectCapabilities:
+    current_external_research: bool = True
+
+
+@dataclass(slots=True)
 class ProjectConfig:
     project_id: str
     name: str
@@ -33,6 +38,7 @@ class ProjectConfig:
     opencode_command: str = "opencode"
     models: dict[str, str] = field(default_factory=dict)
     limits: Limits = field(default_factory=Limits)
+    capabilities: ProjectCapabilities = field(default_factory=ProjectCapabilities)
 
     def model_for(self, profile: str) -> str | None:
         value = self.models.get(profile, "").strip()
@@ -95,6 +101,7 @@ def read_project_marker(path: Path) -> ProjectConfig:
     harness = data.get("harness", {})
     models = data.get("models", {})
     limits_raw = data.get("limits", {})
+    capabilities_raw = data.get("capabilities", {})
     root_value = workspace.get("repository", "../..")
     root_path = (path.parent / root_value).resolve() if not Path(root_value).is_absolute() else Path(root_value).resolve()
     limits = Limits(
@@ -114,6 +121,7 @@ def read_project_marker(path: Path) -> ProjectConfig:
         opencode_command=str(harness.get("command", "opencode")),
         models={name: str(models.get(name, "")) for name in PROFILE_NAMES},
         limits=limits,
+        capabilities=ProjectCapabilities(current_external_research=bool(capabilities_raw.get("current_external_research", True))),
     )
 
 
@@ -148,6 +156,9 @@ def write_project_marker(config: ProjectConfig) -> Path:
     lines.extend(
         [
             "",
+            "[capabilities]",
+            f"current_external_research = {'true' if config.capabilities.current_external_research else 'false'}",
+            "",
             "[limits]",
             f"max_task_depth = {config.limits.max_task_depth}",
             f"max_tasks_per_collection = {config.limits.max_tasks_per_collection}",
@@ -167,6 +178,7 @@ def project_config_to_json(config: ProjectConfig) -> dict[str, Any]:
         "harness": config.harness,
         "opencode_command": config.opencode_command,
         "models": config.models,
+        "capabilities": {"current_external_research": config.capabilities.current_external_research},
         "limits": {
             "max_task_depth": config.limits.max_task_depth,
             "max_tasks_per_collection": config.limits.max_tasks_per_collection,
@@ -195,6 +207,7 @@ def project_config_from_row(row: dict[str, Any]) -> ProjectConfig:
         harness=str(raw.get("harness", "opencode")),
         opencode_command=str(raw.get("opencode_command", "opencode")),
         models={name: str(raw.get("models", {}).get(name, "")) for name in PROFILE_NAMES},
+        capabilities=ProjectCapabilities(current_external_research=bool(raw.get("capabilities", {}).get("current_external_research", True))),
         limits=Limits(
             max_task_depth=int(limits_raw.get("max_task_depth", 8)),
             max_tasks_per_collection=int(limits_raw.get("max_tasks_per_collection", 100)),

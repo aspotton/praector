@@ -34,6 +34,7 @@ class GateHarness:
                 "status": self.review_status,
                 "created_at": self.review_created,
                 "updated_at": self.review_updated,
+                "result_json": '{"verdict":"pass"}',
             }]
         if "from_task_id='T-PLAN'" in query and "to_task_id='T-IMPL'" in query:
             return [{"ok": 1}] if self.include_review_edge else []

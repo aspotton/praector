@@ -261,7 +261,7 @@ func cmdInit(args []string) int {
 		for _, n := range ProfileNames {
 			models[n] = ""
 		}
-		cfg = ProjectConfig{ProjectID: MakeID("PRJ"), Name: filepath.Base(root), Root: root, BaseBranch: br, Harness: "opencode", OpenCodeCommand: oc, Models: models, Limits: DefaultLimits()}
+		cfg = ProjectConfig{ProjectID: MakeID("PRJ"), Name: filepath.Base(root), Root: root, BaseBranch: br, Harness: "opencode", OpenCodeCommand: oc, Models: models, Limits: DefaultLimits(), Capabilities: DefaultProjectCapabilities()}
 	}
 	if x := p.str("name"); x != "" {
 		cfg.Name = x

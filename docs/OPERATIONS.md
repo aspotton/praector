@@ -229,6 +229,8 @@ praector logs COL-... --tail 50
 
 Because log paths are recorded before OpenCode launches, live Attempts can be inspected while they are running.
 
+Managed OpenCode prompts are streamed over stdin rather than placed in the child process argument vector. This keeps large exploration/research/critic envelopes intact without hitting operating-system argv limits; Praector closes stdin after writing so headless OpenCode observes EOF deterministically. Attempt logs retain prompt byte count and SHA-256 and record `prompt_transport=stdin`.
+
 ## Understand `BLOCKED`
 
 A Collection becomes `BLOCKED` when incomplete work remains but no Task is currently executing or runnable and no durable harness Session for the Collection is still running. A parent Task may briefly be `WAITING` while its OpenCode Session finishes; that state remains `RUNNING`, not `BLOCKED`.
@@ -584,3 +586,14 @@ Coordinator-requested final review is single-flight. If a non-failed nonterminal
 - `coordinator -> plan_review` when that review already reaches back to the coordinator.
 
 Each removal emits `LEGACY_DEPENDENCY_CYCLE_REPAIRED`. If a cycle has another shape, Praector does not infer a destructive repair. The Collection is set `BLOCKED`, emits `DEPENDENCY_CYCLE_QUARANTINED`, and is excluded from task scheduling while other Collections continue through the same daemon. The daemon prints the quarantine once per process for visibility.
+
+## External-research capability
+
+Project markers include:
+
+```toml
+[capabilities]
+current_external_research = true
+```
+
+The default is `true`, including for legacy project rows that predate the field. Set it to `false` when the configured harness must not be trusted to retrieve current external information. A Collection that deterministically needs fresh research, or a specialist that raises `RESEARCH_REQUIRED`, is then blocked/quarantined with `RESEARCH_CAPABILITY_REQUIRED` rather than continuing from model memory. Re-run project initialization/registration after changing durable project configuration so the stored project config is refreshed.

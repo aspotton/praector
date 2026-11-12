@@ -65,7 +65,23 @@ Near-term platform work:
 
 The goal is full Windows support, not a permanently experimental port.
 
-## 3. MCP interface
+## 3. Evidence-aware orchestration quality
+
+Praector should treat current external evidence as durable planning input when correctness depends on changing reality rather than model memory. The current baseline can require fresh research alongside repository exploration, feed both into critic and plan review, record structured source/claim provenance, and stale material planning when accepted external evidence changes.
+
+Continue hardening this layer through real dogfood runs:
+
+- expand deterministic freshness classification without making purely local work pay an unnecessary research cost;
+- improve authoritative-source selection and contradiction handling for standards, APIs, vendor behavior, laws/regulations, security guidance, and current events;
+- exercise `RESEARCH_REQUIRED` round-trips raised by critic, plan-review, review, and advise tasks;
+- prefer official/reference/provider verification oracles for external contracts, while distinguishing them from implementation-owned black-box tests;
+- stress prerequisite/evidence lineage changes while downstream implementation is already running, including reconciliation and fresh-review behavior;
+- extend capability-aware routing beyond current external research as additional harness capabilities become relevant;
+- improve operator visibility into why research was required, which evidence made a plan stale, and why reconciliation was triggered.
+
+The design goal is traceable reasoning rather than more ceremony: authoritative evidence should be able to flow into durable claims, planner directives, implementation contracts, and independent verification without silently changing meaning along the way.
+
+## 4. MCP interface
 
 MCP is a first-class Praector interface for coding agents and human-facing agents. It must expose the same durable **domain operations** as the CLI rather than invoking CLI subprocesses or maintaining a second orchestration implementation. The normal user experience should be that a human talks to an MCP-capable agent, and that agent can inspect and operate Praector with the same authority/policy boundaries as an equivalent CLI caller.
 
@@ -141,7 +157,7 @@ Before exposing Praector beyond trusted loopback clients:
 - bound/rate-limit expensive reads and work-creating mutations;
 - support explicit remote-server configuration rather than changing the safe local default.
 
-## 4. Human and executive escalation
+## 5. Human and executive escalation
 
 Praector should remain the delegated command layer, with humans or an executive agent above it for choices that exceed delegated authority.
 
@@ -183,7 +199,7 @@ MCP makes this especially useful: an executive/human-facing application can subs
 
 No worker may infer approval from prose or bypass the durable escalation record.
 
-## 5. Broader control-plane evolution
+## 6. Broader control-plane evolution
 
 Later extensions, after the local core and MCP boundary are solid:
 

@@ -15,7 +15,7 @@ var profileGuidance = map[string]profileGuide{
 	"explore":     {"Map the existing repository/system surface relevant to the Collection objective before planning.", "Inspect relevant files, modules, tests, configuration, runtime boundaries, callers/dependencies, existing patterns, and documentation; return evidence-grounded current-state context.", "Solution design, architecture preference, implementation, graph mutation, or independent review."},
 	"critic":      {"Challenge the request before planning by surfacing hidden intent, ambiguity, scope hazards, and verification gaps.", "Intent classification, evidence-grounded gap analysis, planner directives, risk/assumption analysis, and QA directives.", "Implementation or graph mutation. Request bounded research only when decisive evidence is genuinely missing."},
 	"plan_review": {"Independently determine whether the proposed durable work graph is executable without blocking gaps.", "Reference checks, task executability, dependency coherence, scope coherence, and verification-plan review.", "Plan repair or implementation. Return a verdict; Praector/coordinator handles graph repair."},
-	"research":    {"Investigate a bounded question and return verifiable evidence.", "Repository investigation, evidence gathering, source comparison, and analysis within the assigned question.", "Independent specialist work, implementation, architecture changes, or review outside this task's scope."},
+	"research":    {"Resolve a bounded factual uncertainty with current, verifiable evidence when freshness matters.", "Authoritative source retrieval, version/date scoping, claim-to-directive traceability, oracle classification, and explicit uncertainty/contradiction reporting.", "Implementation, architecture changes, or pretending model memory is current evidence when fresh retrieval is required."},
 	"implement":   {"Make the bounded code/file change assigned by this task and prove it works.", "Inspect relevant code, implement the requested change, run tests/checks, and debug your own implementation.", "External research, architecture decisions, independent review, or materially separate implementation scope."},
 	"review":      {"Independently verify completed implementation against its objective and acceptance intent.", "Inspect integrated code/diffs, run appropriate checks/tests/smoke tests, identify material defects, and determine pass/fail.", "Repairs. If defects require changes, return fail; Praector creates/resumes bounded implementation repair work."},
 	"advise":      {"Provide deep technical judgment and one concrete recommendation without owning implementation.", "Reason about the bounded question, tradeoffs, risks, assumptions, confidence, and recommendation.", "Implementation or review. Request bounded research only when a decisive factual gap remains."},
@@ -25,13 +25,13 @@ var availableProfiles = map[string]string{
 	"explore":     "Use for broad repository/system discovery before planning: what exists, how it connects, and what constraints matter.",
 	"critic":      "Use for pre-planning gap analysis: hidden intent, ambiguity, scope hazards, assumptions, and QA directives.",
 	"plan_review": "Use to review whether a proposed graph/task plan is executable before write work begins.",
-	"research":    "Use for additional facts, repository investigation, authoritative evidence, or bounded discovery.",
+	"research":    "Use for bounded authoritative evidence gathering; freshness-sensitive work must use current external retrieval and structured claim/source/oracle evidence.",
 	"implement":   "Use when an actual code/file change must be produced.",
 	"review":      "Use for independent post-implementation verification and pass/fail judgment.",
 	"advise":      "Use for difficult conceptual/architectural judgment and a concrete recommendation.",
 }
 
-var resultKeys = []string{"verdict", "recommendation", "confidence", "intent_classification", "planner_directives", "qa_directives", "assumptions", "findings", "evidence", "artifacts", "risks", "unresolved"}
+var resultKeys = []string{"verdict", "recommendation", "confidence", "intent_classification", "planner_directives", "qa_directives", "assumptions", "findings", "evidence", "artifacts", "risks", "unresolved", "as_of", "sources", "claims", "verification_oracles", "research_consistency", "authoritative_oracle_unavailable_reason", "oracle_exception_decision_id", "research_required"}
 
 const readOnlyCapabilityPrompt = "This task is read-only. Editor permissions are denied, but shell commands, tests, imports, build tools, and smoke checks can still create or modify repository files. Treat **no net workspace mutation** as part of the task's completion contract.\n\n" +
 	"- At the start of the attempt, capture the worktree state (normally `git status --porcelain=v1 --untracked-files=all`) so you know the baseline.\n" +
@@ -84,6 +84,22 @@ func resultSummary(row Row) Row {
 		}
 	}
 	return out
+}
+
+func inheritedResearchConstraints(deps Rows) ([]any, error) {
+	constraints, err := ResearchClaimConstraints(deps)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]any, 0, len(constraints))
+	for _, constraint := range constraints {
+		out = append(out, Row{
+			"claim_id": constraint.ClaimRef, "research_task_id": constraint.TaskID,
+			"normative_level": constraint.NormativeLevel, "authority": constraint.Authority,
+			"source": constraint.Source, "planner_directive": constraint.PlannerDirective,
+		})
+	}
+	return out, nil
 }
 
 func graphSnapshot(store *Store, collectionID string) (Row, error) {
@@ -151,6 +167,14 @@ func BuildTaskEnvelope(store *Store, project, collection, task, attempt Row) (st
 	for _, d := range decisions {
 		decs = append(decs, Row{"id": S(d, "id"), "statement": S(d, "statement"), "rationale": S(d, "rationale")})
 	}
+	researchAncestors, err := store.ResearchAncestors(S(task, "id"))
+	if err != nil {
+		return "", err
+	}
+	inheritedConstraints, err := inheritedResearchConstraints(researchAncestors)
+	if err != nil {
+		return "", err
+	}
 	ctx := Row{
 		"project":                Row{"id": S(project, "id"), "name": S(project, "name"), "base_branch": S(project, "base_branch")},
 		"workspace":              Row{"assigned_worktree": S(task, "worktree_path"), "mode": S(task, "workspace_mode"), "rule": "All repository/file/shell operations for this attempt must stay inside assigned_worktree."},
@@ -158,7 +182,8 @@ func BuildTaskEnvelope(store *Store, project, collection, task, attempt Row) (st
 		"task":                   Row{"id": S(task, "id"), "profile": S(task, "profile"), "title": S(task, "title"), "objective": S(task, "objective"), "reason": S(task, "reason"), "workspace_mode": S(task, "workspace_mode")},
 		"attempt":                Row{"id": S(attempt, "id"), "number": I(attempt, "attempt_no")},
 		"completed_dependencies": completed, "project_and_collection_memory": mems, "active_decisions": decs,
-		"planning_policy": planning.AsRow(), "delivery_policy": delivery.AsRow(),
+		"inherited_research_constraints": inheritedConstraints,
+		"planning_policy":                planning.AsRow(), "delivery_policy": delivery.AsRow(),
 		"control_plane": Row{"command": "praector", "executable_env": "PRAECTOR_CLI", "rule": "Use `praector` for durable control-plane commands. Worker PATH contains a dedicated Praector shim even when the parent Python virtualenv is sanitized."},
 	}
 	if parent != nil {

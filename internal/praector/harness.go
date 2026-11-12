@@ -286,12 +286,18 @@ func (h *OpenCodeHarness) RunTask(prompt, workdir, profile, model string, taskEn
 	if strings.TrimSpace(model) != "" {
 		args = append(args, "--model", model)
 	}
-	args = append(args, prompt)
 
 	ctx := context.Background()
 	cmd := exec.CommandContext(ctx, h.Command, args...)
 	cmd.Dir = workdir
 	cmd.Env = envList(processEnv)
+	// Prompts can become very large once exploration/research evidence is
+	// embedded in a critic or plan-review envelope. Passing the prompt as a
+	// positional argv element can exceed the platform exec argument limit
+	// (E2BIG) before OpenCode starts. OpenCode run consumes non-TTY stdin as
+	// prompt input, so stream the complete prompt there instead of truncating
+	// evidence or growing argv. strings.Reader reaches EOF deterministically.
+	cmd.Stdin = strings.NewReader(prompt)
 	configureChildProcess(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -345,7 +351,7 @@ func (h *OpenCodeHarness) RunTask(prompt, workdir, profile, model string, taskEn
 	}
 
 	hash := sha256.Sum256([]byte(prompt))
-	header := fmt.Sprintf("# HARNESS\ncommand=%s\nprofile=%s\nworkdir=%s\nmodel=%s\nprompt_bytes=%d\nprompt_sha256=%s\nsanitize_parent_venv=%t\nvirtual_env=%s\npraector_control=%s\n", h.Command, profile, workdir, model, len([]byte(prompt)), hex.EncodeToString(hash[:]), sanitize, processEnv["VIRTUAL_ENV"], control)
+	header := fmt.Sprintf("# HARNESS\ncommand=%s\nprofile=%s\nworkdir=%s\nmodel=%s\nprompt_bytes=%d\nprompt_sha256=%s\nprompt_transport=stdin\nsanitize_parent_venv=%t\nvirtual_env=%s\npraector_control=%s\n", h.Command, profile, workdir, model, len([]byte(prompt)), hex.EncodeToString(hash[:]), sanitize, processEnv["VIRTUAL_ENV"], control)
 	_ = os.WriteFile(logPath, []byte(header+"# STDOUT\n"+stdout.String()+"\n# STDERR\n"+stderr.String()), 0644)
 
 	sessionID := ""

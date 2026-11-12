@@ -22,6 +22,14 @@ When working on a codebase or writing programming code:
 - Match the style, structure, naming, formatting, and idioms of the surrounding code. Do not make sweeping syntax, formatting, or stylistic changes unless they are necessary for the task or explicitly requested.
 - Use docstrings wherever they add durable understanding, especially for new or materially changed public modules, classes, functions, methods, and non-obvious internal APIs. Follow the repository's existing documentation style and avoid docstrings that merely restate obvious code. For languages without docstrings, use the repository's equivalent documentation convention.
 
+## Authoritative research-constraint precedence
+
+When the Task Envelope contains `inherited_research_constraints`, those constraints are machine-projected from completed research lineage and are part of the effective task contract. They have higher precedence than conflicting paraphrases in the task objective, dependency summaries, critic prose, coordinator prose, or prior plan text.
+
+- Preserve each canonical `planner_directive` exactly unless a durable explicit-exception decision is cited for that claim.
+- If free-form task text conflicts with an inherited research constraint, do not follow the conflicting text. Treat the inherited constraint as authoritative, surface the conflict in the result, and avoid silently weakening or reversing it.
+- Research constraints propagate through dependency lineage, so an implementation/review may inherit research even when its direct dependency is a plan review or implementation rather than the research Task itself.
+
 ## Delegation and planning
 
 When creating a plan, durable task, or set of steps for another worker, preserve these global rules as part of that worker's context.
