@@ -113,7 +113,7 @@ When changing a subsystem, update the corresponding docs in the same change:
 
 | Change | Update |
 | --- | --- |
-| CLI command/flag/output | `docs/CLI.md`, and README/OPERATIONS if user-facing workflow changes |
+| CLI command/flag/output | `docs/CLI.md`, `.agents/skills/praector/references/cli.md` (derive the usage table from `internal/praector/help.go` `commandHelp`; enforced by `TestSkillCLICommandHelpCoversCommandHelp`), and README/OPERATIONS if user-facing workflow changes |
 | Runtime global/profile prompt semantics | `internal/assets/prompts/global.md`, `docs/PROFILES.md`, `docs/AGENT_PROTOCOL.md`, possibly `docs/ARCHITECTURE.md` |
 | Deterministic planning-gate policy | `docs/PROFILES.md`, `docs/AGENT_PROTOCOL.md`, `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md` |
 | Task Envelope/delegation/result schema | `docs/AGENT_PROTOCOL.md`, possibly `docs/ARCHITECTURE.md` |
