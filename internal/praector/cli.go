@@ -473,6 +473,7 @@ func cmdDaemon(args []string) int {
 		if e != nil {
 			return fail(e)
 		}
+		defer store.CloseEventSink() // drain open SSE streams (http.Close does not unblock a GET handler)
 		defer mcpSrv.Close()
 		go func() {
 			if err := mcpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

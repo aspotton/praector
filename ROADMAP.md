@@ -109,6 +109,14 @@ auth, richer escalation integration) stays on the roadmap.
 
 When MCP is enabled, the running Praector daemon hosts the MCP endpoint. Target the modern stateless MCP model and Streamable HTTP for network clients. Default binding should be loopback-only (`127.0.0.1` / `::1`) so local coding agents can connect without exposing Praector on the LAN. Remote/LAN/Tailscale/public binding is a separate explicit security mode requiring authentication/authorization. An optional stdio bridge may be useful for clients that insist on spawning a local MCP process, but it should bridge to the same service layer rather than become a second server implementation.
 
+### Server-initiated push: current scope and the deferred migration
+
+Praector's current push surface (`GET /mcp` → SSE `notifications/message`, plus the durable `events` read surface and the `TASK_*`/`COLLECTION_*` status-transition events) targets **MCP 2025-06-18** explicitly, where GET-SSE + `notifications/message` + Last-Event-ID replay is the spec-supported mechanism. This is version scope, not a claim of conformance to the newest revision. The MCP **2026-07-28** revision removes the GET-SSE/Last-Event-ID mechanism in favour of a different model, so adopting it is deferred roadmap work, not current behavior:
+
+- **`subscriptions/listen` + multi-round-trip (MRTR)**: the 2026-07-28 replacement for GET-SSE. When adopted, the durable `events` table + `(created_at, id)` cursor seam built for the current stream is the natural replay substrate; the stream-registry/level/replay state already lives in the wiring layer (`mcp_sse.go`), so a future transport can swap the delivery channel without touching the domain-agnostic `mcp/` core or the store write path.
+- **`resources/subscribe` / `notifications/resources/updated` and per-entity resource URIs** (e.g. `praector://collection/COL-*`): deferred. Resources are currently one-per-command namespace and the `commandHelp`→`mcpSurface` 1:1 parity invariant in `mcp_parity_test.go` would break; making per-entity resources is a deliberate documented change, not an incidental one.
+- **Server-to-client JSON-RPC requests** (sampling, roots, ping-to-client): intentionally absent; there is no plan to introduce them as part of push.
+
 ### Agent-facing state surface
 
 Use resources for durable inspectable state and tools for parameterized queries/actions. Expose at minimum:

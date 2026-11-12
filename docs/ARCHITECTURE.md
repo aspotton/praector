@@ -599,7 +599,24 @@ The design leaves room for later additions without making them current dependenc
     `text/plain` for CLI/help text); the authoritative independent conformance
     oracle is an official MCP client (Inspector CLI / Tier-1 SDK), with the
     Praector-owned black-box probe `scripts/mcp_conformance.py` as an additional
-    non-authoritative check against a live loopback listener;
+    non-authoritative check against a live loopback listener.
+
+  The push surface targets the **MCP 2025-06-18** revision (see `docs/STATE_AND_RECOVERY.md` for the
+    durable event cursor and the SSE replay model, and `ROADMAP.md` for the deferred 2026-07-28
+    subscriptions/listen + MRTR migration). A `GET /mcp` that advertises
+    `Accept: text/event-stream` opens an **observation-only** SSE stream carrying only
+    `notifications/message` logging frames — never a JSON-RPC response — while a `GET`
+    that does not advertise SSE still receives 405 (POST surface byte-for-byte unchanged).
+    A `GET` is gated **identically to POST**: the same loopback-authority gate runs above
+    method dispatch, and the `MCP-Protocol-Version` header is required **unconditionally**
+    before a stream opens (GET has no JSON-RPC body to name a version). Fan-out is
+    strictly **non-blocking** on the write path: every event writer hands a pending
+    payload to a bounded side-channel, and a single drain goroutine outside the Dolt file
+    lock delivers it; a stalled, slow, or vanished client causes at most a drop plus that
+    client's stream close, never a stall in `Store.Event()` or the scheduler. All SSE
+    stream/level/replay state lives in the Praector wiring layer (`mcp_server.go` +
+    `mcp_sse.go`), never inside the domain-agnostic `internal/praector/mcp` package
+    (decision DEC-17fa4b4aff).
 
 - **durable human/executive escalation** above Projects/Collections, with blocked work waiting on recorded decisions rather than live session continuity;
 - **additional harnesses** through the native harness boundary;
