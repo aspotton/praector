@@ -137,6 +137,8 @@ Append-style causal/operational event records.
 
 Events make it possible to inspect what happened without reconstructing every transition from current rows alone.
 
+`praector events [TARGET]` reads this table **directly from the store** (no daemon required). Ordering is deterministic and oldest-first by `created_at` then `id`; `created_at DATETIME(6)` is the monotonic ordering key while `EVT` ids are random hex, so a page emits a `next_cursor` packing the last row's `(created_at, id)` pair as one opaque token. Passing it back as `--since` is an **exclusive** composite cursor that never repeats or skips a row across pages. A collection- or task-scoped read uses the existing `(collection_id, created_at)` / `(task_id, created_at)` indexes; a project-only read has no index and is therefore always bounded by `--limit`.
+
 ### `memories`
 
 Project/Collection durable context.

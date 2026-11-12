@@ -342,6 +342,18 @@ Because log paths are recorded before OpenCode launches, live Attempts can be in
 
 Managed OpenCode prompts are streamed over stdin rather than placed in the child process argument vector. This keeps large exploration/research/critic envelopes intact without hitting operating-system argv limits; Praector closes stdin after writing so headless OpenCode observes EOF deterministically. Attempt logs retain prompt byte count and SHA-256 and record `prompt_transport=stdin`.
 
+## Inspect the durable event log
+
+The `events` command reads the durable `events` table **directly from the store**, so it works with no daemon running:
+
+```bash
+praector events COL-... --type COLLECTION_CREATED
+praector events COL-... --since CURSOR --limit 50
+praector events T-... --type TASK_FAILED
+```
+
+Rows are returned oldest-first by `created_at` then `id`. Each page prints a `next_cursor`; pass it back unchanged as `--since` for the next page (an exclusive composite cursor, so paging never repeats or skips a row). A project-scoped read (`praector events --project PRJ-...`) is always bounded by `--limit`. See [CLI](CLI.md#events) and [State and Recovery](STATE_AND_RECOVERY.md#events).
+
 ## Understand `BLOCKED`
 
 A Collection becomes `BLOCKED` when incomplete work remains but no Task is currently executing or runnable and no durable harness Session for the Collection is still running. A parent Task may briefly be `WAITING` while its OpenCode Session finishes; that state remains `RUNNING`, not `BLOCKED`.

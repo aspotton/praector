@@ -21,6 +21,15 @@ EXPECTED_COMMANDS = {
     "profile", "project", "task", "context", "coordinator", "result", "memory", "decision",
 }
 
+# Commands that exist ONLY in the native Go executable with no Python reference
+# counterpart, following the same precedent that the MCP server surface is
+# native-only. `events` (a direct store-read event-log surface) is deliberately
+# absent from EXPECTED_COMMANDS so command_names() ignores it and the
+# surface-equality checks below are unaffected; documenting the exemption here
+# keeps the decision explicit rather than discovered by accident. See
+# docs/CLI.md and docs/STATE_AND_RECOVERY.md.
+NATIVE_ONLY_COMMANDS = {"events"}
+
 
 def run(cmd: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=ROOT, env=env, text=True, capture_output=True, check=False)

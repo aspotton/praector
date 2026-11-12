@@ -122,6 +122,23 @@ praector logs COL-abc --tail 50
 
 Attempt log paths are stored before OpenCode launches, so `--tail` can inspect a running Attempt.
 
+## Events
+
+```bash
+praector events [TARGET] [--project ID] [--collection COL-ID] [--type EVENT_TYPE] [--since CURSOR] [--limit N]
+```
+
+Reads the durable `events` log **directly from the store**, so it works with **no daemon running**. `TARGET` is a `COL-*`, `T-*`, or `PRJ-*` id (inferred like the other read commands); `--project`/`--collection` override the scope and `--type` filters by `event_type`.
+
+Rows are returned deterministically **oldest-first** ordered by `created_at` then `id`, each showing the `EVT`/`COL`/`T`/`ATTEMPT` ids, the `event_type`, and the payload. The final line prints a `next_cursor` token; pass it back unchanged as `--since CURSOR` to page forward. `--since` is an **exclusive** composite `(created_at, id)` cursor, so paging never repeats or skips a row. A project-scoped listing (no collection/task filter) is permitted but always bounded by `--limit` (finite default) because the `events` table has no `project_id` index.
+
+```bash
+praector events COL-abc --type TASK_CREATED
+praector events COL-abc --since CURSOR --limit 50
+```
+
+The `events` command is **native-only** (like the MCP surface): it has no Python reference counterpart and is intentionally omitted from the parity script's command-surface check. See [State and Recovery](STATE_AND_RECOVERY.md#events) for the event-log and cursor semantics.
+
 ## Collection lifecycle
 
 ### Show

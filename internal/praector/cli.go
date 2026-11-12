@@ -1362,6 +1362,51 @@ func cmdLogs(args []string) int {
 	printTaskLog(out.TaskLogs[0], false, tail)
 	return 0
 }
+func cmdEvents(args []string) int {
+	p, e := parseArgs(args, map[string]bool{"project": true, "collection": true, "type": true, "since": true, "limit": true})
+	if e != nil {
+		return fail(e)
+	}
+	if len(p.Pos) > 1 {
+		return fail(fmt.Errorf("usage: praector events [TARGET] [--project ID] [--collection COL-ID] [--type EVENT_TYPE] [--since CURSOR] [--limit N]"))
+	}
+	limit, e := p.integer("limit", 0)
+	if e != nil {
+		return fail(e)
+	}
+	target := ""
+	if len(p.Pos) == 1 {
+		target = p.Pos[0]
+	}
+	svc, e := newService()
+	if e != nil {
+		return fail(e)
+	}
+	out, e := svc.Events(context.Background(), EventsInput{Target: target, ProjectID: p.str("project"), CollectionID: p.str("collection"), Type: p.str("type"), Since: p.str("since"), Limit: limit})
+	if e != nil {
+		return fail(e)
+	}
+	for _, r := range out.Rows {
+		fmt.Printf("%s %s", S(r, "created_at"), S(r, "event_type"))
+		if c := S(r, "collection_id"); c != "" {
+			fmt.Printf(" col=%s", c)
+		}
+		if t := S(r, "task_id"); t != "" {
+			fmt.Printf(" task=%s", t)
+		}
+		if a := S(r, "attempt_id"); a != "" {
+			fmt.Printf(" attempt=%s", a)
+		}
+		fmt.Printf(" id=%s\n", S(r, "id"))
+		if payload := S(r, "payload_json"); payload != "" {
+			fmt.Printf("  %s\n", payload)
+		}
+	}
+	if out.NextCursor != "" {
+		fmt.Printf("next_cursor %s\n", out.NextCursor)
+	}
+	return 0
+}
 func cmdDoctor(args []string) int {
 	if len(args) > 0 {
 		return fail(fmt.Errorf("usage: praector doctor"))
@@ -1404,6 +1449,7 @@ Commands:
   daemon      Run the durable task scheduler
   doctor      Validate local dependencies and project registration
   logs        List attempt logs for a task or collection
+  events      Read the durable event log directly from the store
   collection  Collection lifecycle operations
   profile     Inspect built-in runtime profile contracts
   project     Project operations
@@ -1465,6 +1511,8 @@ func Main(args []string) int {
 		return cmdCollection(args[1:])
 	case "logs":
 		return cmdLogs(args[1:])
+	case "events":
+		return cmdEvents(args[1:])
 	case "doctor":
 		return cmdDoctor(args[1:])
 	}

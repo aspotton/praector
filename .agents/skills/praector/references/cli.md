@@ -24,6 +24,7 @@ Every `praector` command and its exact usage line (copied verbatim from `command
 | `daemon` | `Usage: praector daemon [--once] [--max-workers N]` | none | Only one scheduler owner per `PRAECTOR_HOME`; `--once` reconciles and exits. | [Scheduler / daemon](../../../../docs/CLI.md#scheduler--daemon) |
 | `doctor` | `Usage: praector doctor` | none | Validates dependencies and registration; no args. | [Doctor](../../../../docs/CLI.md#doctor) |
 | `logs` | `Usage: praector logs TARGET [--tail N]` | `TARGET` (required) | `--tail N` streams a running Attempt's real output. | [Logs](../../../../docs/CLI.md#logs) |
+| `events` | `Usage: praector events [TARGET] [--project ID] [--collection COL-ID] [--type EVENT_TYPE] [--since CURSOR] [--limit N]` | `[TARGET]` optional | Direct store read (no daemon); `--since CURSOR` is an exclusive opaque cursor from the emitted `next_cursor`. | [Events](../../../../docs/CLI.md#events) |
 | `collection show` | `Usage: praector collection show COL-ID` | `COL-ID` | JSON output (policy, revisions, acceptance). | [Collection lifecycle](../../../../docs/CLI.md#collection-lifecycle) |
 | `collection revise` | `Usage: praector collection revise COL-ID --reason TEXT [--detach] [--max-workers N]` | `COL-ID` | `--reason` is **required**; reopens a COMPLETE, unaccepted collection. | [Revise](../../../../docs/CLI.md#revise) |
 | `collection diff` | `Usage: praector collection diff COL-ID [--target BRANCH] [--stat]` | `COL-ID` | `--stat` is the safe preview before accept/pr. | [Diff](../../../../docs/CLI.md#diff) |
@@ -88,6 +89,7 @@ The CLI resolves project context in this order: explicit `--project`/ID, then `P
 | `praector graph [COL]` | `praector_graph` |
 | `praector doctor` | `praector_doctor` |
 | `praector logs TARGET [--tail N]` | `praector_logs` (metadata only) |
+| `praector events [TARGET] [--since CURSOR]` | `praector_events` (read-only store read; requires an explicit scope on the MCP surface) |
 | `praector daemon [--once]` | launch-only; resource `praector://help/daemon` |
 | `praector project list` / `project show` | `praector_project_list` / `praector_project_show` |
 | `praector profile list` / `profile show P` | `praector_profile_list` / `praector_profile_show` |

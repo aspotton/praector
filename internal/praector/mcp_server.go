@@ -196,6 +196,26 @@ var mcpSurface = map[string]mcpSurfaceEntry{
 			return MarshalPretty(out), nil
 		}},
 
+	"events": {toolName: "praector_events", desc: "Read the durable event log directly from the store for an explicit project/collection/task scope (read-only; never launches a scheduler or process).",
+		schema: objectSchema(map[string]any{"target": stringProp, "project": stringProp, "collection": stringProp, "type": stringProp, "since": stringProp, "limit": stringProp}),
+		call: func(s *Service, raw json.RawMessage) (string, error) {
+			var a struct {
+				Target, Project, Collection, Type, Since string
+				Limit                                    int
+			}
+			if err := bindArgs(raw, &a); err != nil {
+				return "", err
+			}
+			if err := mcpRequireProjectContext(a.Project, a.Collection, a.Target); err != nil {
+				return "", err
+			}
+			out, e := s.Events(context.Background(), EventsInput{Target: a.Target, ProjectID: a.Project, CollectionID: a.Collection, Type: a.Type, Since: a.Since, Limit: a.Limit})
+			if e != nil {
+				return "", e
+			}
+			return MarshalPretty(out), nil
+		}},
+
 	// --- collection ---
 	"collection":      {resourceURI: "praector://help/collection", resourceName: "collection commands", read: helpResource("collection")},
 	"collection show": {toolName: "praector_collection_show", desc: "Show a collection including acceptance/revision history.", schema: collectionIDSchema(), call: collectionShowTool},

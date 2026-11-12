@@ -38,6 +38,10 @@ Validate local dependencies and project registration.
 
 List attempt logs for a task or collection.
 `,
+	"events": `Usage: praector events [TARGET] [--project ID] [--collection COL-ID] [--type EVENT_TYPE] [--since CURSOR] [--limit N]
+
+Read the durable event log directly from the store (works with no daemon running).
+`,
 	"collection": `Usage: praector collection {show|revise|diff|pr|accept|cleanup} ...
 
 Collection lifecycle operations:
