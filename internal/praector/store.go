@@ -2267,6 +2267,21 @@ func (s *Store) Event(pid, cid, tid, aid, eventType string, payload any) error {
 	q := fmt.Sprintf("INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", SQLLiteral(MakeID("EVT")), nullString(pid), nullString(cid), nullString(tid), nullString(aid), SQLLiteral(eventType), SQLLiteral(JSONDumps(payload)), SQLLiteral(UTCNow()))
 	return s.Mutate(q, "")
 }
+
+// RecordEmptyDirectiveHarvest emits the DIRECTIVE_TRACEABILITY_EMPTY_HARVEST
+// event naming the consumer task (in the task_id column) and the directive-
+// bearing source ancestors that were checked but yielded zero harvestable
+// directives (in the payload). It is observability, not a block, and the
+// consumer-side dedup is the caller's responsibility; this is the single
+// INSERT site so both emitting seams produce an identically-shaped event. It
+// goes through Store.Event, which re-enters the lock via Mutate, so it MUST
+// only be called OUTSIDE the store lock (the scheduler observer and the
+// acceptance CLI seam) and NEVER from a *Locked claim context.
+func (s *Store) RecordEmptyDirectiveHarvest(projectID, collectionID, consumerID string, sourceIDs []string) error {
+	ids := append([]string{}, sourceIDs...)
+	sort.Strings(ids)
+	return s.Event(projectID, collectionID, consumerID, "", "DIRECTIVE_TRACEABILITY_EMPTY_HARVEST", Row{"source_task_ids": ids})
+}
 func (s *Store) TaskInputLineage(tid string) (Row, error) {
 	r, err := s.Query("SELECT payload_json,attempt_id,created_at FROM events WHERE task_id=" + SQLLiteral(tid) + " AND event_type='TASK_INPUT_LINEAGE' ORDER BY created_at DESC LIMIT 1")
 	if err != nil || len(r) == 0 {

@@ -882,6 +882,18 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 		return nil, nil, e
 	}
 	legacyIDs := LegacyGateTraceabilityExceptionIDs(legacyDecisions, S(c, "id"))
+	// Per-consumer dedup for the empty-harvest event so repeated acceptance
+	// checks do not record the same consumer more than once. The scheduler
+	// observer emits it during sweeps; this seam covers consumers that reached
+	// acceptance without a sweep having observed them.
+	harvestedConsumers := map[string]bool{}
+	if harvestEvents, evErr := store.EventsForCollection(S(c, "id"), 200); evErr == nil {
+		for _, ev := range harvestEvents {
+			if S(ev, "event_type") == "DIRECTIVE_TRACEABILITY_EMPTY_HARVEST" {
+				harvestedConsumers[S(ev, "task_id")] = true
+			}
+		}
+	}
 	for _, t := range tasks {
 		if S(t, "profile") != "review" && S(t, "profile") != "plan_review" {
 			continue
@@ -894,6 +906,18 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 				if e := ValidateDirectiveTraceability(M(t, "result"), directives, true, legacyIDs); e != nil {
 					return nil, nil, fmt.Errorf("Collection %s cannot be accepted: %w", S(c, "id"), e)
 				}
+			} else if len(ancestors) > 0 && !harvestedConsumers[S(t, "id")] {
+				// A directive-bearing ancestor that yielded zero harvestable
+				// directives is recorded here (outside the store lock) so the
+				// empty harvest is auditable rather than silent. Observability
+				// only: acceptance is neither blocked nor newly gated. A
+				// genuinely directive-free lineage (no ancestor) stays silent.
+				ids := []string{}
+				for _, ancestor := range ancestors {
+					ids = append(ids, S(ancestor, "id"))
+				}
+				_ = store.RecordEmptyDirectiveHarvest(S(c, "project_id"), S(c, "id"), S(t, "id"), ids)
+				harvestedConsumers[S(t, "id")] = true
 			}
 		} else {
 			return nil, nil, e
