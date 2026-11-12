@@ -66,14 +66,21 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 // IsLoopbackAddr reports whether an ip:port listen address resolves to a
-// loopback interface only. Bare "localhost" and ":port" (empty host) are treated
-// as loopback; any explicit routable host is rejected.
+// loopback interface only. An explicit loopback IP (127.0.0.0/8 or ::1) or the
+// hostname "localhost" is accepted; any other host is rejected. A bare ":port"
+// (empty host) is NOT loopback: Go binds an empty-host address to the wildcard
+// 0.0.0.0/[::] (every interface), which would silently expose the unauthenticated
+// listener beyond loopback, so an empty host is refused.
 func IsLoopbackAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
 	}
-	if host == "" || strings.EqualFold(host, "localhost") {
+	if host == "" {
+		// Empty host means "all interfaces" to Go's net package, not loopback.
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)

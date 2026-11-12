@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -140,7 +141,9 @@ func TestIsLoopbackAddr(t *testing.T) {
 		"127.0.0.1:8080": true,
 		"127.0.0.1:0":    true,
 		"localhost:8080": true,
-		":8080":          true,
+		"[::1]:8080":     true,  // bracketed IPv6 loopback
+		":8080":          false, // empty host binds the wildcard (all interfaces)
+		":0":             false, // empty host binds the wildcard (all interfaces)
 		"::1:8080":       false, // malformed host:port for SplitHostPort; host becomes weird
 		"0.0.0.0:8080":   false,
 		"10.0.0.5:8080":  false,
@@ -149,6 +152,40 @@ func TestIsLoopbackAddr(t *testing.T) {
 	for addr, want := range cases {
 		if got := IsLoopbackAddr(addr); got != want {
 			t.Errorf("IsLoopbackAddr(%q)=%v want %v", addr, got, want)
+		}
+	}
+}
+
+// TestEmptyHostAddrNeverBindsLoopbackOnly guards the loopback-only security
+// guarantee (DEC-aacb7bfc23): a bare ":port" (empty host) is bound by Go to the
+// wildcard 0.0.0.0/[::] (every interface), so the daemon's sole construction
+// gate must refuse it rather than start an unauthenticated listener reachable
+// beyond the loopback interface.
+func TestEmptyHostAddrNeverBindsLoopbackOnly(t *testing.T) {
+	// First confirm the premise on this platform: Go binds an empty-host listen
+	// to a non-loopback interface. If a platform happens to bind it to loopback,
+	// there is nothing to guard and the check is skipped rather than flaky.
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Skipf("cannot bind ephemeral empty-host listener: %v", err)
+	}
+	premiseNonLoopback := true
+	if ta, ok := ln.Addr().(*net.TCPAddr); ok {
+		if ip := net.ParseIP(ta.IP.String()); ip != nil && ip.IsLoopback() {
+			premiseNonLoopback = false
+		}
+	}
+	_ = ln.Close()
+	if !premiseNonLoopback {
+		t.Skip("platform bound an empty-host listener to loopback; nothing to guard")
+	}
+
+	for _, addr := range []string{":8080", ":0"} {
+		if IsLoopbackAddr(addr) {
+			t.Errorf("IsLoopbackAddr(%q)=true; an empty host binds the wildcard and must be refused", addr)
+		}
+		if _, err := NewLoopbackServer(addr, newTestServer()); err == nil {
+			t.Errorf("NewLoopbackServer(%q) accepted an empty-host (wildcard) bind; the daemon could reach a non-loopback interface", addr)
 		}
 	}
 }
