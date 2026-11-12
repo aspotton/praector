@@ -28,7 +28,8 @@ internal/praector/
 ├── service.go                shared typed domain service layer (CLI/MCP parity seam)
 ├── config.go                 global/project configuration + MCP enable config
 ├── mcp_server.go             MCP tool/resource bridge over the shared service layer
-├── mcp/                      dependency-light stdlib MCP core + streamable-HTTP transport
+├── mcp_sse.go                SSE stream registry/level/replay wiring (state kept out of the mcp core)
+├── mcp/                      dependency-light stdlib MCP core + streamable-HTTP/SSE transport
 ├── store.go                  Dolt persistence + graph/state operations
 ├── scheduler.go              execution/retry/recovery/review policy
 ├── policy.go                 deterministic planning/delivery classifier
@@ -93,7 +94,7 @@ Avoid:
 - external PR provider delivery and privileged accept/merge writes (adapter,
   opt-in); a second store or orchestration implementation.
 
-### `internal/praector/mcp/` + `mcp_server.go`
+### `internal/praector/mcp/` + `mcp_server.go` + `mcp_sse.go`
 
 The MCP surface is another adapter over the same `Service` layer the CLI uses
 (decision DEC-9997d2394f: dependency-light stdlib MCP core; defer the official
@@ -142,6 +143,22 @@ is an official MCP client (the Inspector CLI via
 black-box probe `scripts/mcp_conformance.py` exercises the same live loopback
 listener from an external client but is not itself authoritative conformance.
 
+The server-initiated **event stream** is another observation-only adapter surface
+(decision DEC-17fa4b4aff). `mcp/transport.go` owns only the GET gate and Accept
+negotiation (a `GET` that advertises `Accept: text/event-stream` opens SSE; any
+other `GET` still gets `405`, and the whole GET path runs through the same
+authority/version gate hoisted above method dispatch, so `GET` security is
+byte-for-byte identical to `POST`), and `mcp/server.go` owns only the
+`logging/setLevel` method shape plus the conditional `logging` capability.
+**Every stream, per-connection level, and Last-Event-ID replay decision lives in
+the wiring-layer `mcp_sse.go`** (the `sseHub`: registry, atomic per-stream level,
+bounded side-channel, `drain` fan-out, and the fixed `event_type`→level map),
+fed by the store's non-blocking `Store.emitEvent` seam and never inside the
+domain-agnostic `mcp/` core. The stream carries only `notifications/message`
+frames (never a JSON-RPC response), launches no process, and bypasses no gate;
+a stalled or disconnected client can at most drop and close its own stream
+because fan-out happens outside the Dolt file lock.
+
 Good place for:
 
 - JSON-RPC/MCP protocol framing and the streamable-HTTP transport (`mcp/`);
@@ -150,6 +167,9 @@ Good place for:
 - enqueue-only "execute"-style actions that create durable work via the same
   `CreateCollectionWithCoordinator`/`CreateTask` Store paths as the CLI `--detach`
   path and rely on the running daemon.
+- the SSE observation stream (registry, per-connection level, replay, drain
+  fan-out, event→level map) in the wiring-layer `mcp_sse.go`, fed by the store's
+  non-blocking emit seam.
 
 Avoid:
 
@@ -157,7 +177,9 @@ Avoid:
   inline (the single-owner invariant; enforced by a source-level test);
 - binding any non-loopback address, or introducing auth/identity (deferred
   boundary, decision DEC-aacb7bfc23);
-- a second store/orchestration path or any bypass of policy/review/acceptance.
+- a second store/orchestration path or any bypass of policy/review/acceptance;
+- stream/level/replay state inside the domain-agnostic `mcp/` core (it stays
+  stdlib and state-free; wiring owns those decisions — DEC-17fa4b4aff).
 
 ### `internal/praector/store.go`
 
@@ -168,6 +190,13 @@ Good place for:
 - task/attempt/session records;
 - memory/decisions/events;
 - semantic Dolt commit boundaries.
+
+The `events` write funnel is also a fan-out seam (DEC-48d49461e1): all durable
+event writers — `Store.Event` plus the inline `INSERT INTO events` sites — route
+through one `emitEvent` helper whose publish is a **non-blocking enqueue** to a
+bounded side-channel (drained by the wiring layer outside the Dolt file lock),
+so `SetTaskStatus`/`SetCollectionStatus` status-transition events reach the MCP
+SSE stream without ever blocking the write path on a slow consumer.
 
 Avoid:
 

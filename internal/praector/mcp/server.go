@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 )
 
@@ -56,6 +57,24 @@ type ResourceProvider interface {
 	ReadResource(uri string) ([]ResourceContents, error)
 }
 
+// LoggingProvider receives logging/setLevel requests so the caller (the Praector
+// wiring layer) can apply the verbosity to its own per-stream state. The core
+// owns only the protocol concern: naming the method, validating the level
+// against the eight spec values, and returning Invalid Params for an unknown one.
+// It never stores the level itself, keeping the core domain-agnostic
+// (DEC-17fa4b4aff).
+type LoggingProvider interface {
+	SetLevel(level string) error
+}
+
+// StreamHandler serves the observation-only SSE stream on a GET request. The core
+// performs the shared security gates and the Accept negotiation, then delegates
+// the stream itself to the injected handler so that all stream/level/replay state
+// lives in the wiring layer, not here (DEC-17fa4b4aff).
+type StreamHandler interface {
+	ServeSSE(w http.ResponseWriter, r *http.Request)
+}
+
 // Server is a minimal, transport-agnostic MCP core. It answers the
 // initialize/initialized/ping lifecycle plus tools and resources introspection
 // by delegating to injected providers. It never performs domain or process work
@@ -65,6 +84,14 @@ type Server struct {
 	ServerVersion string
 	Tools         ToolProvider
 	Resources     ResourceProvider
+	// Logging, when non-nil, enables the logging capability in initialize and the
+	// logging/setLevel method. The core validates the eight levels itself; the
+	// provider only applies the level to its own state.
+	Logging LoggingProvider
+	// Streams, when non-nil, enables GET /mcp to open a server-initiated SSE
+	// stream. When nil the transport preserves the historical behavior and returns
+	// 405 for a GET (so POST-only deployments are byte-for-byte unchanged).
+	Streams StreamHandler
 }
 
 // handle processes one decoded request and returns the response to send back. A
@@ -105,6 +132,8 @@ func (s *Server) handle(req rpcRequest) *rpcResponse {
 			return s.err(req.ID, codeMethodNotFound, "resources are not available", nil)
 		}
 		return s.resourceRead(req.ID, req.Params)
+	case methodLoggingSetLevel:
+		return s.loggingSetLevel(req.ID, req.Params)
 	default:
 		return s.err(req.ID, codeMethodNotFound, "method not found: "+req.Method, nil)
 	}
@@ -150,14 +179,42 @@ func (s *Server) initialize(id json.RawMessage, params json.RawMessage) *rpcResp
 	// A matching, older, newer, or otherwise-unknown well-formed revision is
 	// answered by the counter-offer below, which always advertises only
 	// ProtocolVersion and never echoes requested.
+	caps := map[string]any{
+		"tools":     map[string]any{"listChanged": false},
+		"resources": map[string]any{"subscribe": false, "listChanged": false},
+	}
+	// The logging capability is advertised only when a LoggingProvider is wired,
+	// so a POST-only stub never claims a server-initiated channel it lacks. When
+	// present, the server may emit notifications/message and honor setLevel.
+	if s.Logging != nil {
+		caps["logging"] = map[string]any{}
+	}
 	return s.result(id, map[string]any{
 		"protocolVersion": ProtocolVersion,
-		"capabilities": map[string]any{
-			"tools":     map[string]any{"listChanged": false},
-			"resources": map[string]any{"subscribe": false, "listChanged": false},
-		},
-		"serverInfo": map[string]any{"name": s.ServerName, "version": s.ServerVersion},
+		"capabilities":    caps,
+		"serverInfo":      map[string]any{"name": s.ServerName, "version": s.ServerVersion},
 	})
+}
+
+// loggingSetLevel validates the requested verbosity against the exactly-eight MCP
+// logging levels. An unrecognized level is Invalid Params (-32602) with NO state
+// change (the provider is not called). A valid level is applied to the injected
+// provider, which owns the per-stream state (the core stores nothing). The result
+// is the empty result object the spec returns for setLevel.
+func (s *Server) loggingSetLevel(id json.RawMessage, params json.RawMessage) *rpcResponse {
+	if s.Logging == nil {
+		return s.err(id, codeMethodNotFound, "logging is not available", nil)
+	}
+	var p struct {
+		Level string `json:"level"`
+	}
+	if err := json.Unmarshal(defaultObject(params), &p); err != nil || !ValidLoggingLevel(p.Level) {
+		return s.err(id, codeInvalidParams, "logging/setLevel requires one of the eight MCP levels", nil)
+	}
+	if err := s.Logging.SetLevel(p.Level); err != nil {
+		return s.err(id, codeInternalError, err.Error(), nil)
+	}
+	return s.result(id, map[string]any{})
 }
 
 func (s *Server) toolsCall(id json.RawMessage, params json.RawMessage) *rpcResponse {

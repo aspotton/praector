@@ -125,6 +125,13 @@ const (
 	AttemptFailed    = "FAILED"
 	AttemptTimedOut  = "TIMED_OUT"
 	AttemptAborted   = "ABORTED"
+
+	// Collection lifecycle statuses (a collection moves RUNNING -> COMPLETE or
+	// BLOCKED; BLOCKED is a decision-relevant blocked state distinct from the
+	// per-task FAILED terminal).
+	CollectionRunning  = "RUNNING"
+	CollectionComplete = "COMPLETE"
+	CollectionBlocked  = "BLOCKED"
 )
 
 var TerminalTaskStatuses = map[string]bool{TaskComplete: true, TaskFailed: true, TaskCancelled: true, TaskSuperseded: true}

@@ -301,7 +301,60 @@ Tier-1 SDK. In addition, the Praector-owned black-box probe
 `TestMCPExternalConformanceOracle`) exercises the same contract — negotiation, the
 header/Origin contracts, `tools/list`, `resources/list`/`read`, a safe read call,
 and a safe durable queue-write — independently of the in-process protocol tests,
-though this probe is not itself authoritative conformance.
+ though this probe is not itself authoritative conformance.
+
+### Server-initiated event stream (SSE)
+
+In addition to the POST request/response surface, the listener serves an
+**observation-only** server-sent-events stream so an MCP client can subscribe to
+durable events instead of polling `status`/`graph`. This push surface targets the
+**MCP 2025-06-18** revision (the current 2026-07-28 revision differs; that migration
+is deferred roadmap work, not current conformance — see `ROADMAP.md`).
+
+To open it, `GET /mcp` with `Accept: text/event-stream` **and** the
+`MCP-Protocol-Version: 2025-06-18` header:
+
+```bash
+curl -N http://127.0.0.1:8765/mcp \
+  -H 'Accept: text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
+  -H 'Last-Event-ID: EVT-...'          # optional: resume after a reconnect
+```
+
+Behaviour and guarantees:
+
+- A `GET` that does **not** advertise `text/event-stream` still receives **405**
+  (the POST surface is byte-for-byte unchanged for non-streaming clients).
+- A `GET` is authorized **identically to POST**: the loopback-authority gate and
+  the `MCP-Protocol-Version` header requirement are enforced before a single byte
+  is written (a `GET` has no JSON-RPC body, so its version header is required
+  unconditionally, unlike POST's `initialize` header exemption). A foreign/opaque
+  Origin or a missing/wrong header is refused with nothing written to a stream.
+- Each SSE frame carries **only** a JSON-RPC `notifications/message`
+  (`logger: "praector"`, `data` with `event_type` plus the `EVT`/`COL`/`T`/`ATTEMPT`
+  ids and `created_at`); a JSON-RPC **response** is never written on the stream.
+  The SSE `id:` line is the durable `EVT` id.
+- The stream is **read-only and observation-only**: it never implies a mutation
+  happened, never launches a scheduler or process, and never bypasses
+  policy/review/acceptance (`collection pr`/`accept` remain plan-only here too).
+- Fan-out is **non-blocking**: a slow, stalled, or vanished client at most loses
+  its own messages and has its own stream closed; it never blocks `Store.Event()`
+  or starves another consumer.
+- Reconnect with `Last-Event-ID` **replays** that stream's missed rows from the
+  durable `events` table (scoped to the same stream, deduped by id) and then resumes
+  live — so an absent client loses nothing.
+- `logging/setLevel` (the eight spec levels; an unrecognized level returns Invalid
+  Params `-32602`) tunes the verbosity of active stream(s). The default effective
+  level is `info`, and the fixed event→level mapping keeps decision-relevant
+  transitions (`COLLECTION_COMPLETE`/`COLLECTION_ACCEPTED`, `TASK_COMPLETE`,
+  `TASK_INTEGRATED`) visible by default, repair/blocked signals
+  (`COLLECTION_BLOCKED`/`TASK_FAILED`) at `warning`, protocol/authorization
+  violations at `error`, and routine lifecycle/lineage at `debug`. There is no
+  session-id/auth header; a multi-stream `setLevel` is a documented best-effort
+  broadcast (exact for a single observer).
+
+The `praector events [TARGET]` CLI command remains the no-daemon way to read the
+same durable log by hand (`docs/CLI.md`).
 
 ## Observe work
 

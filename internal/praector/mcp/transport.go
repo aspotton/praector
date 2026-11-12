@@ -15,10 +15,11 @@ import (
 // response body (or 202 Accepted for notifications).
 const EndpointPath = "/mcp"
 
-// Handler returns the MCP streamable-HTTP handler. It implements the minimal
-// "Streamable HTTP" transport: each POST carries one JSON-RPC message and is
-// answered with one JSON-RPC response. Server-sent-event streaming is not
-// required for the request/response round-trips Praector exposes.
+// Handler returns the MCP streamable-HTTP handler. It implements the "Streamable
+// HTTP" transport: each POST carries one JSON-RPC message answered with one
+// JSON-RPC response (or 202 Accepted for notifications), and a GET that advertises
+// text/event-stream opens a server-initiated SSE observation stream (when a
+// StreamHandler is wired).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(EndpointPath, s.serveStreamable)
@@ -30,29 +31,74 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) serveStreamable(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodGet {
-		// A GET on the endpoint would open an SSE stream, which this minimal
-		// transport does not implement. Signal that plainly rather than 404.
-		w.Header().Set("Allow", http.MethodPost+", OPTIONS")
-		http.Error(w, "streamable GET not supported; POST JSON-RPC to "+EndpointPath, http.StatusMethodNotAllowed)
-		return
-	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost+", OPTIONS")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	// DNS-rebinding / local-listener hardening: before reading, decoding, or
-	// dispatching anything, the request's Host/local-authority and Origin must
-	// resolve to the loopback authority this server binds. A foreign Origin or
-	// Host (e.g. an attacker-controlled DNS record rebound to 127.0.0.1) is
-	// rejected with 403 before any tool/resource handler runs. This is defense in
-	// depth on top of the authoritative socket bind gate (NewLoopbackServer); it
-	// does not replace IsLoopbackAddr.
+	// DNS-rebinding / local-listener hardening runs BEFORE any method-specific
+	// dispatch or stream open, so the GET and POST paths cannot diverge (DEC).
+	// Before reading, decoding, dispatching, or writing a single byte, the
+	// request's Host/local-authority and Origin must resolve to the loopback
+	// authority this server binds. A foreign or opaque (literal-null) Origin/Host
+	// is rejected with 403 before a stream opens or any handler runs. This is
+	// defense in depth on top of the authoritative socket bind gate
+	// (NewLoopbackServer/IsLoopbackAddr); it does not replace them.
 	if !requestAuthorized(r) {
 		http.Error(w, "forbidden: request authority is not loopback", http.StatusForbidden)
 		return
 	}
+	switch r.Method {
+	case http.MethodGet:
+		s.serveSSE(w, r)
+	case http.MethodPost:
+		s.servePOST(w, r)
+	default:
+		w.Header().Set("Allow", http.MethodPost+", OPTIONS")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// serveSSE handles a GET on the endpoint. A client that does not advertise
+// text/event-stream receives the historical 405 (so the POST-only surface is
+// unchanged for non-streaming clients); one that does must satisfy the same
+// MCP-Protocol-Version gate POST enforces before a single byte is written, and is
+// then handed to the injected StreamHandler. When no StreamHandler is wired the
+// endpoint keeps returning 405 for every GET.
+func (s *Server) serveSSE(w http.ResponseWriter, r *http.Request) {
+	if !acceptsEventStream(r) {
+		w.Header().Set("Allow", http.MethodPost+", OPTIONS")
+		http.Error(w, "streamable GET not supported; POST JSON-RPC to "+EndpointPath, http.StatusMethodNotAllowed)
+		return
+	}
+	// Unlike POST (where initialize may omit the header because a body names the
+	// version), a GET carries no JSON-RPC body, so the version header is required
+	// unconditionally before any stream is opened. Nothing is written on refusal.
+	if v := r.Header.Get(ProtocolVersionHeader); v != ProtocolVersion {
+		http.Error(w, fmt.Sprintf("invalid or missing %s header (want %s)", ProtocolVersionHeader, ProtocolVersion), http.StatusBadRequest)
+		return
+	}
+	if s.Streams == nil {
+		w.Header().Set("Allow", http.MethodPost+", OPTIONS")
+		http.Error(w, "streamable GET not supported; POST JSON-RPC to "+EndpointPath, http.StatusMethodNotAllowed)
+		return
+	}
+	s.Streams.ServeSSE(w, r)
+}
+
+// acceptsEventStream reports whether the request's Accept header includes the SSE
+// media type (text/event-stream), honoring the */* and text/* wildcards.
+func acceptsEventStream(r *http.Request) bool {
+	for _, part := range strings.Split(r.Header.Get("Accept"), ",") {
+		tok := strings.TrimSpace(part)
+		if i := strings.IndexByte(tok, ';'); i >= 0 {
+			tok = strings.TrimSpace(tok[:i])
+		}
+		if tok == "text/event-stream" || tok == "*/*" || tok == "text/*" {
+			return true
+		}
+	}
+	return false
+}
+
+// servePOST handles the request/response half of the transport: one JSON-RPC
+// message answered by one JSON-RPC response (or 202 Accepted for a notification).
+func (s *Server) servePOST(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
 	if err != nil {
 		writeJSON(w, errorResponse(nil, codeParseError, "failed to read request body", nil))

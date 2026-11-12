@@ -44,14 +44,70 @@ func SupportedVersions() []string { return []string{ProtocolVersion} }
 
 // JSON-RPC method names handled by the core.
 const (
-	methodInitialize   = "initialize"
-	methodInitialized  = "notifications/initialized"
-	methodPing         = "ping"
-	methodToolsList    = "tools/list"
-	methodToolsCall    = "tools/call"
-	methodResourcesLst = "resources/list"
-	methodResourcesRd  = "resources/read"
+	methodInitialize      = "initialize"
+	methodInitialized     = "notifications/initialized"
+	methodPing            = "ping"
+	methodToolsList       = "tools/list"
+	methodToolsCall       = "tools/call"
+	methodResourcesLst    = "resources/list"
+	methodResourcesRd     = "resources/read"
+	methodLoggingSetLevel = "logging/setLevel"
 )
+
+// LoggingMethod is the JSON-RPC method a client calls to change the verbosity of
+// the server-initiated notifications/message stream. It is exported so the
+// wiring layer can name the same method the core dispatches.
+const LoggingMethod = methodLoggingSetLevel
+
+// NotificationMessage is the JSON-RPC notification method the server emits on an
+// open SSE stream to deliver a logging message (2025-06-18 logging capability).
+const NotificationMessage = "notifications/message"
+
+// LoggingLevels are the exactly-eight verbosity levels the MCP logging capability
+// defines, in ascending order. logging/setLevel accepts only these names; any
+// other value is Invalid Params (-32602). The ordering gives the wiring layer a
+// rank so a per-connection level filter can decide whether a notification of a
+// given level is delivered to a given stream.
+var LoggingLevels = []string{
+	"debug", "info", "notice", "warning", "error", "critical", "alert", "emergency",
+}
+
+// loggingLevelRank maps a valid logging level to its ascending rank. An unknown
+// level maps to -1 so callers can distinguish "below debug" from "invalid".
+func loggingLevelRank(level string) int {
+	for i, l := range LoggingLevels {
+		if l == level {
+			return i
+		}
+	}
+	return -1
+}
+
+// ValidLoggingLevel reports whether level is one of the exactly-eight MCP logging
+// levels. It is exported so the wiring layer can share one source of truth for
+// the accepted set (used when binding a stream's connect-time level).
+func ValidLoggingLevel(level string) bool { return loggingLevelRank(level) >= 0 }
+
+// LevelRank returns the ascending rank of a valid logging level, or -1 for an
+// unknown level. It is exported so the wiring layer can apply the per-connection
+// level filter without duplicating the ordering.
+func LevelRank(level string) int { return loggingLevelRank(level) }
+
+// NotificationMessageBody builds a server-initiated JSON-RPC notification for the
+// logging capability. It intentionally carries NO id and NO result/error field: a
+// server MUST NOT send a JSON-RPC response on an SSE stream (2025-06-18). Only
+// notifications are ever written to the observation stream.
+func NotificationMessageBody(level, logger string, data any) map[string]any {
+	return map[string]any{
+		"jsonrpc": "2.0",
+		"method":  NotificationMessage,
+		"params": map[string]any{
+			"level":  level,
+			"logger": logger,
+			"data":   data,
+		},
+	}
+}
 
 // JSON-RPC 2.0 standard error codes.
 const (

@@ -764,18 +764,32 @@ func firstLine(s string) string {
 // newMCPServer builds the MCP core wired to the shared service layer. The
 // returned server performs no process work; it delegates to Service ops only.
 // privileged controls whether the collection-finalizing write tools are exposed.
-func newMCPServer(svc *Service, privileged bool) *mcp.Server {
+// When hub is non-nil the core also advertises the logging capability, accepts
+// logging/setLevel, and can open an observation-only SSE stream (state owned
+// entirely by the wiring layer, not the mcp package).
+func newMCPServer(svc *Service, privileged bool, hub *sseHub) *mcp.Server {
 	b := &mcpBridge{svc: svc, privileged: privileged}
-	return &mcp.Server{ServerName: "praector", ServerVersion: Version, Tools: b, Resources: b}
+	s := &mcp.Server{ServerName: "praector", ServerVersion: Version, Tools: b, Resources: b}
+	if hub != nil {
+		s.Logging = hub
+		s.Streams = hub
+	}
+	return s
 }
 
 // startMCPServer constructs a loopback-only HTTP server for the MCP core using
 // the caller's already-open store connection. It never creates a Scheduler and
-// never runs a collection; callers own the returned server's lifecycle.
+// never runs a collection; callers own the returned server's lifecycle (and
+// should call svc.store.CloseEventSink on shutdown to drain open SSE streams).
 func startMCPServer(svc *Service) (*http.Server, error) {
 	cfg := LoadMCPServerConfig(svc.cfg)
-	srv, err := mcp.NewLoopbackServer(cfg.Addr, newMCPServer(svc, cfg.Privileged))
+	hub := newSSEHub(svc.store)
+	go hub.drain()
+	svc.store.SetEventSink(hub)
+	srv, err := mcp.NewLoopbackServer(cfg.Addr, newMCPServer(svc, cfg.Privileged, hub))
 	if err != nil {
+		svc.store.SetEventSink(nil)
+		hub.Close()
 		return nil, err
 	}
 	return srv, nil

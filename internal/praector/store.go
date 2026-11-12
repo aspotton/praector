@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/datascape/praector/internal/assets"
 )
@@ -22,6 +23,68 @@ type Store struct {
 	Cfg      GlobalConfig
 	StateDir string
 	Dolt     string
+
+	// emitMu guards emitter, the optional event fan-out sink wired by the MCP
+	// server (DEC-48d49461e1). It is nil on the CLI/`events` path, so an ordinary
+	// store write performs no fan-out and stays byte-equivalent to before.
+	emitMu  sync.RWMutex
+	emitter eventSink
+}
+
+// eventRecord is the store emit seam's view of one durable events row: the
+// identifiers and ordering key a push consumer needs (no payload JSON). The SSE
+// layer reconstructs the notification data from these fields, so the store does
+// not push payload bytes onto the write path.
+type eventRecord struct {
+	ID           string
+	ProjectID    string
+	CollectionID string
+	TaskID       string
+	AttemptID    string
+	EventType    string
+	CreatedAt    string
+}
+
+// eventSink is the optional fan-out target wired onto a running daemon's store.
+// publish must be non-blocking: the store write path may only hand off a pending
+// payload, never block on delivery (the SSE layer flushes it off the file lock).
+type eventSink interface {
+	publish(eventRecord)
+}
+
+// SetEventSink installs (or, with nil, clears) the event fan-out sink. It is
+// called by the MCP server wiring, never by ordinary store callers, so the CLI
+// event read path is unaffected.
+func (s *Store) SetEventSink(sink eventSink) {
+	s.emitMu.Lock()
+	s.emitter = sink
+	s.emitMu.Unlock()
+}
+
+// CloseEventSink clears the sink and, if it exposes Close, shuts it down so open
+// SSE streams and the drain goroutine terminate on daemon shutdown.
+func (s *Store) CloseEventSink() {
+	s.emitMu.Lock()
+	sink := s.emitter
+	s.emitter = nil
+	s.emitMu.Unlock()
+	if c, ok := sink.(interface{ Close() }); ok {
+		c.Close()
+	}
+}
+
+// emitEvent hands one already-inserted event's fan-out payload to the installed
+// sink. It is the single shared emit helper every event writer calls after its
+// row is committed (FORK B / DEC-48d49461e1). It never blocks: the sink's publish
+// is a non-blocking hand-off and the actual stream delivery runs outside the
+// process-wide Dolt lock. With no sink (CLI, tests) it is a no-op.
+func (s *Store) emitEvent(rec eventRecord) {
+	s.emitMu.RLock()
+	sink := s.emitter
+	s.emitMu.RUnlock()
+	if sink != nil {
+		sink.publish(rec)
+	}
 }
 
 func NewStore(cfg GlobalConfig) (*Store, error) {
@@ -369,16 +432,19 @@ func (s *Store) repairLegacyDependencyCyclesLocked(collectionID string) (int, []
 	}
 	now := UTCNow()
 	statements := make([]string, 0, len(repairs)*2)
+	var repairedEvents []eventRecord
 	for _, r := range repairs {
 		statements = append(statements,
 			"DELETE FROM task_edges WHERE collection_id="+SQLLiteral(collectionID)+" AND relation='depends_on' AND from_task_id="+SQLLiteral(r.from)+" AND to_task_id="+SQLLiteral(r.to),
 		)
 		if projectID != "" {
 			payload := JSONDumps(Row{"from_task_id": r.from, "to_task_id": r.to, "reason": r.reason})
+			eid := MakeID("EVT")
 			statements = append(statements,
 				"INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES ("+
-					SQLLiteral(MakeID("EVT"))+","+SQLLiteral(projectID)+","+SQLLiteral(collectionID)+","+SQLLiteral(r.to)+",NULL,'LEGACY_DEPENDENCY_CYCLE_REPAIRED',"+SQLLiteral(payload)+","+SQLLiteral(now)+")",
+					SQLLiteral(eid)+","+SQLLiteral(projectID)+","+SQLLiteral(collectionID)+","+SQLLiteral(r.to)+",NULL,'LEGACY_DEPENDENCY_CYCLE_REPAIRED',"+SQLLiteral(payload)+","+SQLLiteral(now)+")",
 			)
+			repairedEvents = append(repairedEvents, eventRecord{ID: eid, ProjectID: projectID, CollectionID: collectionID, TaskID: r.to, EventType: "LEGACY_DEPENDENCY_CYCLE_REPAIRED", CreatedAt: now})
 		}
 	}
 	if err := s.mutateLocked(strings.Join(statements, ";")); err != nil {
@@ -386,6 +452,9 @@ func (s *Store) repairLegacyDependencyCyclesLocked(collectionID string) (int, []
 	}
 	if err := s.semanticCommitLocked(fmt.Sprintf("praector: repair %d legacy dependency cycle edge(s) in %s", len(repairs), collectionID)); err != nil {
 		return 0, unresolved, err
+	}
+	for _, rec := range repairedEvents {
+		s.emitEvent(rec)
 	}
 	return len(repairs), unresolved, nil
 }
@@ -416,6 +485,7 @@ func (s *Store) repairRevisionBaselineProvenanceLocked() (int, error) {
 		}
 	}
 	var statements []string
+	var baselineEvents []eventRecord
 	for criticID, row := range latest {
 		payload := JSONMap(S(row, "payload_json"))
 		if S(payload, "source") != "compatibility_plan_seal" {
@@ -473,10 +543,13 @@ func (s *Store) repairRevisionBaselineProvenanceLocked() (int, error) {
 			"corrected_from":      "compatibility_plan_seal",
 			"revision_id":         revision["id"],
 		}
+		eid := MakeID("EVT")
+		eat := UTCNow()
 		statements = append(statements,
 			"INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES ("+
-				SQLLiteral(MakeID("EVT"))+","+SQLLiteral(projectID)+","+SQLLiteral(collectionID)+","+SQLLiteral(criticID)+",NULL,'CRITIC_PLAN_BASELINE',"+SQLLiteral(JSONDumps(correction))+","+SQLLiteral(UTCNow())+")",
+				SQLLiteral(eid)+","+SQLLiteral(projectID)+","+SQLLiteral(collectionID)+","+SQLLiteral(criticID)+",NULL,'CRITIC_PLAN_BASELINE',"+SQLLiteral(JSONDumps(correction))+","+SQLLiteral(eat)+")",
 		)
+		baselineEvents = append(baselineEvents, eventRecord{ID: eid, ProjectID: projectID, CollectionID: collectionID, TaskID: criticID, EventType: "CRITIC_PLAN_BASELINE", CreatedAt: eat})
 	}
 	if len(statements) == 0 {
 		return 0, nil
@@ -486,6 +559,9 @@ func (s *Store) repairRevisionBaselineProvenanceLocked() (int, error) {
 	}
 	if err := s.semanticCommitLocked(fmt.Sprintf("praector: repair %d revision critic baseline provenance label(s)", len(statements))); err != nil {
 		return 0, err
+	}
+	for _, rec := range baselineEvents {
+		s.emitEvent(rec)
 	}
 	return len(statements), nil
 }
@@ -552,8 +628,10 @@ func (s *Store) CreateCollectionWithCoordinator(projectID, title, obj, coordObj 
 	key := DedupeKey("coordinator", coordObj)
 	cp := JSONDumps(Row{"title": title, "objective": obj})
 	tp := JSONDumps(Row{"profile": "coordinator", "title": "Initial coordination", "reason": "Collection entry point"})
+	cevt := MakeID("EVT")
+	tevt := MakeID("EVT")
 	err := s.withLock(func() error {
-		q := fmt.Sprintf("INSERT INTO collections (id,project_id,title,objective,status,integration_branch,created_at,updated_at) VALUES (%s,%s,%s,%s,'RUNNING',%s,%s,%s);INSERT INTO tasks (id,project_id,collection_id,parent_task_id,requested_by_task_id,profile,title,objective,reason,status,priority,depth,workspace_mode,base_commit,dedupe_key,created_at,updated_at) VALUES (%s,%s,%s,NULL,NULL,'coordinator','Initial coordination',%s,'Collection entry point','READY',50,0,'collection',NULL,%s,%s,%s);INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,NULL,NULL,'COLLECTION_CREATED',%s,%s);INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,NULL,'TASK_CREATED',%s,%s)", SQLLiteral(cid), SQLLiteral(projectID), SQLLiteral(title), SQLLiteral(obj), SQLLiteral(branch), SQLLiteral(now), SQLLiteral(now), SQLLiteral(tid), SQLLiteral(projectID), SQLLiteral(cid), SQLLiteral(coordObj), SQLLiteral(key), SQLLiteral(now), SQLLiteral(now), SQLLiteral(MakeID("EVT")), SQLLiteral(projectID), SQLLiteral(cid), SQLLiteral(cp), SQLLiteral(now), SQLLiteral(MakeID("EVT")), SQLLiteral(projectID), SQLLiteral(cid), SQLLiteral(tid), SQLLiteral(tp), SQLLiteral(now))
+		q := fmt.Sprintf("INSERT INTO collections (id,project_id,title,objective,status,integration_branch,created_at,updated_at) VALUES (%s,%s,%s,%s,'RUNNING',%s,%s,%s);INSERT INTO tasks (id,project_id,collection_id,parent_task_id,requested_by_task_id,profile,title,objective,reason,status,priority,depth,workspace_mode,base_commit,dedupe_key,created_at,updated_at) VALUES (%s,%s,%s,NULL,NULL,'coordinator','Initial coordination',%s,'Collection entry point','READY',50,0,'collection',NULL,%s,%s,%s);INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,NULL,NULL,'COLLECTION_CREATED',%s,%s);INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,NULL,'TASK_CREATED',%s,%s)", SQLLiteral(cid), SQLLiteral(projectID), SQLLiteral(title), SQLLiteral(obj), SQLLiteral(branch), SQLLiteral(now), SQLLiteral(now), SQLLiteral(tid), SQLLiteral(projectID), SQLLiteral(cid), SQLLiteral(coordObj), SQLLiteral(key), SQLLiteral(now), SQLLiteral(now), SQLLiteral(cevt), SQLLiteral(projectID), SQLLiteral(cid), SQLLiteral(cp), SQLLiteral(now), SQLLiteral(tevt), SQLLiteral(projectID), SQLLiteral(cid), SQLLiteral(tid), SQLLiteral(tp), SQLLiteral(now))
 		if e := s.mutateLocked(q); e != nil {
 			return e
 		}
@@ -562,6 +640,11 @@ func (s *Store) CreateCollectionWithCoordinator(projectID, title, obj, coordObj 
 	if err != nil {
 		return nil, nil, err
 	}
+	// Fan out the two creation rows after the file lock releases. (COLLECTION_CREATED
+	// usually fires before a listener is wired, so it is replay-only there; the
+	// TASK_CREATED row reaches a connected observer live.)
+	s.emitEvent(eventRecord{ID: cevt, ProjectID: projectID, CollectionID: cid, EventType: "COLLECTION_CREATED", CreatedAt: now})
+	s.emitEvent(eventRecord{ID: tevt, ProjectID: projectID, CollectionID: cid, TaskID: tid, EventType: "TASK_CREATED", CreatedAt: now})
 	c, err := s.GetCollection(cid)
 	if err != nil {
 		return nil, nil, err
@@ -623,8 +706,63 @@ func (s *Store) SetCollectionStatus(cid, status string, commit bool) error {
 	if commit {
 		msg = "collection " + cid + ": " + strings.ToLower(status)
 	}
-	return s.Mutate("UPDATE collections SET status="+SQLLiteral(status)+",updated_at="+SQLLiteral(UTCNow())+" WHERE id="+SQLLiteral(cid), msg)
+	// Slice 3: emit a durable event for a real transition into COMPLETE or
+	// BLOCKED so a push consumer learns of the terminal/decision state. A
+	// repeated no-op write (same status) emits ZERO events: the before value is
+	// read inside the same lock and the INSERT is only appended on a real
+	// transition. The existing Dolt commit-message behavior is unchanged.
+	track := status == CollectionComplete || status == CollectionBlocked
+	var evt *eventRecord
+	err := s.withLock(func() error {
+		stmts := []string{"UPDATE collections SET status=" + SQLLiteral(status) + ",updated_at=" + SQLLiteral(UTCNow()) + " WHERE id=" + SQLLiteral(cid)}
+		if track {
+			cur, e := s.queryLocked("SELECT project_id,status FROM collections WHERE id=" + SQLLiteral(cid))
+			if e != nil {
+				return e
+			}
+			if len(cur) > 0 && S(cur[0], "status") != status {
+				id := MakeID("EVT")
+				now := UTCNow()
+				payload := JSONDumps(Row{"from": S(cur[0], "status"), "to": status})
+				stmts = append(stmts, "INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES ("+SQLLiteral(id)+","+nullString(S(cur[0], "project_id"))+","+SQLLiteral(cid)+",NULL,NULL,"+SQLLiteral(statusCollectionEvent(status))+","+SQLLiteral(payload)+","+SQLLiteral(now)+")")
+				evt = &eventRecord{ID: id, ProjectID: S(cur[0], "project_id"), CollectionID: cid, EventType: statusCollectionEvent(status), CreatedAt: now}
+			}
+		}
+		if e := s.mutateLocked(strings.Join(stmts, ";")); e != nil {
+			return e
+		}
+		if msg != "" {
+			return s.semanticCommitLocked(msg)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if evt != nil {
+		s.emitEvent(*evt)
+	}
+	return nil
 }
+
+// statusCollectionEvent maps a collection terminal status to its event type,
+// consistent with the existing COLLECTION_* naming convention.
+func statusCollectionEvent(status string) string {
+	if status == CollectionBlocked {
+		return "COLLECTION_BLOCKED"
+	}
+	return "COLLECTION_COMPLETE"
+}
+
+// statusTaskEvent maps a task terminal status to its event type, consistent with
+// the existing TASK_* naming convention.
+func statusTaskEvent(status string) string {
+	if status == TaskFailed {
+		return "TASK_FAILED"
+	}
+	return "TASK_COMPLETE"
+}
+
 func (s *Store) CountTasks(cid string) (int, error) {
 	r, e := s.Query("SELECT COUNT(*) AS n FROM tasks WHERE collection_id=" + SQLLiteral(cid))
 	if e != nil || len(r) == 0 {
@@ -700,6 +838,7 @@ func (s *Store) CreateTask(o CreateTaskOptions) (Row, bool, error) {
 	}
 	created := false
 	taskID := ""
+	var baselineEvt string
 	err := s.withLock(func() error {
 		dependencyRefs := append([]string{}, deps...)
 		if o.BlockingCallerTaskID != "" {
@@ -767,7 +906,8 @@ func (s *Store) CreateTask(o CreateTaskOptions) (Row, bool, error) {
 			}
 			if len(b) == 0 {
 				payload := JSONDumps(Row{"critic_task_id": o.CriticBaselineTaskID, "fingerprint": o.CriticBaselineFingerprint, "source": o.CriticBaselineSource, "plan_review_task_id": taskID})
-				stmts = append(stmts, fmt.Sprintf("INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,NULL,'CRITIC_PLAN_BASELINE',%s,%s)", SQLLiteral(MakeID("EVT")), SQLLiteral(o.ProjectID), SQLLiteral(o.CollectionID), SQLLiteral(o.CriticBaselineTaskID), SQLLiteral(payload), SQLLiteral(now)))
+				baselineEvt = MakeID("EVT")
+				stmts = append(stmts, fmt.Sprintf("INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,NULL,'CRITIC_PLAN_BASELINE',%s,%s)", SQLLiteral(baselineEvt), SQLLiteral(o.ProjectID), SQLLiteral(o.CollectionID), SQLLiteral(o.CriticBaselineTaskID), SQLLiteral(payload), SQLLiteral(now)))
 			}
 		}
 		if len(stmts) > 0 {
@@ -786,6 +926,9 @@ func (s *Store) CreateTask(o CreateTaskOptions) (Row, bool, error) {
 	})
 	if err != nil {
 		return nil, false, err
+	}
+	if baselineEvt != "" {
+		s.emitEvent(eventRecord{ID: baselineEvt, ProjectID: o.ProjectID, CollectionID: o.CollectionID, TaskID: o.CriticBaselineTaskID, EventType: "CRITIC_PLAN_BASELINE", CreatedAt: now})
 	}
 	if created {
 		_ = s.Event(o.ProjectID, o.CollectionID, taskID, "", "TASK_CREATED", Row{"profile": o.Profile, "title": o.Title, "reason": o.Reason})
@@ -855,8 +998,10 @@ func (s *Store) RequestCollectionRevision(cid, reason string) (Row, Row, error) 
 	key := DedupeKey("coordinator", obj)
 	rp := JSONDumps(Row{"revision_id": rid, "reason": reason, "coordinator_task_id": tid})
 	tp := JSONDumps(Row{"profile": "coordinator", "title": "Acceptance revision", "reason": reason})
+	revEvt := MakeID("EVT")
+	taskEvt := MakeID("EVT")
 	err = s.withLock(func() error {
-		q := fmt.Sprintf("INSERT INTO collection_revisions (id,project_id,collection_id,reason,status,coordinator_task_id,created_at) VALUES (%s,%s,%s,%s,'OPEN',%s,%s);INSERT INTO tasks (id,project_id,collection_id,parent_task_id,requested_by_task_id,profile,title,objective,reason,status,priority,depth,workspace_mode,base_commit,dedupe_key,created_at,updated_at) VALUES (%s,%s,%s,NULL,NULL,'coordinator','Acceptance revision',%s,%s,'READY',50,0,'collection',NULL,%s,%s,%s);UPDATE collections SET status='RUNNING',updated_at=%s WHERE id=%s;INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,NULL,'COLLECTION_REVISION_REQUESTED',%s,%s);INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,NULL,'TASK_CREATED',%s,%s)", SQLLiteral(rid), SQLLiteral(S(c, "project_id")), SQLLiteral(cid), SQLLiteral(reason), SQLLiteral(tid), SQLLiteral(now), SQLLiteral(tid), SQLLiteral(S(c, "project_id")), SQLLiteral(cid), SQLLiteral(obj), SQLLiteral(reason), SQLLiteral(key), SQLLiteral(now), SQLLiteral(now), SQLLiteral(now), SQLLiteral(cid), SQLLiteral(MakeID("EVT")), SQLLiteral(S(c, "project_id")), SQLLiteral(cid), SQLLiteral(tid), SQLLiteral(rp), SQLLiteral(now), SQLLiteral(MakeID("EVT")), SQLLiteral(S(c, "project_id")), SQLLiteral(cid), SQLLiteral(tid), SQLLiteral(tp), SQLLiteral(now))
+		q := fmt.Sprintf("INSERT INTO collection_revisions (id,project_id,collection_id,reason,status,coordinator_task_id,created_at) VALUES (%s,%s,%s,%s,'OPEN',%s,%s);INSERT INTO tasks (id,project_id,collection_id,parent_task_id,requested_by_task_id,profile,title,objective,reason,status,priority,depth,workspace_mode,base_commit,dedupe_key,created_at,updated_at) VALUES (%s,%s,%s,NULL,NULL,'coordinator','Acceptance revision',%s,%s,'READY',50,0,'collection',NULL,%s,%s,%s);UPDATE collections SET status='RUNNING',updated_at=%s WHERE id=%s;INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,NULL,'COLLECTION_REVISION_REQUESTED',%s,%s);INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,NULL,'TASK_CREATED',%s,%s)", SQLLiteral(rid), SQLLiteral(S(c, "project_id")), SQLLiteral(cid), SQLLiteral(reason), SQLLiteral(tid), SQLLiteral(now), SQLLiteral(tid), SQLLiteral(S(c, "project_id")), SQLLiteral(cid), SQLLiteral(obj), SQLLiteral(reason), SQLLiteral(key), SQLLiteral(now), SQLLiteral(now), SQLLiteral(now), SQLLiteral(cid), SQLLiteral(revEvt), SQLLiteral(S(c, "project_id")), SQLLiteral(cid), SQLLiteral(tid), SQLLiteral(rp), SQLLiteral(now), SQLLiteral(taskEvt), SQLLiteral(S(c, "project_id")), SQLLiteral(cid), SQLLiteral(tid), SQLLiteral(tp), SQLLiteral(now))
 		if e := s.mutateLocked(q); e != nil {
 			return e
 		}
@@ -865,6 +1010,8 @@ func (s *Store) RequestCollectionRevision(cid, reason string) (Row, Row, error) 
 	if err != nil {
 		return nil, nil, err
 	}
+	s.emitEvent(eventRecord{ID: revEvt, ProjectID: S(c, "project_id"), CollectionID: cid, TaskID: tid, EventType: "COLLECTION_REVISION_REQUESTED", CreatedAt: now})
+	s.emitEvent(eventRecord{ID: taskEvt, ProjectID: S(c, "project_id"), CollectionID: cid, TaskID: tid, EventType: "TASK_CREATED", CreatedAt: now})
 	rr, err := s.Query("SELECT * FROM collection_revisions WHERE id=" + SQLLiteral(rid) + " LIMIT 1")
 	if err != nil {
 		return nil, nil, err
@@ -1205,6 +1352,7 @@ func (s *Store) attachExistingPlanReview(reviewID, callerID string, deps []strin
 	pid := S(review, "project_id")
 	now := UTCNow()
 	deps = uniqueStrings(deps)
+	var baselineEvt string
 	err = s.withLock(func() error {
 		if er := s.assertDependencyTasksInCollectionLocked(cid, deps); er != nil {
 			return er
@@ -1276,7 +1424,8 @@ func (s *Store) attachExistingPlanReview(reviewID, callerID string, deps []strin
 			}
 			if len(ex) == 0 {
 				payload := JSONDumps(Row{"critic_task_id": criticID, "fingerprint": fp, "source": source, "plan_review_task_id": reviewID})
-				st = append(st, fmt.Sprintf("INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,NULL,'CRITIC_PLAN_BASELINE',%s,%s)", SQLLiteral(MakeID("EVT")), SQLLiteral(pid), SQLLiteral(cid), SQLLiteral(criticID), SQLLiteral(payload), SQLLiteral(now)))
+				baselineEvt = MakeID("EVT")
+				st = append(st, fmt.Sprintf("INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,NULL,'CRITIC_PLAN_BASELINE',%s,%s)", SQLLiteral(baselineEvt), SQLLiteral(pid), SQLLiteral(cid), SQLLiteral(criticID), SQLLiteral(payload), SQLLiteral(now)))
 			}
 		}
 		if len(st) > 0 {
@@ -1289,6 +1438,9 @@ func (s *Store) attachExistingPlanReview(reviewID, callerID string, deps []strin
 	})
 	if err != nil {
 		return nil, err
+	}
+	if baselineEvt != "" {
+		s.emitEvent(eventRecord{ID: baselineEvt, ProjectID: pid, CollectionID: cid, TaskID: criticID, EventType: "CRITIC_PLAN_BASELINE", CreatedAt: now})
 	}
 	return s.GetTask(reviewID)
 }
@@ -1405,7 +1557,42 @@ func (s *Store) SetTaskWorkspace(tid string, wt, branch, base, head *string) err
 	return s.Mutate("UPDATE tasks SET "+strings.Join(a, ",")+" WHERE id="+SQLLiteral(tid), "")
 }
 func (s *Store) SetTaskStatus(tid, status, msg string) error {
-	return s.Mutate("UPDATE tasks SET status="+SQLLiteral(status)+",updated_at="+SQLLiteral(UTCNow())+" WHERE id="+SQLLiteral(tid), msg)
+	// Slice 3: emit a durable event for a real transition into a terminal task
+	// state (COMPLETE / FAILED) so a push consumer learns of it. A repeated no-op
+	// write emits ZERO events (guarded on the before value read in-lock). The
+	// existing Dolt commit-message behavior (msg) is unchanged.
+	track := status == TaskComplete || status == TaskFailed
+	var evt *eventRecord
+	err := s.withLock(func() error {
+		stmts := []string{"UPDATE tasks SET status=" + SQLLiteral(status) + ",updated_at=" + SQLLiteral(UTCNow()) + " WHERE id=" + SQLLiteral(tid)}
+		if track {
+			cur, e := s.queryLocked("SELECT project_id,collection_id,status FROM tasks WHERE id=" + SQLLiteral(tid))
+			if e != nil {
+				return e
+			}
+			if len(cur) > 0 && S(cur[0], "status") != status {
+				id := MakeID("EVT")
+				now := UTCNow()
+				payload := JSONDumps(Row{"from": S(cur[0], "status"), "to": status})
+				stmts = append(stmts, "INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES ("+SQLLiteral(id)+","+nullString(S(cur[0], "project_id"))+","+nullString(S(cur[0], "collection_id"))+","+SQLLiteral(tid)+",NULL,"+SQLLiteral(statusTaskEvent(status))+","+SQLLiteral(payload)+","+SQLLiteral(now)+")")
+				evt = &eventRecord{ID: id, ProjectID: S(cur[0], "project_id"), CollectionID: S(cur[0], "collection_id"), TaskID: tid, EventType: statusTaskEvent(status), CreatedAt: now}
+			}
+		}
+		if e := s.mutateLocked(strings.Join(stmts, ";")); e != nil {
+			return e
+		}
+		if msg != "" {
+			return s.semanticCommitLocked(msg)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if evt != nil {
+		s.emitEvent(*evt)
+	}
+	return nil
 }
 func (s *Store) SubmitResult(tid string, result Row) (Row, error) {
 	before, err := s.GetTask(tid)
@@ -2056,8 +2243,16 @@ func (s *Store) AddDecision(pid, cid, tid, statement, rationale string, evidence
 	return r[0], nil
 }
 func (s *Store) Event(pid, cid, tid, aid, eventType string, payload any) error {
-	q := fmt.Sprintf("INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", SQLLiteral(MakeID("EVT")), nullString(pid), nullString(cid), nullString(tid), nullString(aid), SQLLiteral(eventType), SQLLiteral(JSONDumps(payload)), SQLLiteral(UTCNow()))
-	return s.Mutate(q, "")
+	id := MakeID("EVT")
+	now := UTCNow()
+	q := fmt.Sprintf("INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", SQLLiteral(id), nullString(pid), nullString(cid), nullString(tid), nullString(aid), SQLLiteral(eventType), SQLLiteral(JSONDumps(payload)), SQLLiteral(now))
+	if err := s.Mutate(q, ""); err != nil {
+		return err
+	}
+	// Fan out only after Mutate's file lock has released, so the write path never
+	// holds the Dolt lock across a stream publish.
+	s.emitEvent(eventRecord{ID: id, ProjectID: pid, CollectionID: cid, TaskID: tid, AttemptID: aid, EventType: eventType, CreatedAt: now})
+	return nil
 }
 func (s *Store) TaskInputLineage(tid string) (Row, error) {
 	r, err := s.Query("SELECT payload_json,attempt_id,created_at FROM events WHERE task_id=" + SQLLiteral(tid) + " AND event_type='TASK_INPUT_LINEAGE' ORDER BY created_at DESC LIMIT 1")
@@ -2123,6 +2318,22 @@ func (s *Store) ListEvents(pid, cid, tid, eventType, sinceCreatedAt, sinceID str
 	}
 	q += " ORDER BY created_at, id LIMIT " + strconv.Itoa(limit)
 	return s.Query(q)
+}
+
+// EventCreatedAt resolves the created_at of a single events row by id. The SSE
+// layer uses it to turn a Last-Event-ID (an EVT id, which is not monotonic) into
+// the (created_at,id) cursor for a scoped replay via ListEvents. found is false
+// when the id is absent so the caller can fail closed (replay nothing) rather than
+// assume a cursor.
+func (s *Store) EventCreatedAt(id string) (createdAt string, found bool, err error) {
+	if id == "" {
+		return "", false, nil
+	}
+	r, err := s.Query("SELECT created_at FROM events WHERE id=" + SQLLiteral(id) + " LIMIT 1")
+	if err != nil || len(r) == 0 {
+		return "", false, err
+	}
+	return S(r[0], "created_at"), true, nil
 }
 
 func (s *Store) RepairSupersededReviewLineage(cid string) (int, error) {
