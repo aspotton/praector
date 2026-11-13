@@ -1137,11 +1137,13 @@ func ValidateReviewImpactEnumeration(result Row, legacyExceptionIDs []string, de
 	}
 	enumeration := M(result, "impact_enumeration")
 	if len(enumeration) == 0 {
-		if err := validateDerivedCandidateAccounting(Row{}, derivedCandidates); err != nil {
-			return err
-		}
+		// The documented legacy exception must clear this whole branch; checking
+		// candidates first made the waiver unreachable whenever a diff yielded one.
 		if len(legacyExceptionIDs) > 0 {
 			return nil
+		}
+		if err := validateDerivedCandidateAccounting(Row{}, derivedCandidates); err != nil {
+			return err
 		}
 		return fmt.Errorf("passing review requires impact_enumeration naming the enumeration method and an explicit disposition for every sibling-effect site")
 	}

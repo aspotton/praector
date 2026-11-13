@@ -895,6 +895,21 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 			}
 		}
 	}
+	// Candidates are recomputed from the final base...integration diff, so the
+	// accounting belongs to the enumeration whose scope is that final state: the
+	// newest passing review. An earlier generation's review cannot name a
+	// candidate a later generation introduced, and completed results are
+	// immutable, so enforcing it per-review would lock any revised Collection
+	// out of acceptance forever. Site-level rules stay per-review.
+	governingReview := Row{}
+	for _, t := range tasks {
+		if S(t, "profile") != "review" || S(t, "status") != TaskComplete || strings.ToLower(strings.TrimSpace(S(M(t, "result"), "verdict"))) != "pass" {
+			continue
+		}
+		if len(governingReview) == 0 || S(t, "created_at")+S(t, "id") >= S(governingReview, "created_at")+S(governingReview, "id") {
+			governingReview = t
+		}
+	}
 	for _, t := range tasks {
 		if S(t, "profile") != "review" && S(t, "profile") != "plan_review" {
 			continue
@@ -924,7 +939,11 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 			return nil, nil, e
 		}
 		if S(t, "profile") == "review" {
-			if e := ValidateReviewImpactEnumeration(M(t, "result"), legacyIDs, derivedCandidates); e != nil {
+			candidates := derivedCandidates
+			if S(t, "id") != S(governingReview, "id") {
+				candidates = nil
+			}
+			if e := ValidateReviewImpactEnumeration(M(t, "result"), legacyIDs, candidates); e != nil {
 				return nil, nil, fmt.Errorf("Collection %s cannot be accepted: %w", S(c, "id"), e)
 			}
 			if decisionIDs := CandidateDecisionIDs(M(t, "result")); len(decisionIDs) > 0 {
