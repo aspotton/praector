@@ -113,6 +113,21 @@ Coverage is intentionally 1:1 (`commandHelp` → `serviceOps` → MCP surface), 
 
 Because these side effects are real, never run `collection pr`, `collection accept`, `collection cleanup`, or `init` on inference. Confirm the user's request authorizes that specific effect, prefer the documented preview first (`--dry-run`, `--stat`, `collection show`), and state what actually changed.
 
+## Poll vs. push for state changes
+
+The CLI has no push surface of its own, so polling is the default when no daemon is running or when the caller is a short-lived worker session: `praector events [TARGET] [--since CURSOR]` reads the durable `events` table directly from the store (see the table above for its full flag list) and does not require a daemon.
+
+When a daemon **is** running with MCP enabled, a client can also open a scoped SSE stream against the same loopback endpoint the MCP tools use, rather than polling `status`/`graph`. One-line form (ad-hoc against a scratch or test-owned listener; never enable MCP on or restart the operator's live daemon to gather evidence):
+
+```bash
+curl -NsG http://127.0.0.1:8765/mcp \
+  -H 'Accept: text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
+  --data-urlencode 'collection=COL-...'
+```
+
+Pass a previous `id:` (the durable `EVT` id) back as a `Last-Event-ID` header to resume. Live delivery and replay share the same `project`/`collection`/`type`/`level` scoping, and the stream is **observation-only**: it launches no scheduler and bypasses no gate. These query parameters are delivery filters only, not authorization; loopback plus the Host/Origin authority gate plus the `MCP-Protocol-Version` header are the security boundary. Prefer `praector events` whenever the caller cannot hold a connection open across a process boundary, no daemon is running, or a one-shot audit is enough. See [Operations § Server-initiated event stream](../../../../docs/OPERATIONS.md#server-initiated-event-stream-sse) for the full contract.
+
 ## Verifying a CLI action
 
 Read the durable state back rather than trusting an exit code:

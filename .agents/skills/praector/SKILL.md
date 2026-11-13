@@ -56,6 +56,7 @@ Each step names the MCP tool; the identically named CLI subcommand does the same
 - Human defect in a `COMPLETE`, unaccepted Collection: inspect candidate -> `praector_collection_revise` with a concrete mandatory correction -> monitor fresh implementation and review.
 - Delivery or acceptance: inspect show/diff and review evidence -> via MCP, request the PR/acceptance plan if privileged then hand the real action to the operator; via the CLI, preview with `--dry-run` and run it only on explicit authorization.
 - Post-acceptance cleanup: verify the acceptance record -> ask for explicit cleanup scope -> call cleanup -> verify worktree/branch counts.
+- Long-running monitoring with a live daemon: a running daemon with MCP enabled can push events to a subscriber instead of being polled, so a client that must react to Collection/Task transitions without polling can open a scoped SSE stream (`GET /mcp?collection=COL-...` with `Accept: text/event-stream` and `MCP-Protocol-Version: 2025-06-18`). Prefer `praector events --since` when no daemon is running or when the caller is a short-lived worker session that cannot hold a connection open — see [references/concepts.md](references/concepts.md).
 
 ## Communication contract
 
