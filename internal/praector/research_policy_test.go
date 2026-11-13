@@ -704,7 +704,9 @@ func TestCurrentNewsObjectiveGetsFreshResearchWithoutImplementationCeremony(t *t
 		switch S(task, "profile") {
 		case "research":
 			research = task
-		case "explore", "critic", "plan_review", "implement":
+		case "explore":
+			// Intentional widening: the recorded freshness/evolving risk categories now enable the read-only explore preflight verb-independently. The heavy critic/plan_review/implement ceremony must still be absent.
+		case "critic", "plan_review", "implement":
 			t.Fatalf("non-implementation current-news objective should not add %s ceremony: %v", S(task, "profile"), tasks)
 		}
 	}

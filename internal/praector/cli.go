@@ -841,7 +841,7 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 		return nil, nil, e
 	}
 	critic, _ := store.CriticRevalidationState(S(c, "id"))
-	policy := ClassifyPlanningPolicy(S(c, "objective"))
+	policy := effectivePlanningPolicy(c)
 	if state != TaskComplete && state != "COMPLETE" {
 		if policy.CriticRequired && B(critic, "stale") {
 			return nil, nil, fmt.Errorf("Collection %s has a stale required critic: sealed material-plan fingerprint %s != current %s. Re-run orchestration to complete critic revalidation before acceptance.", S(c, "id"), S(critic, "sealed_fingerprint"), S(critic, "current_material_plan_fingerprint"))

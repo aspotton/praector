@@ -1712,7 +1712,7 @@ func (s *Store) SubmitResult(tid string, result Row, derivedConfigCandidates ...
 			if e != nil {
 				return nil, e
 			}
-			policy := ClassifyPlanningPolicy(S(collection, "objective"))
+			policy := effectivePlanningPolicy(collection)
 			if e := ValidateDeterministicResearchResult(result, policy.ExternalConformanceRequired); e != nil {
 				return nil, e
 			}
@@ -1739,7 +1739,7 @@ func (s *Store) SubmitResult(tid string, result Row, derivedConfigCandidates ...
 		if e != nil {
 			return nil, e
 		}
-		policy := ClassifyPlanningPolicy(S(collection, "objective"))
+		policy := effectivePlanningPolicy(collection)
 		if profile == "critic" || profile == "plan_review" || profile == "review" {
 			researchDeps, e := s.ResearchAncestors(tid)
 			if e != nil {
@@ -2081,15 +2081,17 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 	if profile != "implement" && profile != "plan_review" {
 		return true, nil
 	}
-	cr, err := s.queryLocked("SELECT objective FROM collections WHERE id=" + SQLLiteral(S(task, "collection_id")) + " LIMIT 1")
+	cr, err := s.queryLocked("SELECT objective, created_at FROM collections WHERE id=" + SQLLiteral(S(task, "collection_id")) + " LIMIT 1")
 	if err != nil {
 		return false, err
 	}
 	obj := ""
+	col := Row{}
 	if len(cr) > 0 {
 		obj = S(cr[0], "objective")
+		col = cr[0]
 	}
-	policy := ClassifyPlanningPolicy(obj)
+	policy := effectivePlanningPolicy(col)
 	if profile == "plan_review" {
 		if !policy.CriticRequired {
 			return true, nil
@@ -2805,7 +2807,7 @@ func (s *Store) UpdateCollectionTerminalState(cid string) (string, error) {
 		}
 		missingDelivery := dp.ImplementationRequired && completedImpl == 0
 		mr, _ := s.ImplementationsMissingPassingReview(cid)
-		pp := ClassifyPlanningPolicy(S(c, "objective"))
+		pp := effectivePlanningPolicy(c)
 		cs, _ := s.CriticRevalidationState(cid)
 		stale := pp.CriticRequired && B(cs, "stale")
 		if !missingDelivery && len(mr) == 0 && !stale {

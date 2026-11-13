@@ -348,7 +348,7 @@ func (s *Scheduler) enforceResearchRequests(collectionID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	policy := ClassifyPlanningPolicy(S(collection, "objective"))
+	policy := effectivePlanningPolicy(collection)
 	changed := false
 	for _, caller := range tasks {
 		if S(caller, "status") != TaskWaiting {
@@ -399,7 +399,7 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	policy := ClassifyPlanningPolicy(S(collection, "objective"))
+	policy := effectivePlanningPolicy(collection)
 	if !policy.ExploreRequired && !policy.ResearchRequired && !policy.CriticRequired && !policy.PlanReviewRequired {
 		return false, nil
 	}
@@ -990,7 +990,7 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		}
 	}
 	if changed {
-		_ = s.Store.Event(S(collection, "project_id"), collectionID, "", "", "PLANNING_POLICY_ENFORCED", Row{"explore_required": policy.ExploreRequired, "research_required": policy.ResearchRequired, "critic_required": policy.CriticRequired, "plan_review_required": policy.PlanReviewRequired, "external_conformance_required": policy.ExternalConformanceRequired, "threat_model_required": policy.ThreatModelRequired, "categories": policy.Categories, "critic_task_id": func() any {
+		_ = s.Store.Event(S(collection, "project_id"), collectionID, "", "", "PLANNING_POLICY_ENFORCED", Row{"gate_derivation": gateDerivationLabel(collection), "explore_required": policy.ExploreRequired, "research_required": policy.ResearchRequired, "critic_required": policy.CriticRequired, "plan_review_required": policy.PlanReviewRequired, "external_conformance_required": policy.ExternalConformanceRequired, "threat_model_required": policy.ThreatModelRequired, "categories": policy.Categories, "critic_task_id": func() any {
 			if critic != nil {
 				return S(critic, "id")
 			}
@@ -1217,7 +1217,7 @@ func (s *Scheduler) ensureReview(project, collection, impl Row) error {
 		return err
 	}
 	deps := []string{S(impl, "id")}
-	policy := ClassifyPlanningPolicy(S(collection, "objective"))
+	policy := effectivePlanningPolicy(collection)
 	if policy.ResearchRequired {
 		tasks, e := s.Store.ListTasks(S(collection, "id"))
 		if e != nil {

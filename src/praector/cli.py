@@ -22,7 +22,7 @@ from .config import (
 from .db import DoltStore
 from .scheduler import Scheduler
 from .profile_prompts import PROFILE_TITLES, load_global_prompt, load_profile_prompt
-from .planning_policy import classify_delivery_policy, classify_planning_policy
+from .planning_policy import classify_delivery_policy, effective_planning_policy
 from .pull_request import GitHubCLIProvider, build_pull_request_body, default_pull_request_title
 from .util import make_id, require_binary, run, sql_literal
 from .workspace import GitWorkspace
@@ -583,7 +583,7 @@ def _validate_collection_for_acceptance(store: DoltStore, collection: dict[str, 
     collection = store.get_collection(collection["id"])
     if state != "COMPLETE":
         critic_state = store.critic_revalidation_state(collection["id"])
-        policy = classify_planning_policy(collection.get("objective") or "")
+        policy = effective_planning_policy(collection)
         if policy.critic_required and critic_state.get("stale"):
             raise RuntimeError(
                 f"Collection {collection['id']} has a stale required critic: sealed material-plan "
@@ -594,7 +594,7 @@ def _validate_collection_for_acceptance(store: DoltStore, collection: dict[str, 
         raise RuntimeError(f"Collection {collection['id']} is {state}, not COMPLETE")
 
     critic_state = store.critic_revalidation_state(collection["id"])
-    policy = classify_planning_policy(collection.get("objective") or "")
+    policy = effective_planning_policy(collection)
     if policy.critic_required and critic_state.get("stale"):
         raise RuntimeError(
             f"Collection {collection['id']} has a stale required critic; acceptance requires a fresh critic seal."
@@ -663,7 +663,7 @@ def _accept_actor(project: dict[str, Any]) -> str:
 def cmd_collection_show(args: argparse.Namespace) -> int:
     store = _store()
     collection = store.get_collection(args.collection_id)
-    collection["planning_policy"] = classify_planning_policy(collection.get("objective") or "").as_dict()
+    collection["planning_policy"] = effective_planning_policy(collection).as_dict()
     collection["delivery_policy"] = classify_delivery_policy(collection.get("objective") or "").as_dict()
     collection["acceptances"] = store.list_collection_acceptances(collection["id"])
     collection["pull_requests"] = store.list_collection_pull_requests(collection["id"])

@@ -38,8 +38,8 @@ func (p DeliveryPolicy) AsRow() Row {
 
 var securityPatterns = []string{`\bauth(?:entication|orization)?\b`, `\bapi[-_ ]?key(?:s)?\b`, `\bcredential(?:s)?\b`, `\bsecret(?:s)?\b`, `\bpassword(?:s)?\b`, `\boauth\b`, `\btoken(?:s)?\b`, `\baccess[ -]?control\b`, `\bpermission(?:s)?\b`, `\bencrypt(?:ion|ed)?\b`, `\bsecurity\b`}
 var statefulPatterns = []string{`\brate[ -]?limit(?:ing)?\b`, `\bstateful\b`, `\bsession(?:s)?\b`, `\bcache(?:d|s|ing)?\b`, `\bqueue(?:s)?\b`, `\bretr(?:y|ies)\b`, `\bidempoten(?:t|cy)\b`, `\bconcurren(?:t|cy)\b`, `\block(?:ing|s)?\b`, `\btransaction(?:s)?\b`}
-var migrationPatterns = []string{`\bmigrat(?:e|ion|ions)\b`, `\bschema\b`, `\bdatabase\b`, `\bbackfill\b`, `\bdata conversion\b`}
-var destructivePatterns = []string{`\bdelete\b`, `\bdrop\b`, `\bpurge\b`, `\bdestructive\b`, `\birreversible\b`}
+var migrationPatterns = []string{`\bmigrat(?:e|es|ed|ing|ion|ions)\b`, `\bschema\b`, `\bdatabase\b`, `\bbackfill\b`, `\bdata conversion\b`}
+var destructivePatterns = []string{`\bdelet(?:e|es|ed|ing|ion)\b`, `\bdrop(?:s|ped|ping)?\b`, `\bpurg(?:e|es|ed|ing)\b`, `\bdestructive\b`, `\birreversible\b`}
 var externalContractPatterns = []string{`\bapi\b`, `\bwebhook(?:s)?\b`, `\bpublic endpoint\b`, `\bbackward compatib(?:le|ility)\b`}
 var externalIntegrationPatterns = []string{`\bgateway(?:s)?\b`, `\bintegration(?:s)?\b`, `\bthird[- ]party\b`, `\bexternal service\b`, `\bexternal api\b`, `\bprovider(?:s)?\b`, `\bsdk\b`, `\btwilio\b`, `\btelephony\b`, `\btwiml\b`, `\bcloud\b`}
 var protocolPatterns = []string{`\bprotocol\b`, `\bspecification\b`, `\bstandard\b`, `\brfc\b`, `\bwire format\b`, `\bcompatibility matrix\b`, `\bmcp\b`, `\bmodel context protocol\b`, `\bopenapi\b`}
@@ -53,6 +53,18 @@ var evolvingDependencyPatterns = []string{
 var networkBoundaryPatterns = []string{`\blistener\b`, `\bhttp server\b`, `\bserver\b`, `\bnetwork\b`, `\bbind\b`, `\bsocket\b`, `\bremote\b`, `\bwebhook\b`, `\binbound\b`, `\bpublic endpoint\b`}
 
 const mutationVerbs = `add|implement|build|create|modify|change|update|fix|repair|refactor|remove|delete|migrate|extend|introduce|replace|upgrade|convert|make|enforce|support`
+
+// GateCoherenceCutoff is the UTC date (YYYY-MM-DD) from which the deterministic
+// planning risk gates are derived from the recorded risk categories rather than
+// being ANDed with the objective's mutation-verb signal. Collections created on
+// or after this date use the coherent derivation; collections created before it
+// keep the historical verb-ANDed derivation so pre-existing work is never
+// retroactively re-gated at the claim gate, COMPLETE reconciliation, submit-time
+// oracle strictness, acceptance critic-stale check, or scheduler staging. This
+// is a forward-scope guard, not a policy_version or per-collection marker; once
+// the cutoff is two releases old the legacy branch may be deleted. See
+// docs/AGENT_PROTOCOL.md and ROADMAP.md.
+const GateCoherenceCutoff = "2026-11-12"
 
 var implementationFirstLine = regexp.MustCompile(`(?i)^(?:please\s+)?(?:` + mutationVerbs + `)\b`)
 var implementationRequests = []string{`\b(?:i(?:'|’)d|i would|we would)\s+like\s+to\s+(?:` + mutationVerbs + `)\b`, `\b(?:i|we)\s+(?:want|need)\s+(?:you\s+)?to\s+(?:` + mutationVerbs + `)\b`, `\b(?:can|could|would)\s+you\s+(?:please\s+)?(?:` + mutationVerbs + `)\b`, `\bplease\s+(?:` + mutationVerbs + `)\b`, `\blet(?:'|’)s\s+(?:` + mutationVerbs + `)\b`}
@@ -85,6 +97,18 @@ func trivialDocs(obj string) bool {
 }
 
 func ClassifyPlanningPolicy(obj string) PlanningPolicy {
+	return classifyPlanningPolicy(obj, true)
+}
+
+// classifyPlanningPolicy is the single deterministic planning-gate derivation.
+// When coherent is true the RISK gates fire from the recorded risk categories;
+// when false (the pre-cutoff legacy mode) the verb-dependent RISK gates are
+// additionally ANDed with the objective's mutation-verb mask, reproducing the
+// historical verb-ANDed behavior exactly. The plan_review `implementation and
+// not trivial_docs` term, the delivery policy, and the research freshness
+// triggers stay verb-based in BOTH modes; this is a risk-gate trigger fix, not a
+// blanket "always run everything" policy.
+func classifyPlanningPolicy(obj string, coherent bool) PlanningPolicy {
 	cats := []string{}
 	reasons := []string{}
 	implementation := requiresImplementation(obj)
@@ -152,16 +176,28 @@ func ClassifyPlanningPolicy(obj string) PlanningPolicy {
 	if research {
 		reasons = append(reasons, "Correctness depends on fresh external evidence; current authoritative research is required before critique/planning.")
 	}
-	externalConformance := implementation && (protocol || extIntegration)
+	// Category-derived RISK gates. Coherent mode derives each gate from the
+	// recorded risk category; legacy (pre-cutoff) mode ANDs each verb-dependent
+	// risk gate with the mutation-verb mask to reproduce the historical behavior
+	// exactly. Any risk category recorded with no action verb therefore still
+	// enables its gate post-cutoff, closing the phrasing-opt-in defect.
+	externalConformance := protocol || extIntegration
+	threatModel := security || networkBoundary
+	integrationSensitive := extContract || extIntegration || protocol
+	anyRisk := security || stateful || migration || destructive || extContract || extIntegration || protocol || freshness || regulation || evolving || networkBoundary
+	explore := implementation || anyRisk
+	if !coherent {
+		externalConformance = implementation && externalConformance
+		threatModel = implementation && threatModel
+		integrationSensitive = implementation && integrationSensitive
+		explore = implementation
+	}
 	if externalConformance {
 		reasons = append(reasons, "External protocol/provider work requires an authoritative independent verification oracle when practical.")
 	}
-	threatModel := implementation && (security || networkBoundary)
 	if threatModel {
 		reasons = append(reasons, "A network/security trust boundary requires explicit threat-model directives before write work.")
 	}
-	integrationSensitive := implementation && (extContract || extIntegration || protocol)
-	explore := implementation
 	critic := implementation || security || migration || destructive || (stateful && extContract) || integrationSensitive
 	plan := stateful || migration || destructive || integrationSensitive || externalConformance || threatModel || (implementation && !trivial)
 	if plan {
@@ -184,6 +220,37 @@ func ClassifyDeliveryPolicy(obj string) DeliveryPolicy {
 		return DeliveryPolicy{true, []string{"implementation_delivery"}, []string{"The Collection objective is a direct change request; at least one completed implementation with passing independent review is required before COMPLETE."}}
 	}
 	return DeliveryPolicy{}
+}
+
+// planningGateCoherent reports whether a collection should be classified with
+// the coherent (category-derived) gate derivation. It compares only created_at's
+// day component (first 10 characters, so the SQLite "T"-separated and Dolt
+// " "-separated DATETIME renderings compare identically) to GateCoherenceCutoff.
+// A seam that cannot reach a collection row (empty created_at) fails CLOSED to
+// the coherent floor; it never guesses and never consults a marker.
+func planningGateCoherent(collection Row) bool {
+	created := S(collection, "created_at")
+	if len(created) < 10 {
+		return true
+	}
+	return created[:10] >= GateCoherenceCutoff
+}
+
+// effectivePlanningPolicy is the single collection-derived planning classification
+// every seam MUST call so enforcement and display cannot diverge. It derives from
+// the same objective string plus one age boolean; it introduces no second source
+// of truth and launches nothing.
+func effectivePlanningPolicy(collection Row) PlanningPolicy {
+	return classifyPlanningPolicy(S(collection, "objective"), planningGateCoherent(collection))
+}
+
+// gateDerivationLabel labels the derivation an enforced policy used for the
+// additive gate_derivation field on the existing PLANNING_POLICY_ENFORCED event.
+func gateDerivationLabel(collection Row) string {
+	if planningGateCoherent(collection) {
+		return "category"
+	}
+	return "verb_legacy"
 }
 
 var materialProfiles = map[string]bool{"implement": true, "research": true, "advise": true}
