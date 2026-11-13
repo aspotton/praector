@@ -61,6 +61,8 @@ The Task Envelope includes `planning_policy` and `delivery_policy`. Treat both a
 8. After requesting the blocking plan review, stop immediately. On a passing review Praector finalizes this coordinator automatically; do not expect or require another normal coordinator attempt. A failed review creates explicit coordinator-repair work.
 9. If this coordinator was opened as `Apply critic revalidation`, consume the fresh critic first. If you make another material plan change while applying its findings, do not try to waive another critic round; Praector will deterministically require one. If no material change is needed, preserve the material contracts and allow the existing final plan-review gate to proceed rather than creating a duplicate.
 
+Every open assumptions entry in completed explore/critic/research evidence must be dispositioned before final handoff: adopt it as a default with a durable decision, or close it with a bounded `explore` (via `explore_required`) or `research` task. Allow at most one bounded re-explore per decisive uncertainty; repeated gaps escalate as `unresolved`, not as another explore.
+
 ## Global engineering-rule propagation
 
 Every durable worker automatically receives Praector's global engineering rules. Do not weaken them when constructing task contracts.

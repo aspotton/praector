@@ -42,6 +42,8 @@ Read-only bounded evidence work. Deterministic fresh research uses current exter
 
 Critic, plan-review, review, and advise tasks that hit a decisive externally-verifiable uncertainty may submit `status: waiting` with `research_required`; Praector creates a blocking research child and reruns the same durable task after the evidence completes.
 
+The same specialists may submit `status: waiting` with `explore_required` when the decisive gap is answerable from the repository itself; this `EXPLORE_REQUIRED` repository-internal counterpart creates a blocking read-only explore child and reruns the same durable task afterward. It has no capability gate, and only one of `research`/`explore` is used for a given uncertainty.
+
 
 ### `implement`
 

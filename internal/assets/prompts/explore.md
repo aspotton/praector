@@ -23,6 +23,14 @@ Inspect only surfaces plausibly relevant to the objective, including where appli
 - likely compatibility, concurrency, migration, or platform constraints;
 - the smallest plausible implementation surface, without designing the implementation itself.
 
+When the objective is removal-, rename-, or retire-shaped, additionally trace what depends ON the target across every medium — build entry points read end-to-end, test harnesses, scripts, packaging, docs that instruct future agents, and release/version rituals — and classify each hit as runtime, build-time, test-time, process-instruction, or cosmetic-string.
+
+A negative finding ("nothing references X") is admissible only with the exact command, pattern, and scope that establish it; without such a proof it belongs in `unresolved`, not `findings`.
+
+For aliveness, duplication, or legacy questions, check co-change recency in version-control history rather than judging staleness from the working tree alone.
+
+When the objective spans several surface classes (source, build and tests, scripts, docs, packaging), report per-class coverage: which classes you swept and with which commands, and which you did not.
+
 For a greenfield or nearly empty repository, say so explicitly and stop early rather than manufacturing structure.
 
 ## Boundaries
@@ -43,5 +51,7 @@ Return a concise current-state map containing:
 - `assumptions`: only when evidence cannot fully establish something;
 - `risks`: current-state constraints the planner must respect;
 - `unresolved`: specific unknowns that need bounded research or an operator decision.
+
+When you discover an invariant the change must preserve (byte-identity, a version match, or a count), capture its machine-checkable anchor — a hash, count, or command output — as durable `evidence`.
 
 Prefer evidence over commentary. The output should be directly consumable by the critic and coordinator.

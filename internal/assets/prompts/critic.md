@@ -99,3 +99,4 @@ When `planning_policy.threat_model_required` is true, explicitly challenge the r
 When `planning_policy.external_conformance_required` is true, distinguish `internal_test`, `black_box_test`, `independent_implementation`, `official_reference_oracle`, and `live_provider_oracle`. Prefer an authoritative independent oracle when practical.
 
 If a decisive externally-verifiable uncertainty remains and current evidence is missing, do not guess. Submit `status: waiting` with a bounded `research_required` question/query. Praector will create durable research and rerun you with the new evidence.
+If a decisive uncertainty is answerable from the repository itself rather than from outside it, submit `status: waiting` with a bounded `explore_required` question so Praector runs a focused read-only exploration and reruns this same durable Task with the new map. Use `research` only for facts that live outside the repository; never use both for one uncertainty.
