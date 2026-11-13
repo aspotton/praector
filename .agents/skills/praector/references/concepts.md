@@ -119,6 +119,15 @@ Operator retry after exhausted failure creates a replacement Task, marks the old
 
 ## MCP security and context
 
-The listener is local and unauthenticated, so it binds loopback only and validates Host and Origin to resist DNS rebinding. It advertises one implemented MCP revision and requires a matching protocol-version header after initialization.
+The listener is local and unauthenticated, so it binds loopback only and validates Host and Origin to resist DNS rebinding. It advertises one implemented MCP revision and requires a matching protocol-version header after initialization. Loopback binding plus the Host/Origin authority gate and the protocol-version header **are** the security boundary; the SSE query parameters `project`/`collection`/`type`/`level` and the `logging/setLevel` level filter are delivery filters only, **not** authorization — any local process that reaches the loopback listener can subscribe to any collection's events.
 
 MCP operations have no implicit daemon cwd. Project-aware tools need an explicit `PRJ-*`, `COL-*`, or `T-*` context; `praector_run` always needs `project`, and MCP `init` always needs an absolute `root_path`. A remote/cloud MCP client cannot reach the loopback listener without a separately designed remote boundary, which this release intentionally does not provide.
+
+## Push vs. poll
+
+Praector has two ways to observe state changes:
+
+- **Poll** with `praector events [TARGET] [--since CURSOR]`, which reads the durable `events` table directly from the store and needs **no daemon running**. This is the right default for a short-lived worker session, a one-off audit, or a scripted paging loop that must not hold a connection open across a process boundary.
+- **Push** by opening a scoped SSE stream against an **already-running** daemon with MCP enabled: `GET http://127.0.0.1:8765/mcp?collection=COL-...` with `Accept: text/event-stream`, `MCP-Protocol-Version: 2025-06-18`, and any of the `project`/`collection`/`type`/`level` query parameters to narrow what the connection receives. Live delivery and Last-Event-ID reconnect replay both honour those same parameters, so a stream never receives foreign rows. The stream is **observation-only**: it launches no process, enqueues nothing, and bypasses no gate.
+
+Push is available only when a daemon is running and `[mcp] enabled = true` (or `PRAECTOR_MCP=…`), and the four query parameters are delivery filters only, not authorization. `logging/setLevel` on the JSON-RPC surface is an **all-streams broadcast** (exact for one observer, last-writer-wins across many) because `mcp.LoggingProvider` carries no session identity; per-connection `setLevel` is deferred roadmap work. Default level is `info`, and any event type not explicitly listed in the mapping is `debug` and therefore muted by default — pass `level=debug` on the subscribe URL (or issue a broadcast `setLevel`) to see it. See [Operations § Server-initiated event stream](../../../docs/OPERATIONS.md#server-initiated-event-stream-sse) for the full contract.

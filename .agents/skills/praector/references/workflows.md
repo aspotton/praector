@@ -53,6 +53,13 @@ Use the narrowest sequence that answers the question:
 
 Do not equate a completed coordinator with a completed Collection. Do not equate a submitted result with a `COMPLETE` Task while it remains `VERIFYING`.
 
+### Push vs. poll
+
+When the caller must react to state transitions without re-polling, prefer push over poll when the prerequisites are already met:
+
+- **Daemon running with MCP enabled:** open a scoped SSE stream against the same loopback endpoint the MCP tools use — `curl -NsG http://127.0.0.1:8765/mcp -H 'Accept: text/event-stream' -H 'MCP-Protocol-Version: 2025-06-18' --data-urlencode 'collection=COL-...'` — narrowing further with `project=`/`type=`/`level=` as needed. The stream is observation-only; it launches no scheduler and bypasses no gate, and any local process that reaches the loopback listener can open one against any collection. Pass a previous SSE `id` (the durable `EVT` id) back as `Last-Event-ID` to resume; replay is scoped, deduped, and fail-closed (an unresolvable id replays nothing rather than guessing a cursor). Never enable MCP on or restart the operator's live daemon just to gather evidence; run against a scratch `PRAECTOR_HOME` daemon or a test-owned listener instead.
+- **No daemon, or a short-lived worker session:** use `praector events [TARGET] [--since CURSOR]` (see the CLI table in [cli.md](cli.md)), which reads the same durable table directly with no daemon required. This is the safer default when a connection cannot be held open across a process boundary or when one-shot auditing is enough.
+
 ## Diagnose a blocked or failed Collection
 
 1. Read `praector_collection_show` for status, planning/delivery policy, revisions, critic freshness, Tasks, and acceptance history.

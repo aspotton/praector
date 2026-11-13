@@ -309,52 +309,196 @@ In addition to the POST request/response surface, the listener serves an
 **observation-only** server-sent-events stream so an MCP client can subscribe to
 durable events instead of polling `status`/`graph`. This push surface targets the
 **MCP 2025-06-18** revision (the current 2026-07-28 revision differs; that migration
-is deferred roadmap work, not current conformance — see `ROADMAP.md`).
+is deferred roadmap work, not current conformance — see `ROADMAP.md`). It targets
+2025-06-18 in **version scope, not conformance**: Praector does not claim to
+implement every 2025-06-18 multi-stream rule, only the subset it wired here.
 
-To open it, `GET /mcp` with `Accept: text/event-stream` **and** the
-`MCP-Protocol-Version: 2025-06-18` header:
+To open a stream, send `GET /mcp` with `Accept: text/event-stream` **and** the
+`MCP-Protocol-Version: 2025-06-18` header. Four optional query parameters scope
+what the connection receives; each also applies to a `Last-Event-ID` reconnect,
+so a stream replays only its own scoped rows:
+
+| Parameter | Applies to | Meaning |
+| --- | --- | --- |
+| `project=PRJ-*` | live + replay | Only events whose durable `project_id` matches. |
+| `collection=COL-*` | live + replay | Only events whose durable `collection_id` matches. |
+| `type=EVENT_TYPE` | live + replay | Only events with this exact `event_type`. No registry check: an unrecognised string simply matches nothing and returns an empty page (a known gap, recorded in `ROADMAP.md`). |
+| `level=LEVEL` | live + replay | Only events whose `eventLevel(...)` rank is at or above `LEVEL`. Validated against `mcp.ValidLoggingLevel`; an **invalid value silently keeps the default `info`** rather than returning an error. |
+
+Anchors: query-parameter read is `internal/praector/mcp_sse.go:216-221`; the
+same `filter{project, collection, eventType}` is stored on the stream struct at
+`internal/praector/mcp_sse.go:58-60`, applied to live fan-out by `matches()`
+(`internal/praector/mcp_sse.go:323-335`), and passed into `Store.ListEvents` for
+replay at `internal/praector/mcp_sse.go:292`; the level filter on replay lives
+at `internal/praector/mcp_sse.go:313`.
+
+Worked example — subscribe to a single collection (ad-hoc observation against a
+loopback listener; **never** enable MCP on the operator's live daemon just to
+gather evidence — use a scratch `PRAECTOR_HOME`/test-owned listener instead):
 
 ```bash
-curl -N http://127.0.0.1:8765/mcp \
+curl -NsG http://127.0.0.1:8765/mcp \
   -H 'Accept: text/event-stream' \
   -H 'MCP-Protocol-Version: 2025-06-18' \
-  -H 'Last-Event-ID: EVT-...'          # optional: resume after a reconnect
+  --data-urlencode 'collection=COL-...'
 ```
+
+Add `-H 'Last-Event-ID: EVT-...'` to resume after a disconnect. Append
+`--data-urlencode 'level=debug'` to also receive the muted `debug` event types
+listed below, or `--data-urlencode 'type=TASK_FAILED'` to narrow to one type.
 
 Behaviour and guarantees:
 
 - A `GET` that does **not** advertise `text/event-stream` still receives **405**
-  (the POST surface is byte-for-byte unchanged for non-streaming clients).
-- A `GET` is authorized **identically to POST**: the loopback-authority gate and
-  the `MCP-Protocol-Version` header requirement are enforced before a single byte
-  is written (a `GET` has no JSON-RPC body, so its version header is required
-  unconditionally, unlike POST's `initialize` header exemption). A foreign/opaque
-  Origin or a missing/wrong header is refused with nothing written to a stream.
-- Each SSE frame carries **only** a JSON-RPC `notifications/message`
-  (`logger: "praector"`, `data` with `event_type` plus the `EVT`/`COL`/`T`/`ATTEMPT`
-  ids and `created_at`); a JSON-RPC **response** is never written on the stream.
-  The SSE `id:` line is the durable `EVT` id.
+  (the POST surface is byte-for-byte unchanged for non-streaming clients;
+  `internal/praector/mcp/transport.go:64-67`).
+- A `GET` is authorized **identically to POST**: the loopback-authority gate
+  (`internal/praector/mcp/transport.go:42-45`) and the `MCP-Protocol-Version`
+  header requirement (`internal/praector/mcp/transport.go:72-74`) are enforced
+  before a single byte is written (a `GET` has no JSON-RPC body, so its version
+  header is required unconditionally, unlike POST's `initialize` header
+  exemption). The **complete GET refusal set** is:
+  - **405** Method Not Allowed — a non-advertising `GET`, or any `GET` while no
+    `StreamHandler` is wired;
+  - **403** Forbidden — a foreign or literal-null/opaque `Origin` or a
+    non-loopback `Host`. This is Praector's fail-closed policy layered on top of
+    the socket-bind gate (DNS-rebinding / cross-origin defense). The Origin
+    requirement itself matches the **2025-11-25** revision strengthening, or
+    Praector's own policy, not a 2025-06-18 mandate;
+  - **400** Bad Request — a missing or wrong `MCP-Protocol-Version` header, per
+    the 2025-06-18 Streamable-HTTP contract;
+  - **503** Service Unavailable — `http.StatusServiceUnavailable` with body
+    `too many event streams`, returned by a single shared code path when either
+    the concurrent-stream cap is reached **or** the hub is closed during daemon
+    shutdown (`internal/praector/mcp_sse.go:224-227` and `tryRegister`
+    `internal/praector/mcp_sse.go:266-279`). One shared code path, one status code:
+    both triggers produce the same `503`, not two distinguishable refusals.
+- A `200` response opens with headers `Content-Type: text/event-stream`,
+  `Cache-Control: no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no`,
+  followed by a `: connected` SSE priming comment (a comment, never a JSON-RPC
+  frame) so the client observes the `200` immediately before any data frame
+  (`internal/praector/mcp_sse.go:230-238`).
+- **Operational limits** are compiled constants —
+  `defaultMaxStreams = 64`, `defaultStreamBuffer = 128`,
+  `defaultReplayLimit = 2000`, `defaultSSELevel = "info"`, `sseLoggerName =
+  "praector"` (`internal/praector/mcp_sse.go:64-70`) — overridable only in
+  tests, not via config or environment.
+- **Security boundary.** Loopback binding plus the Host/Origin authority gate
+  and the mandatory `MCP-Protocol-Version` header together are the security
+  boundary. The `project` / `collection` / `type` / `level` query parameters
+  and the `logging/setLevel` level filter are **delivery filters only**, not
+  authorization or access control: any local process that reaches the loopback
+  listener can subscribe to any collection's events. Do not describe them as
+  authorization, and do not describe loopback binding as stronger than it is.
+- Each SSE frame carries **only** a JSON-RPC `notifications/message` — a
+  JSON-RPC **response** is never written on the stream. The SSE `id:` line is
+  the durable `EVT` id (so a reconnect can pass it back as `Last-Event-ID`),
+  `event:` is `message`, and the `data:` body is the `notifications/message`
+  JSON with `logger: "praector"` and `data` keys **exactly**
+  `{event_type, event_id, project_id, collection, task, attempt, created_at}`
+  (`internal/praector/mcp_sse.go:355-378`). There is no `collection_id`,
+  `task_id`, or `attempt_id` key name on the wire — the internal Go struct uses
+  those names, but the emitted JSON uses the shorter forms above.
 - The stream is **read-only and observation-only**: it never implies a mutation
   happened, never launches a scheduler or process, and never bypasses
   policy/review/acceptance (`collection pr`/`accept` remain plan-only here too).
 - Fan-out is **non-blocking**: a slow, stalled, or vanished client at most loses
   its own messages and has its own stream closed; it never blocks `Store.Event()`
   or starves another consumer.
-- Reconnect with `Last-Event-ID` **replays** that stream's missed rows from the
-  durable `events` table (scoped to the same stream, deduped by id) and then resumes
-  live — so an absent client loses nothing.
-- `logging/setLevel` (the eight spec levels; an unrecognized level returns Invalid
-  Params `-32602`) tunes the verbosity of active stream(s). The default effective
-  level is `info`, and the fixed event→level mapping keeps decision-relevant
-  transitions (`COLLECTION_COMPLETE`/`COLLECTION_ACCEPTED`, `TASK_COMPLETE`,
-  `TASK_INTEGRATED`) visible by default, repair/blocked signals
-  (`COLLECTION_BLOCKED`/`TASK_FAILED`) at `warning`, protocol/authorization
-  violations at `error`, and routine lifecycle/lineage at `debug`. There is no
-  session-id/auth header; a multi-stream `setLevel` is a documented best-effort
-  broadcast (exact for a single observer).
+- Reconnect with **`Last-Event-ID`** (the HTTP GET header, whose value is the
+  SSE `id:` line's durable `EVT` id) **replays** that stream's missed rows
+  strictly after the resolved `(created_at, id)` cursor from the durable
+  `events` table, applying the same connect-time `project`/`collection`/`type`
+  scope and the effective `level`, and **deduped by id**. The replay is
+  **fail-closed**: an absent or unresolvable last id replays nothing rather
+  than guessing a cursor (`internal/praector/mcp_sse.go:284-291`).
+- **Level semantics.** The valid level domain is the eight RFC 5424 levels
+  (`debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`,
+  `emergency`; `internal/praector/mcp/protocol.go:72`). The default effective
+  level on a fresh stream is `info`. There are **two different mechanisms with
+  different scope**:
+  - `?level=` is **per-connection** and is validated with
+    `mcp.ValidLoggingLevel` (`internal/praector/mcp_sse.go:219-221`). An invalid
+    value is silently ignored; the stream keeps the `info` default rather than
+    failing.
+  - `logging/setLevel` is a JSON-RPC method whose server-side handler calls
+    `sseHub.SetLevel`, which loops over every active stream and stores the new
+    rank on each (`internal/praector/mcp_sse.go:147-162`). It is therefore an
+    **all-streams broadcast** — exact for a single observer, last-writer-wins
+    across many concurrent subscribers. An invalid level parameter is rejected
+    with JSON-RPC Invalid Params `-32602` at the protocol layer, which is a
+    spec-mandated behavior of the targeted revision. Per-connection `setLevel`
+    would require session identity that `mcp.LoggingProvider` does not
+    currently carry; the 2025-06-18 spec leaves the method's scope
+    unspecified, so this broadcast is a Praector implementation decision rather
+    than a spec mandate. Deferred as roadmap work.
+- **Event-type → level mapping (rule, not just examples).** `eventLevel` is a
+  fixed `switch` (`internal/praector/mcp_sse.go:384-402`) whose `default:`
+  branch returns `debug`. Consequence: **any emitted event type not explicitly
+  listed in that map is `debug`**, therefore **muted at the default `info`
+  level**; a subscriber that needs to see it must request `?level=debug` (or
+  issue `logging/setLevel` at `debug`). The explicitly-listed set covers, at
+  `error`: `IMPLEMENTATION_WORKSPACE_VIOLATION`, `READ_ONLY_CAPABILITY_RETRY`;
+  at `warning`: `CRITIC_REVALIDATION_REQUIRED`, `COLLECTION_BLOCKED`,
+  `TASK_FAILED`, `PLAN_REVIEW_CYCLE_REPAIRED`, `PLAN_REVIEW_REPAIR_CREATED`,
+  `LEGACY_DEPENDENCY_CYCLE_REPAIRED`; at `info`: `COLLECTION_COMPLETE`,
+  `COLLECTION_ACCEPTED`, `COLLECTION_PR_RECORDED`, `COLLECTION_PR_UPDATED`,
+  `COLLECTION_REVISION_SATISFIED`, `COLLECTION_ENTRYPOINT_RECOVERED`,
+  `TASK_COMPLETE`, `TASK_INTEGRATED`, `TASK_SUPERSEDED`,
+  `TASK_MANUAL_RETRY_CREATED`. Everything else the store actually emits is
+  `debug`/muted by default.
+  - Derived emitted-but-muted list (current tree; re-derive with the command
+    below). Note: two names in the level map (`PLAN_REVIEW_CYCLE_REPAIRED`,
+    `PLAN_REVIEW_REPAIR_CREATED`) have no emission site in this tree, and three
+    emitted names (`PLAN_REVIEW_COORDINATOR_CYCLE_REPAIRED`,
+    `PLAN_REVIEW_DEPENDENCY_CYCLE_REPAIRED`, `PLAN_REVIEW_REPAIR_REQUESTED`)
+    are **not** in that map and therefore fall through to `debug`.
+    `ATTEMPT_FINISHED`, `COLLECTION_CREATED`, `COLLECTION_REVISION_REQUESTED`,
+    `CONFIG_BASIS_UNAVAILABLE`, `COORDINATOR_ATTENTION_REQUESTED`,
+    `COORDINATOR_FINALIZED_AFTER_PLAN_REVIEW`, `CRITIC_PLAN_BASELINE`,
+    `DELIVERY_POLICY_ENFORCED`, `DEPENDENCY_CYCLE_QUARANTINED`,
+    `DEPENDENCY_CYCLE_REJECTED`, `DIRECTIVE_TRACEABILITY_EMPTY_HARVEST`,
+    `DIRECTIVE_TRACEABILITY_GAP`, `EXECUTOR_ERROR`,
+    `PLANNING_POLICY_ENFORCED`, `PLAN_REVIEW_CALLER_DEPENDENCY_IGNORED`,
+    `PLAN_REVIEW_COORDINATOR_CYCLE_REPAIRED`,
+    `PLAN_REVIEW_DEPENDENCY_CYCLE_REPAIRED`,
+    `PLAN_REVIEW_IMPLEMENT_DEPENDENCIES_IGNORED`,
+    `PLAN_REVIEW_REPAIR_REQUESTED`, `PLAN_REVIEW_REUSED`,
+    `POST_REPAIR_REVIEW_CREATED`, `RECONCILIATION_REQUIRED`,
+    `REDUNDANT_PLAN_REVIEW_COLLAPSED`, `RESEARCH_CAPABILITY_REQUIRED`,
+    `RESEARCH_CONSISTENCY_REVALIDATION_REQUIRED`, `RESEARCH_REQUIRED`,
+    `REVIEW_LINEAGE_REPAIRED`, `REVIEW_PROTOCOL_RETRY`, `REVIEW_REPAIR_CREATED`,
+    `SESSION_STARTED`, `TASK_COMPLETION_DEFERRED`, `TASK_CREATED`,
+    `TASK_INPUT_LINEAGE`, `TASK_REQUESTED`, `TASK_RESULT_SUBMITTED`. Whether
+    promoting any of these to `info` is warranted is recorded in `ROADMAP.md`;
+    none is promoted here. Note that `PLANNING_POLICY_ENFORCED` carries a
+    `gate_derivation` payload field describing which planning gates were set
+    (`internal/praector/scheduler.go:993`).
+  - Reproducible enumeration command (union of `.Event(...)` /
+    `emitEvent(... EventType: "...")` call sites plus inline `INSERT INTO
+    events` string literals and the `statusTaskEvent`/`statusCollectionEvent`
+    functions):
+
+    ```bash
+    {
+      git grep -h -E 'Store\.Event|\.Event\(|emitEvent' -- 'internal/praector/*.go' \
+        | grep -oE '"[A-Z][A-Z_]{3,}"'
+      git grep -h "INSERT INTO events" -- 'internal/praector/*.go' \
+        | grep -oE "'[A-Z_]{4,}'" | tr -d "'" | sed 's/^/"/;s/$/"/'
+      git grep -A 12 'func statusTaskEvent\|func statusCollectionEvent' \
+        -- 'internal/praector/*.go' | grep -oE '"[A-Z_]{4,}"'
+    } | sort -u
+    ```
+
+    Subtract the levels listed above to derive the currently-muted set. Static
+    grep can miss dynamically-composed type strings, so a reviewer should
+    re-derive rather than trust this list across releases; treat it as derived
+    from the current tree, not settled fact.
 
 The `praector events [TARGET]` CLI command remains the no-daemon way to read the
-same durable log by hand (`docs/CLI.md`).
+same durable log by hand (`docs/CLI.md`) and is the right choice when no daemon
+is running or when the caller is a short-lived worker session that cannot hold
+an SSE connection open across a process boundary.
 
 ## Observe work
 
