@@ -351,14 +351,24 @@ Behaviour and guarantees:
 
 - A `GET` that does **not** advertise `text/event-stream` still receives **405**
   (the POST surface is byte-for-byte unchanged for non-streaming clients;
-  `internal/praector/mcp/transport.go:64-67`).
+  `internal/praector/mcp/transport.go:64-67`). "Advertise" means content
+  negotiation, not an exact string: the check
+  (`internal/praector/mcp/transport.go:86-97`) accepts `text/event-stream` and
+  honors the `*/*` and `text/*` wildcards. A plain `curl` or browser `GET` that
+  names no `Accept` header at all is therefore sending `Accept: */*` and **does
+  open the stream**; the 405 case is a `GET` whose `Accept` explicitly excludes
+  SSE (an empty header, or only non-SSE media types). This widens nothing that
+  the gates below refuse, because the `MCP-Protocol-Version` header and the
+  loopback Host/Origin authority check run first on every `GET` path.
 - A `GET` is authorized **identically to POST**: the loopback-authority gate
   (`internal/praector/mcp/transport.go:42-45`) and the `MCP-Protocol-Version`
   header requirement (`internal/praector/mcp/transport.go:72-74`) are enforced
   before a single byte is written (a `GET` has no JSON-RPC body, so its version
   header is required unconditionally, unlike POST's `initialize` header
   exemption). The **complete GET refusal set** is:
-  - **405** Method Not Allowed — a non-advertising `GET`, or any `GET` while no
+  - **405** Method Not Allowed — a `GET` whose `Accept` header excludes SSE (an
+    empty header, or one naming only non-SSE media types; `*/*` and `text/*`
+    count as advertising and open the stream), or any `GET` while no
     `StreamHandler` is wired;
   - **403** Forbidden — a foreign or literal-null/opaque `Origin` or a
     non-loopback `Host`. This is Praector's fail-closed policy layered on top of
