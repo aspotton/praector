@@ -148,7 +148,7 @@ praector events COL-abc --type TASK_CREATED
 praector events COL-abc --since CURSOR --limit 50
 ```
 
-The `events` command is **native-only** (like the MCP surface): it has no Python reference counterpart and is intentionally omitted from the parity script's command-surface check. See [State and Recovery](STATE_AND_RECOVERY.md#events) for the event-log and cursor semantics.
+The `events` command is **native-only** (like the MCP surface). See [State and Recovery](STATE_AND_RECOVERY.md#events) for the event-log and cursor semantics.
 
 ## Collection lifecycle
 

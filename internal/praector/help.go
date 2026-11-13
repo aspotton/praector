@@ -6,9 +6,9 @@ import (
 )
 
 // commandHelp keeps help handling independent of runtime/store initialization.
-// The Python reference uses argparse, where every command and subcommand accepts
-// -h/--help without requiring Git, Dolt, a project marker, or any other runtime
-// dependency. Preserve that contract in the native executable.
+// Every command and subcommand accepts -h/--help without requiring Git, Dolt, a
+// project marker, or any other runtime dependency. Preserve that contract in the
+// native executable.
 var commandHelp = map[string]string{
 	"init": `Usage: praector init [--name NAME] [--base-branch BRANCH] [--opencode PATH]
 

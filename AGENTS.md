@@ -87,8 +87,6 @@ internal/praector/process_*.go    OS-specific worker process-tree control
 internal/assets/schema.sql    embedded durable relational schema
 internal/assets/prompts/*.md  embedded global/profile operating contracts
 internal/praector/*_test.go       native executable/state regression tests
-src/praector/                     Python reference implementation
-tests/                        original Python behavioral regression contract
 ```
 
 ## Where behavior belongs
@@ -106,7 +104,7 @@ Keep responsibilities separated:
 - **Harness (`internal/praector/harness.go`)**: launch/observe one disposable model/tool session. Do not move scheduling policy here.
 - **MCP (`internal/praector/mcp/` + `mcp_server.go`)**: the MCP protocol core, loopback-only transport, and the tool/resource bridge over the shared service layer. It adds no orchestration/process-launch path; every MCP action delegates to a typed `Service` op. The bridge is driven off `commandHelp`/`serviceOps` so every CLI command projects to exactly one MCP tool (leaf) or resource (namespace / launch-only). Enqueue-only "execute" actions mirror the CLI `--detach` path and rely on the running daemon; privileged collection-finalizing tools remain default-off behind an independent `privileged` opt-in. The server-initiated SSE stream is another observation-only adapter surface: the domain-agnostic `mcp/` core owns only the GET gate/negotiation and the `logging/setLevel` protocol shape, while every stream, per-connection level, and Last-Event-ID replay decision lives in `mcp_sse.go`, fed by a non-blocking store emit seam (`Store.emitEvent`) wired by the daemon — it launches no process and bypasses no gate.
 
-Add future harnesses behind the native harness boundary; do not scatter provider-specific branches through scheduler/store code. The Python tree is a regression oracle, not the primary place for new runtime behavior.
+Add future harnesses behind the native harness boundary; do not scatter provider-specific branches through scheduler/store code.
 
 ## Change-impact checklist
 
@@ -118,13 +116,13 @@ When changing a subsystem, update the corresponding docs in the same change:
 | Runtime global/profile prompt semantics | `internal/assets/prompts/global.md`, `docs/PROFILES.md`, `docs/AGENT_PROTOCOL.md`, possibly `docs/ARCHITECTURE.md` |
 | Deterministic planning-gate policy | `docs/PROFILES.md`, `docs/AGENT_PROTOCOL.md`, `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md` |
 | Task Envelope/delegation/result schema | `docs/AGENT_PROTOCOL.md`, possibly `docs/ARCHITECTURE.md` |
-| Gate-traceability validators, inherited directives, impact enumeration, oracle probes | `docs/AGENT_PROTOCOL.md`, `docs/ARCHITECTURE.md`, `docs/PROFILES.md`, `docs/OPERATIONS.md` (legacy-exception clearing), plus the affected `src/praector/prompts/*.md` via `make sync-assets` |
+| Gate-traceability validators, inherited directives, impact enumeration, oracle probes | `docs/AGENT_PROTOCOL.md`, `docs/ARCHITECTURE.md`, `docs/PROFILES.md`, `docs/OPERATIONS.md` (legacy-exception clearing), plus the affected `internal/assets/prompts/*.md` |
 | Git branch/worktree/integration/PR/acceptance | `docs/WORKSPACES.md`, `docs/ARCHITECTURE.md` |
 | Schema/state transitions/events/recovery | `docs/STATE_AND_RECOVERY.md`, `docs/ARCHITECTURE.md` |
 | Install/config/operator workflow | `README.md`, `docs/OPERATIONS.md` |
 | Repository/module architecture | `AGENTS.md`, `docs/DEVELOPMENT.md`, `docs/ARCHITECTURE.md` |
 | Planned public/MCP/escalation direction | `ROADMAP.md`, plus the focused architecture/protocol docs when behavior lands |
-| Version/release | `internal/praector/version.go`, `pyproject.toml`, `src/praector/__init__.py`, `CHANGELOG.md` |
+| Version/release | `internal/praector/version.go`, `CHANGELOG.md` |
 
 Do not leave behavior discoverable only by reading source or old conversation history.
 
@@ -136,7 +134,7 @@ Run before committing:
 make check
 ```
 
-For native/runtime changes also use `make parity` and `make smoke`; `make test-reference` runs the original Python regression contract.
+For native/runtime changes also run `make smoke`.
 
 When changing orchestration semantics, add tests that cover the durable behavior, not only a helper function. In particular, prefer integration-style tests for:
 

@@ -19,7 +19,7 @@ Do not solve an orchestration problem by making model sessions more persistent o
 
 ## Source layout
 
-The native Go implementation is the primary runtime. The Python implementation remains temporarily as a reference implementation so behavior can be compared while the native runtime is hardened.
+The native Go implementation is the primary runtime.
 
 ```text
 cmd/praector/main.go              executable entry point
@@ -46,12 +46,9 @@ internal/assets/
 ├── schema.sql                schema embedded in the executable
 ├── envelope.md               embedded Task Envelope template
 └── prompts/*.md              embedded global/profile contracts
-src/praector/                     Python reference runtime
-tests/                        original Python regression suite
-scripts/parity_check.py       black-box shared-contract comparison
 ```
 
-`make check-assets` guarantees the embedded schema/profile prompts remain byte-identical to the Python reference copies while both implementations coexist.
+`internal/assets/` is the sole embedded-asset source: the schema and prompts are authored directly there and the Go binary embeds them via `go:embed`. There is no second tree to sync against, so embedded-asset changes are reviewed as ordinary diffs rather than verified against another copy by an automated byte-identity check.
 
 ## Responsibility boundaries
 
@@ -139,9 +136,9 @@ explicit `PRJ-*`/`COL-*`/`T-*` id), `init` requires an absolute `root_path`, and
 resources advertise accurate content types (`application/json` for JSON listings,
 `text/plain` for CLI/help text). The authoritative independent conformance oracle
 is an official MCP client (the Inspector CLI via
-`TestMCPOfficialClientInteroperability`, or a Tier-1 SDK); the Praector-owned
-black-box probe `scripts/mcp_conformance.py` exercises the same live loopback
-listener from an external client but is not itself authoritative conformance.
+`TestMCPOfficialClientInteroperability`, or a Tier-1 SDK); Praector's own
+in-process Go tests exercise the same live loopback
+listener from an external-style client but are not themselves authoritative conformance.
 
 The server-initiated **event stream** is another observation-only adapter surface
 (decision DEC-17fa4b4aff). `mcp/transport.go` owns only the GET gate and Accept
@@ -310,7 +307,7 @@ When changing profiles, Task Envelope fields, delegation semantics, or result sc
 1. update the relevant `internal/assets/prompts/<profile>.md` role contract;
 2. update `internal/praector/config.go` if the profile set changes;
 3. update `internal/praector/envelope.go` when context composition or common protocol changes;
-4. add/update tests in `tests/test_profiles.py`, `tests/test_envelope.py`, or integration tests;
+4. add/update tests in `internal/praector/*_test.go` (profile/envelope/integration coverage);
 5. update [`PROFILES.md`](PROFILES.md) and [`AGENT_PROTOCOL.md`](AGENT_PROTOCOL.md);
 6. update [`ARCHITECTURE.md`](ARCHITECTURE.md) if the authority/lifecycle model changed;
 7. update [`CLI.md`](CLI.md) / [`OPERATIONS.md`](OPERATIONS.md) when commands/configuration change, and the repo-local skill CLI reference `.agents/skills/praector/references/cli.md` (derive its usage table from `internal/praector/help.go` `commandHelp`; kept in sync by `TestSkillCLICommandHelpCoversCommandHelp`).
@@ -383,16 +380,14 @@ Preserve:
 - durable audit record;
 - conservative cleanup.
 
-Acceptance tests live in `tests/test_acceptance.py`; durable human-revision lifecycle tests live in `tests/test_collection_revision.py`; Git integration tests remain in workspace coverage.
+Acceptance tests live in `internal/praector/*_test.go`; durable human-revision lifecycle tests are covered there too; Git integration tests remain in workspace coverage.
 
 ## Versioning and changelog
 
-The native and reference-implementation versions must stay synchronized while both runtimes ship from one tree:
+The native executable version is the single source of truth:
 
 ```text
 internal/praector/version.go      native executable version
-pyproject.toml                Python reference package version
-src/praector/__init__.py          Python reference __version__
 ```
 
 Release history belongs only in `../CHANGELOG.md`, not README or focused docs. Every repository change updates the changelog: add in-progress work under `Unreleased`; when publishing, move those entries into the new version section.
@@ -428,8 +423,6 @@ Focused targets:
 
 ```bash
 make test-go
-make test-reference
-make parity
 make smoke
 ```
 
@@ -508,7 +501,7 @@ Directive traceability and impact enumeration intentionally reuse the research-c
 - validators are pure functions in `policy.go` shaped like `ValidateResearchConsumerResult` with identical `requirePass` (pass-only) semantics, wired at the same seams: `SubmitResult`, the claim-time planning barrier, and acceptance; a scheduler-side observation only records `DIRECTIVE_TRACEABILITY_GAP` events and never rewrites history;
 - directive ids derive purely from persisted `result_json` order (`<task>:<kind>:<ordinal>`) so revalidation/reconciliation re-match prior dispositions; never hash model-facing text or collide with the research `<task>:<claim>` reference form;
 - retroactive enforcement at the read/acceptance seams honors the single-decision escape hatch (`LegacyGateTraceabilityMarker`); submission is always strict;
-- prompt text for the result fields is authored only in `src/praector/prompts/` and synced with `make sync-assets`.
+- prompt text for the result fields is authored directly in `internal/assets/prompts/`.
 
 
 ### Planning-race regression tests
@@ -550,4 +543,4 @@ When changing `praector collection pr`, keep tests for both result generations:
 
 ## Research/evidence policy tests
 
-Changes to planning classification must test both positive and negative research triggers. External/current protocol/provider/regulatory/dependency work should exercise `explore + research -> critic -> coordinator`; purely local work must prove it does not incur unnecessary external research. Deterministic research tests should cover source authority levels, stable claim ids (including cross-task collision qualification), durable exception-decision validation, claim-backed directives, Task Envelope `inherited_research_constraints`, exact inherited-directive preservation, per-claim `research_consistency` dispositions, active-generation revalidation of legacy consumer traces, authoritative-oracle enforcement for external-conformance review, research-result fingerprint staleness, `RESEARCH_REQUIRED` resume behavior, capability-unavailable blocking, and implementation input-lineage reconciliation. Keep Go and Python reference behavior aligned.
+Changes to planning classification must test both positive and negative research triggers. External/current protocol/provider/regulatory/dependency work should exercise `explore + research -> critic -> coordinator`; purely local work must prove it does not incur unnecessary external research. Deterministic research tests should cover source authority levels, stable claim ids (including cross-task collision qualification), durable exception-decision validation, claim-backed directives, Task Envelope `inherited_research_constraints`, exact inherited-directive preservation, per-claim `research_consistency` dispositions, active-generation revalidation of legacy consumer traces, authoritative-oracle enforcement for external-conformance review, research-result fingerprint staleness, `RESEARCH_REQUIRED` resume behavior, capability-unavailable blocking, and implementation input-lineage reconciliation.
