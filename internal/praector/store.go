@@ -2253,12 +2253,14 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 // more: an implement claim is blocked while the Collection has no
 // non-cancelled/non-superseded plan_review row at all or its latest review is
 // still nonterminal, and is released once that latest review reaches a terminal
-// COMPLETE. It deliberately omits the policy-required path's verdict, research,
-// directive-traceability, fingerprint, dependency-edge, and coordinator-inactivity
-// extras, and it reuses the SAME latest-review lookup so the two modes are one
-// code path. A COMPLETE verdict=fail does not prematurely release a real
-// implementation because the scheduler's fail-review repair lineage records a
-// NEWER (nonterminal) review that this same latest-review lookup then sees.
+// COMPLETE with a passing verdict. It deliberately omits the policy-required
+// path's research, directive-traceability, fingerprint, dependency-edge, and
+// coordinator-inactivity extras, and it reuses the SAME latest-review lookup so
+// the two modes are one code path. The verdict check is NOT one of the omitted
+// extras: a terminal `verdict=fail` is a decision that implementation must not
+// proceed under, so the floor holds on a refused plan exactly as the policy path
+// does rather than trusting the fail-review repair lineage to have already
+// recorded the NEWER (nonterminal) review that would otherwise release it.
 func (s *Store) planReviewFloorAllowsClaimLocked(task Row) (bool, error) {
 	reviews, err := s.queryLocked("SELECT * FROM tasks WHERE collection_id=" + SQLLiteral(S(task, "collection_id")) + " AND profile='plan_review' AND status NOT IN ('CANCELLED','SUPERSEDED') ORDER BY created_at,id")
 	if err != nil {
@@ -2267,7 +2269,11 @@ func (s *Store) planReviewFloorAllowsClaimLocked(task Row) (bool, error) {
 	if len(reviews) == 0 {
 		return false, nil
 	}
-	return S(reviews[len(reviews)-1], "status") == TaskComplete, nil
+	review := reviews[len(reviews)-1]
+	if S(review, "status") != TaskComplete {
+		return false, nil
+	}
+	return strings.ToLower(strings.TrimSpace(S(JSONMap(S(review, "result_json")), "verdict"))) == "pass", nil
 }
 
 // claimGateIsFloorMode reports whether an implement's claim decision was made

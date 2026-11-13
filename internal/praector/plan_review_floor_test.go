@@ -204,6 +204,12 @@ func TestArtifactPlanReviewFloorFailReviewRepairLineage(t *testing.T) {
 	}
 	completePlanReview(t, s, older, "fail")
 
+	if lone, _, err := s.ClaimTask(S(impl, "id"), 3); err != nil {
+		t.Fatal(err)
+	} else if lone != nil && S(lone, "id") == S(impl, "id") {
+		t.Fatal("a lone COMPLETE verdict=fail plan_review must not release the floor")
+	}
+
 	// The repair lineage creates a fresh final plan review that gates the
 	// implementations (the same GateImplementTasks the coordinator uses).
 	newer, _, err := s.CreateTask(CreateTaskOptions{ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "plan_review", Title: "Repair plan review", Objective: "re-review the repaired plan", Reason: "repair", WorkspaceMode: "collection", Depth: 1, AllowDedupe: false, GateImplementTasks: true})
