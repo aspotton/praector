@@ -56,3 +56,4 @@ When the Task Envelope contains `inherited_directives`, they are canonical plann
 When threat-model or external-conformance policy applies, verify those obligations are encoded in executable task contracts and verification.
 
 If a decisive current external fact is missing or contradictory and cannot responsibly be resolved from the provided evidence, submit `status: waiting` with a bounded `research_required` question instead of passing or guessing. Praector will research and rerun this review.
+If instead a decisive gap is answerable from the repository itself, submit `status: waiting` with a bounded `explore_required` question so Praector runs a focused read-only exploration and reruns this same durable review with the new map. Use `research` only for facts that live outside the repository; never use both for one uncertainty.

@@ -394,14 +394,74 @@ func (s *Scheduler) enforceResearchRequests(collectionID string) (bool, error) {
 	return changed, nil
 }
 
+func (s *Scheduler) enforceExploreRequests(collectionID string) (bool, error) {
+	tasks, err := s.Store.ListTasks(collectionID)
+	if err != nil {
+		return false, err
+	}
+	collection, err := s.Store.GetCollection(collectionID)
+	if err != nil {
+		return false, err
+	}
+	changed := false
+	for _, caller := range tasks {
+		if S(caller, "status") != TaskWaiting {
+			continue
+		}
+		profile := S(caller, "profile")
+		if profile != "critic" && profile != "review" && profile != "plan_review" && profile != "advise" {
+			continue
+		}
+		requests := Slice(M(caller, "result"), "explore_required")
+		if len(requests) == 0 {
+			continue
+		}
+		existing := Row(nil)
+		for i := len(tasks) - 1; i >= 0; i-- {
+			if S(tasks[i], "profile") == "explore" && S(tasks[i], "requested_by_task_id") == S(caller, "id") && S(tasks[i], "status") != TaskCancelled && S(tasks[i], "status") != TaskSuperseded {
+				existing = tasks[i]
+				break
+			}
+		}
+		if existing != nil {
+			continue
+		}
+		q := researchRequestQuestion(requests[0])
+		if q == "" {
+			q = "Resolve the repository-internal uncertainty identified by the requesting task."
+		}
+		objective := fmt.Sprintf("Answer this bounded question using read-only discovery of the repository only, before %s %s resumes: %s Do not perform external retrieval; the answer must come from the current working tree. Trace what depends on the relevant targets across every medium, establish negative findings with exact commands and scope, and report concrete paths, symbols, tests, configuration, and docs. Return structured summary, findings, evidence, assumptions, risks, and unresolved.", profile, S(caller, "id"), q)
+		_, _, e := s.Store.CreateTask(CreateTaskOptions{ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "explore", Title: "Explore requested by " + S(caller, "id"), Objective: objective, Reason: "Structured EXPLORE_REQUIRED escalation from " + profile, ParentTaskID: S(caller, "id"), RequestedByTaskID: S(caller, "id"), WorkspaceMode: "collection", Depth: I(caller, "depth") + 1, AllowDedupe: false, SpawnedByTaskID: S(caller, "id"), BlockingCallerTaskID: S(caller, "id")})
+		if e != nil {
+			return changed, e
+		}
+		_ = s.Store.Event(S(collection, "project_id"), collectionID, S(caller, "id"), "", "EXPLORE_REQUIRED", Row{"requesting_profile": profile, "question": q})
+		changed = true
+	}
+	return changed, nil
+}
+
 func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 	collection, err := s.Store.GetCollection(collectionID)
 	if err != nil {
 		return false, err
 	}
 	policy := effectivePlanningPolicy(collection)
-	if !policy.ExploreRequired && !policy.ResearchRequired && !policy.CriticRequired && !policy.PlanReviewRequired {
-		return false, nil
+	gateFree := !policy.ExploreRequired && !policy.ResearchRequired && !policy.CriticRequired && !policy.PlanReviewRequired
+	if gateFree {
+		// The artifact-derived plan-review floor makes final-plan-review staging a
+		// graph invariant rather than only a planning_policy boolean: a COHERENT
+		// (post-cutoff) Collection whose classifier requested no gate may still
+		// carry write work, and that work must not run before a terminal plan-review
+		// decision exists. Keep the staging path reachable for such a Collection;
+		// every policy-conditioned preflight branch below self-disables when all
+		// four gates are false, the PLANNING_POLICY_ENFORCED emit stays off for
+		// gate-free work, and a gate-free Collection that creates no implement task
+		// returns before reaching the staging guard. Legacy (pre-cutoff) Collections
+		// keep the exact classifier-driven behavior and return early here.
+		if !planningGateCoherent(collection) {
+			return false, nil
+		}
 	}
 	tasks, err := s.Store.ListTasks(collectionID)
 	if err != nil {
@@ -931,13 +991,27 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		}
 	}
 	activeCoordinators := Rows{}
+	activeShapers := Rows{}
 	for _, t := range active {
 		st := S(t, "status")
-		if S(t, "profile") == "coordinator" && (st == TaskPending || st == TaskReady || st == TaskRunning || st == TaskWaiting || st == TaskVerifying) {
+		if S(t, "profile") != "coordinator" {
+			continue
+		}
+		// The policy-required path keeps its exact graph-shaping semantics: any
+		// non-terminal coordinator (still including WAITING) counts as an active
+		// shaper so an implementation-classified Collection produces the same
+		// graph as today. A gate-free (artifact-floor) Collection additionally treats
+		// a WAITING coordinator as having already handed off (the single-flight
+		// handoff rule), so it does not suppress the artifact-floor staging.
+		if st == TaskPending || st == TaskReady || st == TaskRunning || st == TaskWaiting || st == TaskVerifying {
 			activeCoordinators = append(activeCoordinators, t)
 		}
+		if st == TaskPending || st == TaskReady || st == TaskRunning || st == TaskVerifying {
+			activeShapers = append(activeShapers, t)
+		}
 	}
-	if policy.PlanReviewRequired && planReview == nil && len(activeCoordinators) == 0 {
+	stageFinalReview := planReview == nil && ((policy.PlanReviewRequired && len(activeCoordinators) == 0) || (gateFree && len(activeShapers) == 0))
+	if stageFinalReview {
 		deps := []string{}
 		if critic != nil {
 			deps = append(deps, S(critic, "id"))
@@ -978,7 +1052,11 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		}
 		changed = true
 	}
-	if policy.PlanReviewRequired && planReview != nil {
+	// Wire the staged final plan review as a prerequisite of any write task that
+	// appeared after staging already created it, so the review->implement edge
+	// holds at the RunnableTasks level too. The store claim floor is the
+	// defense-in-depth backstop; this mirrors the policy-required path exactly.
+	if (policy.PlanReviewRequired || gateFree) && planReview != nil {
 		for _, wt := range writeTasks {
 			deps, _ := s.Store.Dependencies(S(wt, "id"))
 			if !depsIDSet(deps)[S(planReview, "id")] {
@@ -990,23 +1068,29 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		}
 	}
 	if changed {
-		_ = s.Store.Event(S(collection, "project_id"), collectionID, "", "", "PLANNING_POLICY_ENFORCED", Row{"gate_derivation": gateDerivationLabel(collection), "explore_required": policy.ExploreRequired, "research_required": policy.ResearchRequired, "critic_required": policy.CriticRequired, "plan_review_required": policy.PlanReviewRequired, "external_conformance_required": policy.ExternalConformanceRequired, "threat_model_required": policy.ThreatModelRequired, "categories": policy.Categories, "critic_task_id": func() any {
-			if critic != nil {
-				return S(critic, "id")
-			}
-			return nil
-		}(), "plan_review_task_id": func() any {
-			if planReview != nil {
-				return S(planReview, "id")
-			}
-			return nil
-		}(), "gated_implement_tasks": func() []string {
-			x := []string{}
-			for _, t := range writeTasks {
-				x = append(x, S(t, "id"))
-			}
-			return x
-		}()})
+		// A gate-free Collection reached this point only through the artifact-floor
+		// staging path, which must not reuse the policy-required PLANNING_POLICY_ENFORCED
+		// audit event (its claim-held reason is the dedicated PLAN_REVIEW_FLOOR_HELD
+		// event emitted on the claim path).
+		if !gateFree {
+			_ = s.Store.Event(S(collection, "project_id"), collectionID, "", "", "PLANNING_POLICY_ENFORCED", Row{"gate_derivation": gateDerivationLabel(collection), "explore_required": policy.ExploreRequired, "research_required": policy.ResearchRequired, "critic_required": policy.CriticRequired, "plan_review_required": policy.PlanReviewRequired, "external_conformance_required": policy.ExternalConformanceRequired, "threat_model_required": policy.ThreatModelRequired, "categories": policy.Categories, "critic_task_id": func() any {
+				if critic != nil {
+					return S(critic, "id")
+				}
+				return nil
+			}(), "plan_review_task_id": func() any {
+				if planReview != nil {
+					return S(planReview, "id")
+				}
+				return nil
+			}(), "gated_implement_tasks": func() []string {
+				x := []string{}
+				for _, t := range writeTasks {
+					x = append(x, S(t, "id"))
+				}
+				return x
+			}()})
+		}
 		if S(collection, "status") == "BLOCKED" {
 			_ = s.Store.SetCollectionStatus(collectionID, "RUNNING", false)
 		}
@@ -1657,6 +1741,9 @@ func (s *Scheduler) reconcileCollection(collectionID string) (string, error) {
 	if _, err = s.enforceResearchRequests(collectionID); err != nil {
 		return "", err
 	}
+	if _, err = s.enforceExploreRequests(collectionID); err != nil {
+		return "", err
+	}
 	if _, err = s.Store.RefreshWaitingTasks(collectionID); err != nil {
 		return "", err
 	}
@@ -1664,6 +1751,9 @@ func (s *Scheduler) reconcileCollection(collectionID string) (string, error) {
 		return "", err
 	}
 	if _, err = s.enforceResearchRequests(collectionID); err != nil {
+		return "", err
+	}
+	if _, err = s.enforceExploreRequests(collectionID); err != nil {
 		return "", err
 	}
 	if _, err = s.Store.RefreshWaitingTasks(collectionID); err != nil {

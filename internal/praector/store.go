@@ -2142,7 +2142,18 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 		return fp == cur || fp == legacy, nil
 	}
 	if !policy.PlanReviewRequired {
-		return true, nil
+		// Artifact-derived plan-review floor. A COHERENT (post-cutoff) Collection
+		// must never hand out an implement claim before its latest plan_review has
+		// reached a terminal decision, regardless of what the objective-text
+		// classifier inferred: the gate is an invariant of the graph, not only a
+		// planning_policy boolean. This reuses the SAME latest-review lookup the
+		// policy-required path below uses; it is a mode branch, not a second
+		// parallel predicate. Pre-cutoff (non-coherent) Collections keep the exact
+		// pre-floor behavior so forward-scope/non-retroactivity holds unchanged.
+		if !planningGateCoherent(col) {
+			return true, nil
+		}
+		return s.planReviewFloorAllowsClaimLocked(task)
 	}
 	reviews, err := s.queryLocked("SELECT * FROM tasks WHERE collection_id=" + SQLLiteral(S(task, "collection_id")) + " AND profile='plan_review' AND status NOT IN ('CANCELLED','SUPERSEDED') ORDER BY created_at,id")
 	if err != nil {
@@ -2236,6 +2247,53 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 	return len(ac) == 0 || I(ac[0], "n") == 0, nil
 }
 
+// planReviewFloorAllowsClaimLocked is the artifact-derived plan-review floor
+// reached only for a COHERENT Collection whose objective-text classifier did
+// not require a plan review. It proves a plan-review DECISION exists, nothing
+// more: an implement claim is blocked while the Collection has no
+// non-cancelled/non-superseded plan_review row at all or its latest review is
+// still nonterminal, and is released once that latest review reaches a terminal
+// COMPLETE. It deliberately omits the policy-required path's verdict, research,
+// directive-traceability, fingerprint, dependency-edge, and coordinator-inactivity
+// extras, and it reuses the SAME latest-review lookup so the two modes are one
+// code path. A COMPLETE verdict=fail does not prematurely release a real
+// implementation because the scheduler's fail-review repair lineage records a
+// NEWER (nonterminal) review that this same latest-review lookup then sees.
+func (s *Store) planReviewFloorAllowsClaimLocked(task Row) (bool, error) {
+	reviews, err := s.queryLocked("SELECT * FROM tasks WHERE collection_id=" + SQLLiteral(S(task, "collection_id")) + " AND profile='plan_review' AND status NOT IN ('CANCELLED','SUPERSEDED') ORDER BY created_at,id")
+	if err != nil {
+		return false, err
+	}
+	if len(reviews) == 0 {
+		return false, nil
+	}
+	return S(reviews[len(reviews)-1], "status") == TaskComplete, nil
+}
+
+// claimGateIsFloorMode reports whether an implement's claim decision was made
+// under the artifact floor rather than the policy-required path. It reuses the
+// same effectivePlanningPolicy / planningGateCoherent seam as the gate and makes
+// no allow/deny decision of its own, so it is not a second parallel gate.
+// ClaimTask consults it only to label an already-refused claim in the durable
+// audit trail, distinguishing a floor-held write task from a policy-held one.
+func (s *Store) claimGateIsFloorModeLocked(task Row) (bool, error) {
+	if S(task, "profile") != "implement" {
+		return false, nil
+	}
+	cr, err := s.queryLocked("SELECT objective, created_at FROM collections WHERE id=" + SQLLiteral(S(task, "collection_id")) + " LIMIT 1")
+	if err != nil {
+		return false, err
+	}
+	col := Row{}
+	if len(cr) > 0 {
+		col = cr[0]
+	}
+	if !planningGateCoherent(col) || effectivePlanningPolicy(col).PlanReviewRequired {
+		return false, nil
+	}
+	return true, nil
+}
+
 // directiveTraceabilityGateLocked is the claim/read-time gate mirroring the
 // research-consistency claim gates: a completed dispositioning consumer
 // (review or plan_review) must have dispositioned every inherited planning
@@ -2279,6 +2337,8 @@ func (s *Store) decisionsLocked(projectID, collectionID string) (Rows, error) {
 
 func (s *Store) ClaimTask(tid string, maxAttempts int) (Row, Row, error) {
 	var task, attempt Row
+	floorHeld := false
+	floorProjectID, floorCollectionID := "", ""
 	err := s.withLock(func() error {
 		rows, e := s.queryLocked("SELECT * FROM tasks WHERE id=" + SQLLiteral(tid) + " LIMIT 1")
 		if e != nil {
@@ -2292,6 +2352,14 @@ func (s *Store) ClaimTask(tid string, maxAttempts int) (Row, Row, error) {
 			return e
 		}
 		if !ok {
+			// A refused claim is held either by the policy-required path or by the
+			// artifact plan-review floor. The decision above is the only gate; this
+			// only labels which mode refused so an operator can tell why a READY
+			// implement is not starting. Fan-out runs after the lock releases.
+			if isFloor, fe := s.claimGateIsFloorModeLocked(rows[0]); fe == nil && isFloor {
+				floorHeld = true
+				floorProjectID, floorCollectionID = S(rows[0], "project_id"), S(rows[0], "collection_id")
+			}
 			return nil
 		}
 		unmet, e := s.queryLocked("SELECT COUNT(*) AS n FROM task_edges e JOIN tasks dep ON dep.id=e.from_task_id WHERE e.to_task_id=" + SQLLiteral(tid) + " AND e.relation='depends_on' AND dep.status!='COMPLETE'")
@@ -2336,6 +2404,15 @@ func (s *Store) ClaimTask(tid string, maxAttempts int) (Row, Row, error) {
 		attempt = at[0]
 		return nil
 	})
+	if err != nil {
+		return task, attempt, err
+	}
+	if floorHeld {
+		_ = s.Event(floorProjectID, floorCollectionID, tid, "", "PLAN_REVIEW_FLOOR_HELD", Row{
+			"hold_kind": "plan_review_floor",
+			"reason":    "implement claim held by the artifact-derived plan-review floor: the Collection has no terminal plan_review decision yet",
+		})
+	}
 	return task, attempt, err
 }
 func (s *Store) SetAttemptLogPath(aid, path string) error {

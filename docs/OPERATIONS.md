@@ -466,11 +466,12 @@ Behaviour and guarantees:
     `COORDINATOR_FINALIZED_AFTER_PLAN_REVIEW`, `CRITIC_PLAN_BASELINE`,
     `DELIVERY_POLICY_ENFORCED`, `DEPENDENCY_CYCLE_QUARANTINED`,
     `DEPENDENCY_CYCLE_REJECTED`, `DIRECTIVE_TRACEABILITY_EMPTY_HARVEST`,
-    `DIRECTIVE_TRACEABILITY_GAP`, `EXECUTOR_ERROR`,
+     `DIRECTIVE_TRACEABILITY_GAP`, `EXPLORE_REQUIRED`, `EXECUTOR_ERROR`,
     `PLANNING_POLICY_ENFORCED`, `PLAN_REVIEW_CALLER_DEPENDENCY_IGNORED`,
     `PLAN_REVIEW_COORDINATOR_CYCLE_REPAIRED`,
-    `PLAN_REVIEW_DEPENDENCY_CYCLE_REPAIRED`,
-    `PLAN_REVIEW_IMPLEMENT_DEPENDENCIES_IGNORED`,
+     `PLAN_REVIEW_DEPENDENCY_CYCLE_REPAIRED`,
+     `PLAN_REVIEW_FLOOR_HELD`,
+     `PLAN_REVIEW_IMPLEMENT_DEPENDENCIES_IGNORED`,
     `PLAN_REVIEW_REPAIR_REQUESTED`, `PLAN_REVIEW_REUSED`,
     `POST_REPAIR_REVIEW_CREATED`, `RECONCILIATION_REQUIRED`,
     `REDUNDANT_PLAN_REVIEW_COLLAPSED`, `RESEARCH_CAPABILITY_REQUIRED`,
@@ -747,6 +748,8 @@ Praector enforces a scheduler-level planning policy floor. The coordinator may s
 Current mandatory triggers include non-trivial implementation requests, security/authentication/credential-sensitive work, stateful/rate-limit/concurrency behavior, persistence/schema/migration work, destructive/irreversible changes, and external provider/gateway or external-contract changes. A non-trivial implementation request requires `plan_review`; external integration/contract changes also require a `critic`. Clearly trivial documentation-only edits remain ungated. Delivery classification recognizes both imperative wording (`Add ...`) and common conversational requests such as `I'd like to add ...` or `Can you fix ...`.
 
 **Risk gates fire from the detected risk category, not the objective's verb.** Each detected category (security, network trust boundary, external protocol/standard, external integration, external contract) now enables the gate that category justifies — `external_conformance`, `threat_model` (which feeds `plan_review`), and the integration-sensitive critic — even when the objective is phrased as a noun phrase or in the passive voice ("The auth bypass in the token check requires correction" gets the same threat-model/plan-review gate as "Fix the auth bypass"). Genuinely implementation-ceremony terms stay verb-based on purpose: the `plan_review` `implementation and not trivial_docs` term, the `delivery_policy.implementation_required` classification, and the research freshness triggers, so descriptive/trivial prose is not turned into plan-review theater. `explore` is de-verbed to `implementation OR any risk category recorded` (never unconditional). This widening is **forward-scoped**: collections created on or after the `GateCoherenceCutoff` date use the coherent category-derived gates, while collections created before it keep the historical verb-ANDed gates at every enforcement seam (scheduler staging, the claim gate, COMPLETE reconciliation, submit-time oracle strictness, and acceptance critic-stale) so pre-existing work is never retroactively re-gated or reopened. `praector collection show` reports the resolved `planning_policy` (the audit surface), and the `PLANNING_POLICY_ENFORCED` event carries an additive `gate_derivation` field (`category` vs `verb_legacy`).
+
+**The plan-review claim floor is an artifact invariant, so a classifier miss is visible rather than silent.** Independently of the classifier, an implement in a coherent (post-`GateCoherenceCutoff`) Collection is never claimable until the Collection's latest non-cancelled/non-superseded `plan_review` reaches a terminal `COMPLETE`; the floor holds it via the same claim seam and releases without the policy path's verdict/research/traceability/fingerprint/edge/coordinator extras. The scheduler also auto-stages the missing final plan review for a write-bearing collection even when all four gates classified false, and a `WAITING` coordinator (control already handed off) no longer suppresses that staging. When a claim is held by the floor rather than by the policy path, the store emits a dedicated `PLAN_REVIEW_FLOOR_HELD` event (with `hold_kind=plan_review_floor`) on the refusal, so an operator can tell why a `READY` implement is not starting: a policy-held claim shows up under `PLANNING_POLICY_ENFORCED`/the policy path, a floor-held claim under `PLAN_REVIEW_FLOOR_HELD`. A lone `COMPLETE verdict=fail` review does not prematurely release the floor because the fail-review repair lineage records a newer (nonterminal) review that the same latest-review lookup sees. Pre-cutoff collections keep the exact pre-floor behavior.
 
 For example, API-key authentication plus per-key rate limiting is classified as `implementation_change`, `security`, and `stateful_behavior`, so the minimum pre-write path is:
 
