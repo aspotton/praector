@@ -45,7 +45,7 @@ Only after the retry budget is exhausted does the Task become terminally `FAILED
 
 ## Main tables
 
-The native executable embeds the schema from `internal/assets/schema.sql`; `make check-assets` verifies it is byte-identical to the Python reference `src/praector/schema.sql`.
+The native executable embeds the schema from `internal/assets/schema.sql`, which is the sole embedded-asset source: it is edited directly, and no separate copy is verified against it by an automated byte-identity check.
 
 ### `projects`
 

@@ -9,7 +9,7 @@ This roadmap describes direction, not guaranteed release dates. Items move only 
 ### Release and repository readiness
 
 - Publish the renamed Praector repository with reproducible release artifacts and checksums.
-- Add GitHub Actions for Go tests/vet, Python reference tests, parity/smoke checks, and Linux/macOS/Windows build artifacts.
+- Add GitHub Actions for Go tests/vet, parity/smoke checks, and Linux/macOS/Windows build artifacts.
 - Keep `CHANGELOG.md` as the release history and require it to be updated for every behavioral, code, prompt, workflow, or documentation change.
 - Add contributor/release guidance as outside contributors begin using the project.
 

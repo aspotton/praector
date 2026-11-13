@@ -76,7 +76,7 @@ praector --version
 praector doctor
 ```
 
-`make build-all` cross-builds the Linux, macOS, and Windows amd64/arm64 release matrix. The Python implementation remains in-tree temporarily as a reference implementation and regression oracle while the native Go runtime is hardened.
+`make build-all` cross-builds the Linux, macOS, and Windows amd64/arm64 release matrix.
 
 Initialize an existing Git repository:
 
@@ -268,7 +268,7 @@ See [`docs/OPERATIONS.md`](docs/OPERATIONS.md#project-configuration) for the com
 
 ## Development
 
-Run the native and reference-implementation validation suites before committing:
+Run the native validation suite before committing:
 
 ```bash
 make check
@@ -278,11 +278,7 @@ Useful focused targets:
 
 ```bash
 make test-go          # native Go unit/integration tests
-make parity           # black-box native/Python CLI contract checks
 make smoke            # quick compiled-binary smoke
-make smoke-state      # optional fresh-repo/store smoke (best with real Dolt)
-make test-reference   # original Python regression suite
-make parity           # black-box shared-contract comparison
 make smoke            # exercise the compiled executable
 ```
 

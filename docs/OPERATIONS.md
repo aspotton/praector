@@ -43,7 +43,7 @@ praector --version
 praector doctor
 ```
 
-The Python package remains in the repository only as a reference implementation and regression oracle; normal Praector operation should use the native binary.
+Normal Praector operation uses the native executable.
 
 ## Praector home
 
@@ -296,12 +296,10 @@ and project listings) advertise `application/json`, while CLI/help-text resource
 advertise `text/plain`. The authoritative independent conformance check is an
 official MCP client — the Inspector CLI (driven by
 `TestMCPOfficialClientInteroperability` when `PRAECTOR_MCP_INSPECTOR` is set) or a
-Tier-1 SDK. In addition, the Praector-owned black-box probe
-`scripts/mcp_conformance.py` (run against a live loopback listener by
-`TestMCPExternalConformanceOracle`) exercises the same contract — negotiation, the
+Tier-1 SDK. In addition, Praector's own in-process Go tests exercise the same contract — negotiation, the
 header/Origin contracts, `tools/list`, `resources/list`/`read`, a safe read call,
-and a safe durable queue-write — independently of the in-process protocol tests,
- though this probe is not itself authoritative conformance.
+and a safe durable queue-write — independently of the official-client oracle,
+ though this coverage is not itself authoritative conformance.
 
 ### Server-initiated event stream (SSE)
 

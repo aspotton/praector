@@ -1,10 +1,7 @@
 package praector
 
 import (
-	"bytes"
 	"github.com/datascape/praector/internal/assets"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -54,26 +51,5 @@ func TestCapabilityPromptSeparatesReadOnlyAndWriteProfiles(t *testing.T) {
 	}
 	if prompt := capabilityPrompt("implement"); strings.Contains(prompt, "no net workspace mutation") || !strings.Contains(prompt, "write capability") {
 		t.Fatalf("implement capability prompt is wrong: %q", prompt)
-	}
-}
-
-func TestEmbeddedSchemaAndPromptsMatchPythonReference(t *testing.T) {
-	root := filepath.Clean(filepath.Join("..", ".."))
-	pairs := [][2]string{{"schema.sql", filepath.Join(root, "src", "praector", "schema.sql")}}
-	for _, profile := range append([]string{"global"}, ProfileNames...) {
-		pairs = append(pairs, [2]string{"prompts/" + profile + ".md", filepath.Join(root, "src", "praector", "prompts", profile+".md")})
-	}
-	for _, pair := range pairs {
-		embedded, err := assets.FS.ReadFile(pair[0])
-		if err != nil {
-			t.Fatalf("embedded %s: %v", pair[0], err)
-		}
-		reference, err := os.ReadFile(pair[1])
-		if err != nil {
-			t.Fatalf("reference %s: %v", pair[1], err)
-		}
-		if !bytes.Equal(embedded, reference) {
-			t.Fatalf("embedded asset %s is out of sync with %s; run make sync-assets", pair[0], pair[1])
-		}
 	}
 }

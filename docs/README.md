@@ -58,5 +58,3 @@ Useful source anchors:
 - agent protocol/context compiler: `internal/praector/envelope.go`
 - Git workspaces/acceptance: `internal/praector/workspace.go`
 - OpenCode harness: `internal/praector/harness.go`
-
-The matching `src/praector/` Python implementation and `tests/` suite are retained as a reference implementation and regression oracle while the native runtime is hardened.

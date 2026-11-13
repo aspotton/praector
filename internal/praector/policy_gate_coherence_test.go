@@ -180,9 +180,8 @@ func TestPlanningGateTrivialDocsNotNewlyForced(t *testing.T) {
 }
 
 // TestGoPythonClassifierParityVectors pins the coherent-floor gate booleans over
-// the shared objective matrix. scripts/parity_check.py does not compare classifier
-// verdicts, so this table is machine-checked parity; the identical table is asserted
-// in tests/test_planning_policy.py against the Python mirror.
+// the shared objective matrix. This table is machine-checked parity for the
+// planning classifier's deterministic gate decisions.
 func TestGoPythonClassifierParityVectors(t *testing.T) {
 	type want struct{ e, r, c, p, x, th bool }
 	table := map[string]want{

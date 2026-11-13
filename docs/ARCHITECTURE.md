@@ -606,9 +606,9 @@ The design leaves room for later additions without making them current dependenc
     store-backed resolver), `init` requires an absolute `root_path`, and resources
     advertise accurate content types (`application/json` for JSON listings,
     `text/plain` for CLI/help text); the authoritative independent conformance
-    oracle is an official MCP client (Inspector CLI / Tier-1 SDK), with the
-    Praector-owned black-box probe `scripts/mcp_conformance.py` as an additional
-    non-authoritative check against a live loopback listener.
+    oracle is an official MCP client (Inspector CLI / Tier-1 SDK), with
+    Praector's own in-process Go tests as additional non-authoritative coverage
+    of a live loopback listener.
 
   The push surface targets the **MCP 2025-06-18** revision (see `docs/STATE_AND_RECOVERY.md` for the
     durable event cursor and the SSE replay model, and `ROADMAP.md` for the deferred 2026-07-28
