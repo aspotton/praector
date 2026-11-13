@@ -394,6 +394,53 @@ func (s *Scheduler) enforceResearchRequests(collectionID string) (bool, error) {
 	return changed, nil
 }
 
+func (s *Scheduler) enforceExploreRequests(collectionID string) (bool, error) {
+	tasks, err := s.Store.ListTasks(collectionID)
+	if err != nil {
+		return false, err
+	}
+	collection, err := s.Store.GetCollection(collectionID)
+	if err != nil {
+		return false, err
+	}
+	changed := false
+	for _, caller := range tasks {
+		if S(caller, "status") != TaskWaiting {
+			continue
+		}
+		profile := S(caller, "profile")
+		if profile != "critic" && profile != "review" && profile != "plan_review" && profile != "advise" {
+			continue
+		}
+		requests := Slice(M(caller, "result"), "explore_required")
+		if len(requests) == 0 {
+			continue
+		}
+		existing := Row(nil)
+		for i := len(tasks) - 1; i >= 0; i-- {
+			if S(tasks[i], "profile") == "explore" && S(tasks[i], "requested_by_task_id") == S(caller, "id") && S(tasks[i], "status") != TaskCancelled && S(tasks[i], "status") != TaskSuperseded {
+				existing = tasks[i]
+				break
+			}
+		}
+		if existing != nil {
+			continue
+		}
+		q := researchRequestQuestion(requests[0])
+		if q == "" {
+			q = "Resolve the repository-internal uncertainty identified by the requesting task."
+		}
+		objective := fmt.Sprintf("Answer this bounded question using read-only discovery of the repository only, before %s %s resumes: %s Do not perform external retrieval; the answer must come from the current working tree. Trace what depends on the relevant targets across every medium, establish negative findings with exact commands and scope, and report concrete paths, symbols, tests, configuration, and docs. Return structured summary, findings, evidence, assumptions, risks, and unresolved.", profile, S(caller, "id"), q)
+		_, _, e := s.Store.CreateTask(CreateTaskOptions{ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "explore", Title: "Explore requested by " + S(caller, "id"), Objective: objective, Reason: "Structured EXPLORE_REQUIRED escalation from " + profile, ParentTaskID: S(caller, "id"), RequestedByTaskID: S(caller, "id"), WorkspaceMode: "collection", Depth: I(caller, "depth") + 1, AllowDedupe: false, SpawnedByTaskID: S(caller, "id"), BlockingCallerTaskID: S(caller, "id")})
+		if e != nil {
+			return changed, e
+		}
+		_ = s.Store.Event(S(collection, "project_id"), collectionID, S(caller, "id"), "", "EXPLORE_REQUIRED", Row{"requesting_profile": profile, "question": q})
+		changed = true
+	}
+	return changed, nil
+}
+
 func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 	collection, err := s.Store.GetCollection(collectionID)
 	if err != nil {
@@ -1657,6 +1704,9 @@ func (s *Scheduler) reconcileCollection(collectionID string) (string, error) {
 	if _, err = s.enforceResearchRequests(collectionID); err != nil {
 		return "", err
 	}
+	if _, err = s.enforceExploreRequests(collectionID); err != nil {
+		return "", err
+	}
 	if _, err = s.Store.RefreshWaitingTasks(collectionID); err != nil {
 		return "", err
 	}
@@ -1664,6 +1714,9 @@ func (s *Scheduler) reconcileCollection(collectionID string) (string, error) {
 		return "", err
 	}
 	if _, err = s.enforceResearchRequests(collectionID); err != nil {
+		return "", err
+	}
+	if _, err = s.enforceExploreRequests(collectionID); err != nil {
 		return "", err
 	}
 	if _, err = s.Store.RefreshWaitingTasks(collectionID); err != nil {

@@ -31,7 +31,7 @@ var availableProfiles = map[string]string{
 	"advise":      "Use for difficult conceptual/architectural judgment and a concrete recommendation.",
 }
 
-var resultKeys = []string{"verdict", "recommendation", "confidence", "intent_classification", "planner_directives", "qa_directives", "assumptions", "findings", "evidence", "artifacts", "risks", "unresolved", "as_of", "sources", "claims", "verification_oracles", "research_consistency", "authoritative_oracle_unavailable_reason", "oracle_exception_decision_id", "research_required", "directive_dispositions", "additions", "impact_enumeration", "probes"}
+var resultKeys = []string{"verdict", "recommendation", "confidence", "intent_classification", "planner_directives", "qa_directives", "assumptions", "findings", "evidence", "artifacts", "risks", "unresolved", "as_of", "sources", "claims", "verification_oracles", "research_consistency", "authoritative_oracle_unavailable_reason", "oracle_exception_decision_id", "research_required", "explore_required", "directive_dispositions", "additions", "impact_enumeration", "probes"}
 
 const readOnlyCapabilityPrompt = "This task is read-only. Editor permissions are denied, but shell commands, tests, imports, build tools, and smoke checks can still create or modify repository files. Treat **no net workspace mutation** as part of the task's completion contract.\n\n" +
 	"- At the start of the attempt, capture the worktree state (normally `git status --porcelain=v1 --untracked-files=all`) so you know the baseline.\n" +
