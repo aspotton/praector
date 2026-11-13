@@ -16,7 +16,7 @@ from .envelope import build_task_envelope
 from .harness import create_harness
 from .models import AttemptStatus, TaskStatus
 from .planning_policy import (
-    classify_delivery_policy, classify_planning_policy, dependency_lineage_digest, material_plan_fingerprint, material_plan_fingerprint_v021,
+    classify_delivery_policy, classify_planning_policy, dependency_lineage_digest, effective_planning_policy, gate_derivation_label, material_plan_fingerprint, material_plan_fingerprint_v021,
     validate_research_consumer_result,
 )
 from .workspace import GitWorkspace
@@ -275,7 +275,7 @@ class Scheduler:
     def _enforce_research_requests(self, collection_id: str) -> bool:
         tasks = self.store.list_tasks(collection_id)
         collection = self.store.get_collection(collection_id)
-        policy = classify_planning_policy(collection.get("objective") or "")
+        policy = effective_planning_policy(collection)
         changed = False
         for caller in tasks:
             if caller.get("status") != TaskStatus.WAITING.value or caller.get("profile") not in {"critic", "review", "plan_review", "advise"}:
@@ -321,7 +321,7 @@ class Scheduler:
         pre-write gate for objectives that require it.
         """
         collection = self.store.get_collection(collection_id)
-        policy = classify_planning_policy(collection.get("objective") or "")
+        policy = effective_planning_policy(collection)
         if not (policy.explore_required or policy.research_required or policy.critic_required or policy.plan_review_required):
             return False
 
@@ -937,6 +937,7 @@ class Scheduler:
                 collection["project_id"], collection_id, None, None,
                 "PLANNING_POLICY_ENFORCED",
                 {
+                    "gate_derivation": gate_derivation_label(collection),
                     "explore_required": policy.explore_required,
                     "research_required": policy.research_required,
                     "critic_required": policy.critic_required,
@@ -1173,7 +1174,7 @@ class Scheduler:
             return
         lineage, reconciliation_required = self._task_input_lineage_changed(implement_task)
         dependencies = [implement_task["id"]]
-        policy = classify_planning_policy(collection.get("objective") or "")
+        policy = effective_planning_policy(collection)
         if policy.research_required:
             for task in self.store.list_tasks(collection["id"]):
                 if (

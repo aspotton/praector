@@ -3,8 +3,9 @@ from praector.models import TaskStatus
 
 
 class GateHarness:
-    def __init__(self, *, objective="Add API-key authentication and per-key rate limiting to a public API endpoint.", review_status=TaskStatus.COMPLETE.value, review_created="2026-11-10 10:02:00", review_updated="2026-11-10 10:03:00", include_review_edge=True, critic_status=TaskStatus.COMPLETE.value, critic_updated="2026-11-10 10:01:00", include_critic_edge=True, active_coordinators=0, include_review=True, include_critic=True, baseline_matches=True):
+    def __init__(self, *, objective="Add API-key authentication and per-key rate limiting to a public API endpoint.", collection_created_at="2026-11-12 09:00:00", review_status=TaskStatus.COMPLETE.value, review_created="2026-11-10 10:02:00", review_updated="2026-11-10 10:03:00", include_review_edge=True, critic_status=TaskStatus.COMPLETE.value, critic_updated="2026-11-10 10:01:00", include_critic_edge=True, active_coordinators=0, include_review=True, include_critic=True, baseline_matches=True):
         self.objective = objective
+        self.collection_created_at = collection_created_at
         self.review_status = review_status
         self.review_created = review_created
         self.review_updated = review_updated
@@ -24,8 +25,8 @@ class GateHarness:
         return "fp-current"
 
     def _query_locked(self, query):
-        if query.startswith("SELECT objective FROM collections"):
-            return [{"objective": self.objective}]
+        if query.startswith("SELECT objective, created_at FROM collections") or query.startswith("SELECT objective FROM collections"):
+            return [{"objective": self.objective, "created_at": self.collection_created_at}]
         if "profile='plan_review'" in query and query.startswith("SELECT * FROM tasks"):
             if not self.include_review:
                 return []

@@ -8,6 +8,15 @@ from typing import Any
 
 from .util import normalize_text
 
+# GateCoherenceCutoff is the UTC date (YYYY-MM-DD) from which the deterministic
+# planning risk gates are derived from the recorded risk categories rather than
+# being ANDed with the objective's mutation-verb signal. Collections created on
+# or after this date use the coherent derivation; collections created before it
+# keep the historical verb-ANDed derivation so pre-existing work is never
+# retroactively re-gated. This is a forward-scope guard, not a policy_version or
+# per-collection marker; it mirrors internal/praector/policy.go exactly.
+GATE_COHERENCE_CUTOFF = "2026-11-12"
+
 
 @dataclass(frozen=True, slots=True)
 class PlanningPolicy:
@@ -43,8 +52,8 @@ _STATEFUL_PATTERNS = (
     r"\bqueue(?:s)?\b", r"\bretr(?:y|ies)\b", r"\bidempoten(?:t|cy)\b", r"\bconcurren(?:t|cy)\b",
     r"\block(?:ing|s)?\b", r"\btransaction(?:s)?\b",
 )
-_MIGRATION_PATTERNS = (r"\bmigrat(?:e|ion|ions)\b", r"\bschema\b", r"\bdatabase\b", r"\bbackfill\b", r"\bdata conversion\b")
-_DESTRUCTIVE_PATTERNS = (r"\bdelete\b", r"\bdrop\b", r"\bpurge\b", r"\bdestructive\b", r"\birreversible\b")
+_MIGRATION_PATTERNS = (r"\bmigrat(?:e|es|ed|ing|ion|ions)\b", r"\bschema\b", r"\bdatabase\b", r"\bbackfill\b", r"\bdata conversion\b")
+_DESTRUCTIVE_PATTERNS = (r"\bdelet(?:e|es|ed|ing|ion)\b", r"\bdrop(?:s|ped|ping)?\b", r"\bpurg(?:e|es|ed|ing)\b", r"\bdestructive\b", r"\birreversible\b")
 _EXTERNAL_CONTRACT_PATTERNS = (r"\bapi\b", r"\bwebhook(?:s)?\b", r"\bpublic endpoint\b", r"\bbackward compatib(?:le|ility)\b")
 _EXTERNAL_INTEGRATION_PATTERNS = (
     r"\bgateway(?:s)?\b", r"\bintegration(?:s)?\b", r"\bthird[- ]party\b", r"\bexternal service\b",
@@ -99,7 +108,7 @@ def _is_trivial_documentation_change(objective: str) -> bool:
     return _matches_any(text, _DOCUMENTATION_PATTERNS) and not _matches_any(text, _CODE_OR_RUNTIME_PATTERNS)
 
 
-def classify_planning_policy(objective: str) -> PlanningPolicy:
+def _classify_planning_policy(objective: str, coherent: bool) -> PlanningPolicy:
     text = objective or ""
     categories: list[str] = []
     reasons: list[str] = []
@@ -154,15 +163,27 @@ def classify_planning_policy(objective: str) -> PlanningPolicy:
     research_required = bool(protocol or freshness or regulation or external_integration or (implementation and evolving))
     if research_required:
         reasons.append("Correctness depends on fresh external evidence; current authoritative research is required before critique/planning.")
-    external_conformance_required = bool(implementation and (protocol or external_integration))
+    # Category-derived RISK gates. Coherent mode derives each gate from the
+    # recorded risk category; legacy (pre-cutoff) mode ANDs each verb-dependent
+    # risk gate with the mutation-verb mask to reproduce the historical verb-
+    # gated behavior exactly. The plan-review `implementation and not trivial`
+    # term, the delivery policy, and the research freshness triggers stay
+    # verb-based in both modes.
+    external_conformance_required = bool(protocol or external_integration)
+    threat_model_required = bool(security or network_boundary)
+    integration_sensitive_change = bool(external_contract or external_integration or protocol)
+    any_risk = bool(security or stateful or migration or destructive or external_contract or external_integration or protocol or freshness or regulation or evolving or network_boundary)
+    explore_required = bool(implementation or any_risk)
+    if not coherent:
+        external_conformance_required = bool(implementation and external_conformance_required)
+        threat_model_required = bool(implementation and threat_model_required)
+        integration_sensitive_change = bool(implementation and integration_sensitive_change)
+        explore_required = implementation
     if external_conformance_required:
         reasons.append("External protocol/provider work requires an authoritative independent verification oracle when practical.")
-    threat_model_required = bool(implementation and (security or network_boundary))
     if threat_model_required:
         reasons.append("A network/security trust boundary requires explicit threat-model directives before write work.")
 
-    integration_sensitive_change = bool(implementation and (external_contract or external_integration or protocol))
-    explore_required = implementation
     critic_required = bool(implementation or security or migration or destructive or (stateful and external_contract) or integration_sensitive_change)
     plan_review_required = bool(stateful or migration or destructive or integration_sensitive_change or external_conformance_required or threat_model_required or (implementation and not trivial_docs))
     if plan_review_required and not any("plan-review" in reason.lower() or "plan review" in reason.lower() for reason in reasons):
@@ -177,6 +198,25 @@ def classify_planning_policy(objective: str) -> PlanningPolicy:
         threat_model_required=threat_model_required,
         categories=tuple(categories), reasons=tuple(reasons),
     )
+
+
+def classify_planning_policy(objective: str) -> PlanningPolicy:
+    return _classify_planning_policy(objective, True)
+
+
+def _planning_gate_coherent(collection: dict[str, Any]) -> bool:
+    created = str((collection or {}).get("created_at") or "")
+    if len(created) < 10:
+        return True
+    return created[:10] >= GATE_COHERENCE_CUTOFF
+
+
+def effective_planning_policy(collection: dict[str, Any]) -> PlanningPolicy:
+    return _classify_planning_policy((collection or {}).get("objective") or "", _planning_gate_coherent(collection))
+
+
+def gate_derivation_label(collection: dict[str, Any]) -> str:
+    return "category" if _planning_gate_coherent(collection) else "verb_legacy"
 
 
 _MATERIAL_PLAN_PROFILES = {"implement", "research", "advise"}

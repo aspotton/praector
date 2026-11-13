@@ -106,6 +106,8 @@ It returns actionable planner directives and clearly separates observed facts, a
 
 For required-critic collections, the initial critic is a preflight, not a permanent approval. Praector seals it to the first critic-informed material plan at final plan-review handoff. Later changes to implementation/research/advice contracts or their meaningful dependencies require a revalidation critic. A fresh coordinator consumes that revalidation; if incorporation changes the material plan again, another critic round is required before plan review. Completed fresh-research result digests are part of the material fingerprint, so materially refreshed external evidence can stale that seal as well.
 
+Whether the critic (and the external-conformance / threat-model gates that also feed `plan_review`) is mandatory is decided by the deterministic planning policy from the objective's **detected risk category**, not from the verb used to phrase it, so an integration- or security-sensitive objective in noun or passive form still mandates the critic rather than slipping through on wording. This is forward-scoped by the collection `created_at` against `GateCoherenceCutoff`; collections created before the cutoff keep the prior verb-ANDed gates so already-dispatched work is not re-gated. See `docs/OPERATIONS.md`.
+
 ## Plan reviewer
 
 The plan reviewer is approval-biased and blocker-focused. It asks whether a capable worker can execute the current graph without getting stuck. It checks:

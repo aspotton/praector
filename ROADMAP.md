@@ -101,6 +101,17 @@ The derived-knob / scoped-legacy / live-seam / evidence-floor change deliberatel
 - an actor/origin column on `decisions`: the legacy escape's operator ownership is enforced by the schema-free discriminator (collection-scoped + names-collection + `task_id IS NULL`) instead of a real actor attribution;
 - the follow-on (durable decision **DEC-cada832e82**): replacing the objective-regex intent classifier with a persisted, declared, and diff-derived classification so a phrasing choice cannot silently remove a security or external-conformance gate — this change deliberately kept classification call sites readable and did not touch the regex verb lists.
 
+### Deferred from the risk-category planning-gate change
+
+Making the planning risk gates fire from the detected category rather than the objective's verb deliberately stopped short of:
+
+- **an operator override / waiver for pre-cutoff collections**: `GateCoherenceCutoff` (`2026-11-12`) is a fixed constant and the verb-legacy branch is unconditional for older collections; there is no `praector decision` waiver that re-derives an existing collection's gates on the coherent path (the accepted escalation here is an explicit, dated forward-scope, not a per-collection knob);
+- **semantic-synonym destructive detection**: the destructive detector was widened morphologically (inflections of `delete`/`drop`/`purge`) but not semantically — `removal`, `cleanup`, `prune`, `wipe`, `deprecate` still do not set the destructive category, a deliberately scoped known gap rather than silently broadened matching;
+- **`\bserver\b` / `\bsecurity\b` precision calibration**: those broad-term triggers remain intentionally conservative and may over-flag; tuning their false-positive rate against real corpus distribution is deferred;
+- **a diff-derived post-write risk floor**: the classifier still reads only the objective text; deriving the gate from the integrated diff (the way the knob validator derives candidates) so an implementation that grows risk its objective never mentioned cannot slip a gate is deferred;
+- **persisting the classification / collapsing the legacy branch (DEC-cada832e82)**: the coherent-vs-verb decision is still a pure in-memory boolean recomputed from `created_at`, not a stored per-collection field, and the historical verb-ANDed branch is kept rather than deleted so pre-cutoff behavior is provably unchanged — removing it (and the parallel classifier path) is the follow-on;
+- **a dedicated `threat_model` stage or `intent_classification` escalation**: the threat-model signal currently feeds `plan_review` rather than running as its own read-only profile/stage, and uncertain objectives are not yet escalated to an explicit classification task.
+
 ### Deferred from the events fail-closed read surface
 
 Making `praector events` reject unresolvable scope ids deliberately stopped short of the same defect class elsewhere:

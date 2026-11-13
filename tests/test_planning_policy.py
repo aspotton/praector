@@ -3,7 +3,9 @@ from pathlib import Path
 from praector.config import GlobalConfig
 from praector.models import TaskStatus
 from praector.planning_policy import (
-    classify_planning_policy, material_plan_fingerprint, validate_deterministic_research_result,
+    classify_planning_policy, effective_planning_policy, gate_derivation_label, GATE_COHERENCE_CUTOFF,
+    _classify_planning_policy,
+    material_plan_fingerprint, validate_deterministic_research_result,
     validate_external_conformance_review_result, validate_research_consumer_result,
     research_claim_ids, research_claim_constraints, research_exception_decision_ids,
 )
@@ -836,10 +838,16 @@ def test_conversational_research_does_not_become_write_delivery():
     delivery = classify_delivery_policy(objective)
     planning = classify_planning_policy(objective)
 
+    # A read-only analysis request must never be forced into write delivery.
     assert delivery.implementation_required is False
-    assert planning.explore_required is False
-    assert planning.plan_review_required is False
-    assert planning.critic_required is False
+    # Intentional widening: because the objective names an external integration
+    # (Twilio gateway), the category-derived risk gates fire regardless of the
+    # "analyze" verb phrasing. The delivery classification above is the invariant
+    # this test protects, not the absence of these gates.
+    assert "external_integration" in planning.categories
+    assert planning.explore_required is True
+    assert planning.plan_review_required is True
+    assert planning.critic_required is True
 
 
 def test_conversational_nontrivial_code_change_requires_explore_critic_and_plan_review():
@@ -1407,7 +1415,10 @@ def test_v022_current_news_objective_gets_research_without_implementation_ceremo
     assert scheduler._enforce_planning_policy("COL-1") is True
     research = [task for task in store.tasks if task["profile"] == "research"]
     assert len(research) == 1
-    assert not [task for task in store.tasks if task["profile"] in {"explore", "critic", "plan_review", "implement"}]
+    # Intentional widening: the recorded freshness/evolving risk categories now
+    # enable the read-only explore preflight verb-independently. The heavy
+    # critic/plan_review/implement ceremony must still be absent.
+    assert not [task for task in store.tasks if task["profile"] in {"critic", "plan_review", "implement"}]
     coordinator_deps = {task["id"] for task in store.dependencies("T-COORD")}
     assert research[0]["id"] in coordinator_deps
 
@@ -1589,3 +1600,116 @@ def test_v024_historical_completed_legacy_consumer_is_not_reopened(tmp_path: Pat
     scheduler._enforce_planning_policy("COL-1")
     assert store.get_task("T-CRITIC")["status"] == TaskStatus.COMPLETE.value
     assert not [task for task in store.tasks if task["title"] == "Revalidate inherited research constraints"]
+
+
+# --- Planning-gate coherence regression oracles (mirror internal/praector) ---
+
+PRE_CUTOFF = "2020-01-01T00:00:00.000000"
+POST_CUTOFF = "2026-11-12T00:00:00.000000"
+
+
+def _gates(p):
+    return (p.explore_required, p.research_required, p.critic_required,
+            p.plan_review_required, p.external_conformance_required, p.threat_model_required)
+
+
+def test_gate_coherence_parity_vectors():
+    # Identical table asserted in internal/praector/policy_gate_coherence_test.go;
+    # scripts/parity_check.py never compares classifier verdicts, so this is the
+    # machine-checked Go/Python parity for the coherent floor.
+    table = {
+        "Update the transport to comply with the MCP protocol specification.": (1, 1, 1, 1, 1, 0),
+        "MCP protocol specification compliance for the transport.": (1, 1, 1, 1, 1, 0),
+        "Fix the auth bypass in the token check.": (1, 0, 1, 1, 0, 1),
+        "The auth bypass in the token check requires correction.": (1, 0, 1, 1, 0, 1),
+        "Migrate the ledger to the new format.": (1, 0, 1, 1, 0, 0),
+        "Migrating the ledger to the new format.": (1, 0, 1, 1, 0, 0),
+        "Delete the stale records.": (1, 0, 1, 1, 0, 0),
+        "Deletion of the stale records.": (1, 0, 1, 1, 0, 0),
+        "Integrate the Twilio gateway.": (1, 1, 1, 1, 1, 0),
+        "Twilio gateway integration.": (1, 1, 1, 1, 1, 0),
+        "The vendor library needs assessment.": (1, 0, 0, 0, 0, 0),
+        "Summarize current news and recent events.": (1, 1, 0, 0, 0, 0),
+        "Assess GDPR compliance implications.": (1, 1, 0, 0, 0, 0),
+        "Review the public API endpoint backward compatibility.": (1, 0, 1, 1, 0, 0),
+        "The cache layer behavior under load.": (1, 0, 0, 1, 0, 0),
+        "Harden the HTTP server listener.": (1, 0, 0, 1, 0, 1),
+        "Update a typo in README.md.": (1, 0, 1, 0, 0, 0),
+        "Fix documentation wording in the docs.": (1, 0, 1, 0, 0, 0),
+        "A minor wording correction in the README.": (0, 0, 0, 0, 0, 0),
+        "The removal of stale records.": (0, 0, 0, 0, 0, 0),
+        "Add API-key authentication and per-key rate limiting to the public API endpoint.": (1, 0, 1, 1, 0, 1),
+        "Fix a typo in README.md and update one example sentence.": (1, 0, 1, 0, 0, 0),
+    }
+    for obj, expected in table.items():
+        got = tuple(int(x) for x in _gates(classify_planning_policy(obj)))
+        assert got == expected, f"parity vector mismatch {obj!r}: got {got} want {expected}"
+
+
+def test_gate_coherence_phrasing_matrix():
+    rows = [
+        ("external_protocol_or_standard", "Update the transport to comply with the MCP protocol specification.", "MCP protocol specification compliance for the transport.", "x", True, False),
+        ("security", "Fix the auth bypass in the token check.", "The auth bypass in the token check requires correction.", "t", True, False),
+        ("migration_or_persistence", "Migrate the ledger to the new format.", "Migrating the ledger to the new format.", "p", True, True),
+        ("destructive_change", "Delete the stale records.", "Deletion of the stale records.", "c", True, True),
+        ("external_integration", "Add Twilio gateway integration.", "Twilio gateway integration.", "x", True, False),
+    ]
+    pick = {"x": lambda p: p.external_conformance_required, "t": lambda p: p.threat_model_required,
+            "p": lambda p: p.plan_review_required, "c": lambda p: p.critic_required}
+    for category, verb, noun, g, verb_legacy, noun_legacy in rows:
+        gate = pick[g]
+        assert category in classify_planning_policy(noun).categories
+        assert gate(classify_planning_policy(verb)) == gate(classify_planning_policy(noun))
+        assert gate(classify_planning_policy(noun)) is True
+        assert gate(_classify_planning_policy(verb, False)) is verb_legacy
+        assert gate(_classify_planning_policy(noun, False)) is noun_legacy
+
+
+def test_gate_coherence_all_twelve_categories():
+    table = [
+        ("implementation_change", "Add a helper function to the module.", lambda p: p.explore_required or p.critic_required),
+        ("security", "Fix the authentication token check.", lambda p: p.critic_required),
+        ("stateful_behavior", "The cache layer behavior under load.", lambda p: p.plan_review_required),
+        ("migration_or_persistence", "Migrating the ledger to the new format.", lambda p: p.critic_required),
+        ("destructive_change", "Deletion of the stale records.", lambda p: p.critic_required),
+        ("external_contract", "Review the public API endpoint backward compatibility.", lambda p: p.critic_required),
+        ("external_integration", "Twilio gateway integration.", lambda p: p.external_conformance_required),
+        ("external_protocol_or_standard", "MCP protocol specification compliance for the transport.", lambda p: p.external_conformance_required),
+        ("freshness_sensitive", "Summarize current news and recent events.", lambda p: p.research_required),
+        ("law_regulation_or_compliance", "Assess GDPR compliance implications.", lambda p: p.research_required),
+        ("network_trust_boundary", "Harden the HTTP server listener.", lambda p: p.threat_model_required),
+    ]
+    for category, obj, witness in table:
+        p = classify_planning_policy(obj)
+        assert category in p.categories, f"{category} not recorded for {obj!r}"
+        assert witness(p), f"{category} recorded for {obj!r} but its gate is disabled: {_gates(p)}"
+    evolving = classify_planning_policy("The vendor library needs assessment.")
+    assert "evolving_dependency_or_vendor" in evolving.categories
+    assert evolving.explore_required is True
+    assert evolving.research_required is False
+
+
+def test_gate_coherence_destructive_noun_known_gap():
+    p = classify_planning_policy("The removal of stale records.")
+    assert "destructive_change" not in p.categories and "migration_or_persistence" not in p.categories
+    assert p.critic_required is False and p.plan_review_required is False and p.explore_required is False
+
+
+def test_gate_coherence_dual_separator():
+    for created in ("2020-01-01T10:00:00.000000", "2020-01-01 10:00:00.000000"):
+        assert effective_planning_policy({"objective": "MCP protocol specification compliance", "created_at": created}) is not None
+        assert gate_derivation_label({"created_at": created}) == "verb_legacy"
+    for created in ("2026-11-12T00:00:01.000000", "2026-11-12 23:59:59.000000"):
+        assert gate_derivation_label({"created_at": created}) == "category"
+    assert gate_derivation_label({}) == "category"  # fail closed to coherent
+
+
+def test_gate_coherence_forward_scope_effective_policy():
+    for obj in ("MCP protocol specification compliance for the transport.",
+                "Twilio gateway integration.",
+                "Deletion of the stale records.",
+                "The vendor library needs assessment."):
+        coherent = classify_planning_policy(obj)
+        legacy = _classify_planning_policy(obj, False)
+        assert _gates(effective_planning_policy({"objective": obj, "created_at": POST_CUTOFF})) == _gates(coherent)
+        assert _gates(effective_planning_policy({"objective": obj, "created_at": PRE_CUTOFF})) == _gates(legacy)

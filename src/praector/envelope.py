@@ -6,7 +6,7 @@ from typing import Any
 from .config import READ_ONLY_PROFILES
 from .db import DoltStore
 from .profile_prompts import load_global_prompt, load_profile_prompt
-from .planning_policy import classify_delivery_policy, classify_planning_policy, research_claim_constraints
+from .planning_policy import classify_delivery_policy, effective_planning_policy, research_claim_constraints
 
 
 PROFILE_GUIDANCE = {
@@ -162,7 +162,7 @@ def build_task_envelope(
     global_prompt = load_global_prompt()
     role_prompt = load_profile_prompt(task["profile"])
 
-    planning_policy = classify_planning_policy(collection.get("objective") or "")
+    planning_policy = effective_planning_policy(collection)
     delivery_policy = classify_delivery_policy(collection.get("objective") or "")
     research_ancestors = store.research_ancestors(task["id"])
     inherited_constraints = [

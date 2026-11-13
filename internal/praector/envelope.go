@@ -179,7 +179,7 @@ func BuildTaskEnvelope(store *Store, project, collection, task, attempt Row) (st
 	if err != nil {
 		return "", err
 	}
-	planning := ClassifyPlanningPolicy(S(collection, "objective"))
+	planning := effectivePlanningPolicy(collection)
 	delivery := ClassifyDeliveryPolicy(S(collection, "objective"))
 	completed := []any{}
 	for _, d := range deps {

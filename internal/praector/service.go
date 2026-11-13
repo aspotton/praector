@@ -674,7 +674,7 @@ func (s *Service) CollectionShow(ctx context.Context, in CollectionShowInput) (C
 	if e != nil {
 		return CollectionShowOutput{}, e
 	}
-	c["planning_policy"] = ClassifyPlanningPolicy(S(c, "objective")).AsRow()
+	c["planning_policy"] = effectivePlanningPolicy(c).AsRow()
 	c["delivery_policy"] = ClassifyDeliveryPolicy(S(c, "objective")).AsRow()
 	c["acceptances"], _ = s.store.ListCollectionAcceptances(S(c, "id"))
 	c["pull_requests"], _ = s.store.ListCollectionPullRequests(S(c, "id"))

@@ -14,6 +14,8 @@ from .models import TaskStatus
 from .planning_policy import (
     classify_delivery_policy,
     classify_planning_policy,
+    effective_planning_policy,
+    gate_derivation_label,
     material_plan_fingerprint,
     material_plan_fingerprint_v021,
     validate_deterministic_research_result,
@@ -1417,7 +1419,7 @@ class DoltStore:
             strict = "fresh external research" in title or "fresh external evidence" in reason or title.startswith("research requested by")
             if strict:
                 collection = self.get_collection(before["collection_id"])
-                policy = classify_planning_policy(collection.get("objective") or "")
+                policy = effective_planning_policy(collection)
                 validate_deterministic_research_result(result, require_oracle=policy.external_conformance_required)
                 exception_ids = research_exception_decision_ids(result)
                 if exception_ids:
@@ -1432,7 +1434,7 @@ class DoltStore:
         if status in {"complete", "completed"}:
             profile = str(before.get("profile") or "")
             collection = self.get_collection(before["collection_id"])
-            policy = classify_planning_policy(collection.get("objective") or "")
+            policy = effective_planning_policy(collection)
             if profile in {"critic", "plan_review", "review"}:
                 research_deps = self.research_ancestors(task_id)
                 if research_deps:
@@ -1729,10 +1731,11 @@ class DoltStore:
         if profile not in {"implement", "plan_review"}:
             return True
         collection_rows = self._query_locked(
-            f"SELECT objective FROM collections WHERE id={sql_literal(task['collection_id'])} LIMIT 1"
+            f"SELECT objective, created_at FROM collections WHERE id={sql_literal(task['collection_id'])} LIMIT 1"
         )
-        objective = collection_rows[0].get("objective") if collection_rows else ""
-        policy = classify_planning_policy(objective or "")
+        col = collection_rows[0] if collection_rows else {}
+        objective = col.get("objective")
+        policy = effective_planning_policy(col)
 
         if profile == "plan_review":
             if not policy.critic_required:
@@ -2227,7 +2230,7 @@ class DoltStore:
             ]
             missing_delivery = bool(delivery_policy.implementation_required and not completed_impls)
             missing_reviews = self.implementations_missing_passing_review(collection_id)
-            planning_policy = classify_planning_policy(collection.get("objective") or "")
+            planning_policy = effective_planning_policy(collection)
             critic_state = self.critic_revalidation_state(collection_id)
             stale_required_critic = bool(planning_policy.critic_required and critic_state.get("stale"))
             desired = "BLOCKED" if (missing_delivery or missing_reviews or stale_required_critic) else "COMPLETE"
