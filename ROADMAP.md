@@ -112,6 +112,20 @@ Making the planning risk gates fire from the detected category rather than the o
 - **persisting the classification / collapsing the legacy branch (DEC-cada832e82)**: the coherent-vs-verb decision is still a pure in-memory boolean recomputed from `created_at`, not a stored per-collection field, and the historical verb-ANDed branch is kept rather than deleted so pre-cutoff behavior is provably unchanged — removing it (and the parallel classifier path) is the follow-on;
 - **a dedicated `threat_model` stage or `intent_classification` escalation**: the threat-model signal currently feeds `plan_review` rather than running as its own read-only profile/stage, and uncertain objectives are not yet escalated to an explicit classification task.
 
+### Classifier-blind-spot planning floors
+
+The objective-text classifier can silently miss risk (a real case: an "Analyze and deep dive … CloudFormation parameter" objective matched neither a mutation verb nor any risk pattern, so an implement ran before its plan review). The mitigation taken and the parts still open:
+
+- **LANDED — the artifact-derived plan-review claim floor**: independent of the classifier, an `implement` in a coherent (post-`GateCoherenceCutoff`) Collection is never claimable until its latest `plan_review` reaches a terminal decision, and the missing final review is auto-staged for a write-bearing collection even when every gate classified false; a `WAITING` coordinator no longer suppresses that staging. The classifier itself is untouched (the floor is meant to hold even when the classifier is wrong), the floor is coherence-scoped so pre-cutoff behavior is byte-identical, a floor-held claim is recorded as `PLAN_REVIEW_FLOOR_HELD`, and no schema/policy field/capability/knob or preemption of a running attempt was introduced.
+
+Deliberately still deferred (this change only closes the plan-review ordering gap, not the classifier's blind spot itself):
+
+- **classifier detection of the miss**: making the regex/pattern set itself recognize compound camelCase tokens (so `\bcloud\b` would match `CloudFormation`, and analogous `\bserver\b`-style camelCase boundaries are handled) rather than relying on the floor to cover a still-blind classifier;
+- **an infra/deploy risk category**: CloudFormation/terraform/parameter/deploy-style work has no dedicated category today, so its gates fire only via the floor or an incidental match, not a first-class detection;
+- **a zero-gate audit record**: there is still no dedicated durable event that names "this coherent collection classified all four gates false" on its own (only the plan-review floor's `PLAN_REVIEW_FLOOR_HELD` and the policy path's `PLANNING_POLICY_ENFORCED` are emitted, neither of which is a standalone zero-gate marker);
+- **preemption / termination of an already-running attempt**: the floor holds a claim before it starts; it never preempts or stops a session already past the claim, so a claim-before-staging race window on a task that raced into RUNNING before the staging pass is not addressed;
+- **closing the staging-before-claim race**: the store claim floor is a defense-in-depth backstop while the auto-staging pass runs before the claim in the reconcile-then-claim loop; a dedicated guarantee that the review is staged atomically before the first claim attempt (rather than via the floor holding the claim in the interim) remains open.
+
 ### Deferred from the events fail-closed read surface
 
 Making `praector events` reject unresolvable scope ids deliberately stopped short of the same defect class elsewhere:
