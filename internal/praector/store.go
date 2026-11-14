@@ -292,14 +292,20 @@ type invariantRows struct {
 // and baseline events retain their ORDER BY created_at so the per-collection walk
 // and the "latest per task_id" selection are unchanged; tasks and edges project
 // collection_id so they can be grouped in Go without changing which rows feed the
-// (unchanged) per-collection repair decision logic.
+// (unchanged) per-collection repair decision logic. tasks and edges carry an
+// explicit deterministic ORDER BY (tasks by collection_id,created_at,id; edges by
+// collection_id,from_task_id,to_task_id) so batched-vs-standalone agreement rests
+// on MySQL SELECT ordering, not on Dolt's implicit Prolly-Tree scan order; because
+// computeLegacyRepairs reaches a fixpoint the surviving-edge SET is unaffected, so
+// only the DELETE-statement and emitted LEGACY_DEPENDENCY_CYCLE_REPAIRED ordering
+// is pinned by this clause.
 func (s *Store) loadInvariantRowsLocked() (*invariantRows, error) {
 	out, err := s.queryManyLocked(
 		"SELECT id FROM attempts WHERE status='SUCCEEDED' AND exit_code IS NOT NULL AND exit_code <> 0",
 		"SELECT task_id,payload_json,created_at FROM events WHERE event_type='CRITIC_PLAN_BASELINE' ORDER BY created_at",
 		"SELECT id FROM collections ORDER BY created_at",
-		"SELECT collection_id,id,project_id,profile,status,requested_by_task_id FROM tasks",
-		"SELECT collection_id,from_task_id,to_task_id FROM task_edges WHERE relation='depends_on'",
+		"SELECT collection_id,id,project_id,profile,status,requested_by_task_id FROM tasks ORDER BY collection_id,created_at,id",
+		"SELECT collection_id,from_task_id,to_task_id FROM task_edges WHERE relation='depends_on' ORDER BY collection_id,from_task_id,to_task_id",
 	)
 	if err != nil {
 		return nil, err
@@ -320,7 +326,7 @@ func (s *Store) repairInvariantsLocked() error {
 			return err
 		}
 	}
-	if _, err = s.repairRevisionBaselineProvenanceLockedAll(loaded.baseline); err != nil {
+	if _, err = s.repairRevisionBaselineProvenanceLockedAll(loaded.baseline, loaded.tasks); err != nil {
 		return err
 	}
 	_, err = s.repairLegacyDependencyCyclesLockedAllWithRows(loaded)
@@ -467,22 +473,6 @@ func (s *Store) assertDependencyTasksInCollectionLocked(cid string, taskIDs []st
 		}
 	}
 	return nil
-}
-
-func (s *Store) repairLegacyDependencyCyclesLockedAll() (int, error) {
-	rows, err := s.queryLocked("SELECT id FROM collections ORDER BY created_at")
-	if err != nil {
-		return 0, err
-	}
-	repaired := 0
-	for _, row := range rows {
-		count, _, err := s.repairLegacyDependencyCyclesLocked(S(row, "id"))
-		if err != nil {
-			return repaired, err
-		}
-		repaired += count
-	}
-	return repaired, nil
 }
 
 func (s *Store) repairLegacyDependencyCyclesLocked(collectionID string) (int, []string, error) {
@@ -640,8 +630,9 @@ func (s *Store) repairLegacyDependencyCyclesLockedWithRows(collectionID string, 
 
 // repairLegacyDependencyCyclesLockedAllWithRows is the batched global cycle-repair
 // walk used by CLI bootstrap. It groups the preloaded task and edge rows by
-// collection in Go and repairs each collection in the same ORDER BY created_at
-// order the standalone repairLegacyDependencyCyclesLockedAll walk uses, without
+// collection in Go and repairs each collection (via the same per-collection
+// repairLegacyDependencyCyclesLocked the standalone RepairLegacyDependencyCycles
+// uses) in the ORDER BY created_at order the loaded collections carry, without
 // launching one queryLocked read pair per collection.
 func (s *Store) repairLegacyDependencyCyclesLockedAllWithRows(loaded *invariantRows) (int, error) {
 	tasksByCollection := map[string]Rows{}
@@ -680,27 +671,46 @@ func (s *Store) RepairLegacyDependencyCycles(collectionID string) (int, []string
 	return repaired, unresolved, err
 }
 
+// repairRevisionBaselineProvenanceLocked is the standalone wrapper used by the
+// byte-identity regression test (store_querymany_test.go) to drive the same
+// repair through the non-batched path. It supplies its own task snapshot with one
+// full task read (the same projection loadInvariantRowsLocked uses) rather than
+// the removed per-candidate `tasks WHERE id IN` lookup, so the batched and
+// standalone outcomes stay comparable. It exists only for that test; production
+// bootstrap calls the All variant directly with the preloaded rows.
 func (s *Store) repairRevisionBaselineProvenanceLocked() (int, error) {
 	rows, err := s.queryLocked("SELECT task_id,payload_json,created_at FROM events WHERE event_type='CRITIC_PLAN_BASELINE' ORDER BY created_at")
 	if err != nil {
 		return 0, err
 	}
-	return s.repairRevisionBaselineProvenanceLockedAll(rows)
+	tasks, err := s.queryLocked("SELECT collection_id,id,project_id,profile,status,requested_by_task_id FROM tasks ORDER BY collection_id,created_at,id")
+	if err != nil {
+		return 0, err
+	}
+	return s.repairRevisionBaselineProvenanceLockedAll(rows, tasks)
 }
 
 // repairRevisionBaselineProvenanceLockedAll runs the revision critic-baseline
-// provenance repair over a caller-supplied set of CRITIC_PLAN_BASELINE event rows:
-// the batched bootstrap read supplies the already-scanned, ORDER BY created_at
-// snapshot, while the standalone wrapper above scans them itself. The per-critic
-// pair collection_revisions LIMIT 1 selection and the correction INSERT / single
-// commit output remain unchanged, so the durable outcome is identical whether the
-// initial scan was batched or issued on its own.
-func (s *Store) repairRevisionBaselineProvenanceLockedAll(rows Rows) (int, error) {
+// provenance repair over a caller-supplied set of CRITIC_PLAN_BASELINE event rows
+// and a task-row snapshot: the batched bootstrap read supplies both from its
+// single loadInvariantRowsLocked process, while the standalone wrapper above scans
+// them itself. The per-id critic/plan_review membership selection and the
+// requested_by_task_id coordinator match are reproduced exactly against the
+// snapshot (the same two-row IN lookup, now an id-keyed membership test that
+// needs no per-candidate read), while the per-critic-pair collection_revisions
+// LIMIT 1 selection and the collections project_id fallback remain per-candidate
+// reads. The correction INSERT / single commit output is unchanged, so the durable
+// outcome is identical whether the initial scan was batched or issued on its own.
+func (s *Store) repairRevisionBaselineProvenanceLockedAll(rows, taskRows Rows) (int, error) {
 	latest := map[string]Row{}
 	for _, row := range rows {
 		if id := S(row, "task_id"); id != "" {
 			latest[id] = row
 		}
+	}
+	byID := map[string]Row{}
+	for _, task := range taskRows {
+		byID[S(task, "id")] = task
 	}
 	var statements []string
 	var baselineEvents []eventRecord
@@ -713,14 +723,6 @@ func (s *Store) repairRevisionBaselineProvenanceLockedAll(rows Rows) (int, error
 		fingerprint := S(payload, "fingerprint")
 		if planReviewID == "" || fingerprint == "" {
 			continue
-		}
-		tasks, err := s.queryLocked("SELECT id,collection_id,requested_by_task_id FROM tasks WHERE id IN (" + SQLLiteral(criticID) + "," + SQLLiteral(planReviewID) + ")")
-		if err != nil {
-			return 0, err
-		}
-		byID := map[string]Row{}
-		for _, task := range tasks {
-			byID[S(task, "id")] = task
 		}
 		critic, okCritic := byID[criticID]
 		planReview, okReview := byID[planReviewID]

@@ -72,6 +72,17 @@ The invocation counts include all `dolt` child processes, not only `dolt sql` qu
 
 Important behavior: `praector status` is not purely read-only. Its terminal-state reconciliation can update durable state and create Dolt commits. Benchmarks should therefore be interpreted as realistic operational measurements, not immutable snapshots.
 
+### Clean benchmark vs live environment
+
+Two distinct measurement contexts appear in this tracker and must not be conflated:
+
+- **Live environment** — the tables in this "Measured baseline" section (the daemon-active `status` captures above) were taken against the real, populated user store with a normal `praector daemon` running.
+- **Clean benchmark** — the seeded-scale numbers in the Results tracker and the "Phase 1 measured result" subsection (a scratch DB built to the investigation snapshot size: 23 collections, 241 tasks, 603 edges, 262 attempts, 1713 events) are reproducible before/after counts from the PATH-shim methodology, not live production traffic.
+
+The 51 → 3 `dolt sql` and bootstrap-repair 49 → 2 figures in the Results tracker are **clean-benchmark** numbers; they are not a live-environment capture.
+
+The **remaining live `project list` `dolt sql` count** (the post-optimization count one would read from the real store with the daemon active) is **not-captured-in-this-environment**: reproducing it needs the PATH-shim wrapped against the live user store (per the Reproduction methodology), which was not run here. Until such a live capture is recorded, treat only the seeded `project list` figures above as the `project list` measurement, and do not present the clean-benchmark `dolt sql` counts as live-environment counts.
+
 ## Reproduction methodology
 
 The measurement harness used a temporary PATH shim that records every Dolt invocation and forwards it to the real binary:
@@ -160,7 +171,7 @@ Consequence: a status command pays repair scanning before it renders anything.
 
 ### Bootstrap dependency-cycle repair scans collections one at a time
 
-`repairLegacyDependencyCyclesLockedAll()` lists collections, then invokes a per-collection repair.
+Before Phase 1, `repairInvariantsLocked`'s cycle-repair step listed every collection (ordered by `created_at`) and invoked the per-collection `repairLegacyDependencyCyclesLocked` repair for each. (That global list-then-walk wrapper has since been removed; the live bootstrap path is now the batched `repairLegacyDependencyCyclesLockedAllWithRows`, and the standalone per-collection entry point is `RepairLegacyDependencyCycles`.)
 
 For each collection it runs:
 
@@ -442,7 +453,8 @@ Function names are more durable than line numbers. At the time of investigation:
 | Status service | `Service.Status()` and `collectionStatus()` in `internal/praector/service.go` |
 | One Dolt subprocess per query | `Store.Query()` / `Store.queryLocked()` in `internal/praector/store.go` |
 | Bootstrap | `Store.Bootstrap()` and `Store.repairInvariantsLocked()` |
-| Global cycle repair | `Store.repairLegacyDependencyCyclesLockedAll()` |
+| Bootstrap batching (live) | `Store.loadInvariantRowsLocked()` → `Store.repairLegacyDependencyCyclesLockedAllWithRows()` / `Store.repairRevisionBaselineProvenanceLockedAll()` |
+| Standalone cycle repair | `Store.RepairLegacyDependencyCycles()` / `Store.repairLegacyDependencyCyclesLocked()` |
 | Revision baseline repair | `Store.repairRevisionBaselineProvenanceLocked()` |
 | Terminal reconciliation | `Store.UpdateCollectionTerminalState()` |
 | Coverage validator | `Store.ImplementationsMissingPassingReview()` |
@@ -503,16 +515,19 @@ The optimization work is complete when:
 | Investigation | Landed in this tracker | 86 queries / 8.92 s single status | Evidence recorded | No runtime change |
 | Multi-query helper | **Landed** | One `dolt sql` per logical read | `QueryMany`/`queryManyLocked` batch N reads into one JSONL process | Read-side only; `{}`/blank → empty; statement-indexed errors |
 | Bootstrap batching | **Landed** | 51 `dolt sql` / 53 dolt / 2.75 s (`project list`, 23 collections) | 3 `dolt sql` / 5 dolt / 0.30 s; bootstrap repair alone 49 → 2 | Cycle + baseline repair outcomes unchanged |
+| Bootstrap batching refinement (Phase 1.1) | **Landed** | Revision-baseline repair issues one `tasks WHERE id IN` read per matching candidate | 0 such reads (satisfied from the batched snapshot); batched task/edge reads now carry a deterministic `ORDER BY` | Clean benchmark; per-candidate `collection_revisions`/`collections` reads retained; repair SET unchanged |
 | Snapshot reconciliation | Planned | 86+ queries single status | Pending | Preserve all terminal-state semantics |
 | Sweep cooldown | Planned | One sweep per COMPLETE collection per second | Pending | Internal interval first |
 | Targeted indexes | Planned | No collection edge/event-type indexes | Pending | Needs idempotent migration |
 | Persistent/embedded Dolt | Deferred | Not measured | Deferred | Revisit only after batching |
 
-### Phase 1 measured result
+### Phase 1 measured result (clean benchmark)
 
-Captured under the PATH-shim methodology against a benchmark DB seeded to the
-investigation snapshot scale (23 collections, 241 tasks, 603 edges, 262 attempts,
-1713 events), comparing the committed pre-change binary against this change's build:
+These are **clean-benchmark** figures, not a live-environment capture (see
+"Clean benchmark vs live environment" above). Captured under the PATH-shim methodology
+against a benchmark DB seeded to the investigation snapshot scale (23 collections, 241
+tasks, 603 edges, 262 attempts, 1713 events), comparing the committed pre-change binary
+against this change's build:
 
 | Command | Before | After |
 | --- | ---: | ---: |
@@ -529,6 +544,33 @@ query. Bootstrap invariant repair alone therefore dropped from 49 SQL processes 
 asserts the batch is one process and bootstrap stays bounded regardless of collection
 count, and `TestBootstrapBatchedRepairMatchesStandaloneRepair` asserts the batched run
 reproduces the standalone repair's durable outcome for all three repair paths.
+
+### Phase 1.1 measured result (clean benchmark)
+
+Phase 1.1 refines the same batched bootstrap region without changing any repair
+outcome:
+
+- The revision-baseline provenance repair no longer issues a `tasks WHERE id IN
+  (criticID,planReviewID)` read per matching candidate; the two-row selection and the
+  `requested_by_task_id` coordinator match are reproduced from the rows already loaded
+  by `loadInvariantRowsLocked`, so the batched path makes **exactly one fewer `dolt
+  sql` per matching candidate** while the per-candidate `collection_revisions ... LIMIT
+  1` selection and the `collections` project_id fallback remain. This is a clean-
+  benchmark reduction measured through the invocation-count seam, not a live capture.
+- The batched `tasks` and `task_edges` reads now carry an explicit deterministic
+  `ORDER BY`, so batched-vs-standalone agreement rests on MySQL SELECT ordering rather
+  than Dolt's implicit Prolly-Tree scan order. Because `computeLegacyRepairs` reaches a
+  fixpoint, the repaired edge SET is unchanged; only the DELETE-statement and emitted
+  `LEGACY_DEPENDENCY_CYCLE_REPAIRED` ordering is pinned.
+
+`TestBootstrapRevisionBaselineDropsTaskPairRead` asserts the removed per-candidate
+task-pair read (zero `WHERE id IN` reads) while the `collection_revisions` and
+`collections` per-candidate reads remain; `TestComputeLegacyRepairsOrderIndependent`
+asserts the surviving/removed edge SET is invariant to read order across every edge
+permutation; and `TestBootstrapCycleRepairDeterministicEmission` asserts the batched
+edge read's `ORDER BY` is present, the surviving edge SET matches the expected repaired
+outcome, and the emitted DELETE order is deterministic. `TestBootstrapBatchedRepairMatchesStandaloneRepair`
+still passes byte-for-byte.
 
 ## Risks and open questions
 
