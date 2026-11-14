@@ -1788,6 +1788,36 @@ func (s *Scheduler) ensureReview(project, collection, impl Row) error {
 				}
 			}
 		}
+		// The verifies scan above is the scheduler-created discovery path and is
+		// necessary but not sufficient: a coordinator-created failed review
+		// (`praector task request --profile review`) carries only depends_on edges,
+		// so verifies-edge-only discovery leaves its original implementation
+		// uncovered and the collection permanently BLOCKED. Resolve the same
+		// originals deterministically from the failed review's own depends_on
+		// prerequisites: any COMPLETE implement-profile task it waits on is an
+		// implementation it reviewed. The verifies edges added for these sources
+		// are INSERT IGNORE with no dependency cycle guard, but they are not part
+		// of the dependency DAG (dependencyEdgesLocked filters relation='depends_on'),
+		// so they cannot close a cycle; the direct depends_on prerequisite is
+		// transitively redundant (the fresh review already reaches it through the
+		// failed review) and passes the atomic-batch acyclicity check.
+		for _, edge := range edges {
+			if S(edge, "relation") != "depends_on" || S(edge, "to_task_id") != S(failedParentReview, "id") {
+				continue
+			}
+			source := S(edge, "from_task_id")
+			if source == "" || source == S(impl, "id") || containsString(originalVerificationSources, source) {
+				continue
+			}
+			src, e := s.Store.GetTask(source)
+			if e != nil || src == nil || S(src, "profile") != "implement" || S(src, "status") != TaskComplete {
+				continue
+			}
+			originalVerificationSources = append(originalVerificationSources, source)
+			if !containsString(deps, source) {
+				deps = append(deps, source)
+			}
+		}
 		// The failed review is a durable verification source of the fresh
 		// review, not just a one-line summary in an objective: completed
 		// dependencies project findings/evidence through the envelope. The
