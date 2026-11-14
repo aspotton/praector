@@ -719,10 +719,13 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 	// policy gates classify false) and never reuses their PLANNING_POLICY_ENFORCED
 	// audit event; it emits the dedicated PREFLIGHT_FLOOR_STAGED event instead.
 	// Generation existence reuses the same requested_by_task_id-of-the-coordinator
-	// logic as latestForCoordinator above, so a coordinator that authored its own
-	// preflight (a COL-4274d1d8d9-shaped graph) takes exactly zero staging
-	// mutations here. Pre-cutoff Collections never reach this block: the gateFree
-	// early return above already keeps them on the exact classifier-driven path.
+	// logic as latestForCoordinator above and is evaluated PER PROFILE, matching the
+	// independent explore/critic requirement of preflightFloorAllowsClaimLocked: a
+	// coordinator that authored BOTH its own preflights (a COL-4274d1d8d9-shaped graph)
+	// takes exactly zero staging mutations, while one that authored only ONE of the
+	// pair has just the missing half backfilled rather than being held permanently.
+	// Pre-cutoff Collections never reach this block: the gateFree early return above
+	// already keeps them on the exact classifier-driven path.
 	if gateFree {
 		var floorCoordinator Row
 		for i := len(active) - 1; i >= 0; i-- {
@@ -732,97 +735,141 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 				break
 			}
 		}
-		genHasProfile := func(profile string) bool {
+		genProfile := func(profile string) Row {
 			if floorCoordinator == nil {
-				return false
+				return nil
 			}
-			for _, t := range active {
-				st := S(t, "status")
-				if S(t, "profile") == profile && S(t, "requested_by_task_id") == S(floorCoordinator, "id") && st != TaskCancelled && st != TaskSuperseded {
-					return true
+			for i := len(active) - 1; i >= 0; i-- {
+				st := S(active[i], "status")
+				if S(active[i], "profile") == profile && S(active[i], "requested_by_task_id") == S(floorCoordinator, "id") && st != TaskCancelled && st != TaskSuperseded {
+					return active[i]
 				}
 			}
-			return false
+			return nil
 		}
-		if floorCoordinator != nil && !genHasProfile("explore") && !genHasProfile("critic") {
+		genHasProfile := func(profile string) bool { return genProfile(profile) != nil }
+		// Per-profile (INDEPENDENT) existence, mirroring preflightFloorAllowsClaimLocked
+		// which requires this generation's explore AND critic each to exist and reach
+		// terminal COMPLETE. A coordinator that authored only ONE of the paired preflight
+		// (an explore-only or critic-only graph) must have the missing half backfilled
+		// rather than being held permanently, since the classifier critic/explore staging
+		// branches above are CriticRequired/ExploreRequired-gated and off in gate-free
+		// mode. With BOTH authored, both checks evaluate false so this stays zero-mutation.
+		if floorCoordinator != nil && (!genHasProfile("explore") || !genHasProfile("critic")) {
 			pid := S(floorCoordinator, "id")
 			depth := I(floorCoordinator, "depth") + 1
 			blocking := ""
 			if st := S(floorCoordinator, "status"); st == TaskPending || st == TaskReady || st == TaskWaiting {
 				blocking = pid
 			}
-			stagedExplore, _, e := s.Store.CreateTask(CreateTaskOptions{
-				ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "explore",
-				Title:        "Explore current implementation surface",
-				Objective:    "Before planning, inspect the existing repository/system surface relevant to the Collection objective. Map relevant files/modules, entry points, callers/dependencies, shared state, configuration/runtime boundaries, tests, documentation, similar existing patterns, and compatibility/concurrency/platform constraints. Return a concise evidence-grounded current-state map for the critic and coordinator. Do not design the solution or implement changes; for a greenfield repository, say so explicitly and stop early.",
-				Reason:       "Artifact preflight floor: a gate-free coherent write-bearing Collection must have repository-exploration evidence before write work.",
-				ParentTaskID: pid, RequestedByTaskID: pid, WorkspaceMode: "collection", Depth: depth, AllowDedupe: false,
-				SpawnedByTaskID: pid, BlockingCallerTaskID: blocking,
-			})
-			if e != nil {
-				return false, e
-			}
-			deps := []string{S(stagedExplore, "id")}
-			var genResearch Row
-			for i := len(active) - 1; i >= 0; i-- {
-				st := S(active[i], "status")
-				if S(active[i], "profile") == "research" && S(active[i], "requested_by_task_id") == pid && st != TaskCancelled && st != TaskSuperseded {
-					genResearch = active[i]
-					break
-				}
-			}
-			if genResearch != nil {
-				deps = append(deps, S(genResearch, "id"))
-			}
-			stagedCritic, _, e := s.Store.CreateTask(CreateTaskOptions{
-				ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "critic",
-				Title:        "Preflight implementation plan",
-				Objective:    criticObjective,
-				Reason:       "Artifact preflight floor: a gate-free coherent write-bearing Collection must have an independent critic preflight before write work.",
-				ParentTaskID: pid, RequestedByTaskID: pid, DependsOn: deps, WorkspaceMode: "collection", Depth: depth, AllowDedupe: false,
-				SpawnedByTaskID: pid, BlockingCallerTaskID: blocking,
-			})
-			if e != nil {
-				return false, e
-			}
-			changed = true
-			// Atomically attach the staged critic as a prerequisite of any existing
-			// nonterminal final plan review, reusing the cycle-guard-reject pattern so
-			// no cycle and no second plan-review generation is ever created.
-			for _, pr := range planReviews {
-				st := S(pr, "status")
-				if st == TaskComplete || st == TaskFailed || st == TaskCancelled || st == TaskSuperseded {
-					continue
-				}
-				prDeps, _ := s.Store.Dependencies(S(pr, "id"))
-				if depsIDSet(prDeps)[S(stagedCritic, "id")] {
-					continue
-				}
-				if path, _ := s.Store.DependencyPath(S(pr, "id"), S(stagedCritic, "id")); path != nil {
-					continue
-				}
-				if e := s.Store.AddDependency(S(pr, "id"), S(stagedCritic, "id")); e != nil {
-					var cyc *DependencyCycleError
-					if errors.As(e, &cyc) {
-						_ = s.Store.Event(S(collection, "project_id"), collectionID, S(pr, "id"), "", "DEPENDENCY_CYCLE_REJECTED", Row{"from_task_id": S(stagedCritic, "id"), "to_task_id": S(pr, "id"), "context": "preflight_floor_staging", "error": e.Error()})
-						continue
-					}
+			staged := false
+			var stagedExplore Row
+			if !genHasProfile("explore") {
+				var e error
+				stagedExplore, _, e = s.Store.CreateTask(CreateTaskOptions{
+					ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "explore",
+					Title:        "Explore current implementation surface",
+					Objective:    "Before planning, inspect the existing repository/system surface relevant to the Collection objective. Map relevant files/modules, entry points, callers/dependencies, shared state, configuration/runtime boundaries, tests, documentation, similar existing patterns, and compatibility/concurrency/platform constraints. Return a concise evidence-grounded current-state map for the critic and coordinator. Do not design the solution or implement changes; for a greenfield repository, say so explicitly and stop early.",
+					Reason:       "Artifact preflight floor: a gate-free coherent write-bearing Collection must have repository-exploration evidence before write work.",
+					ParentTaskID: pid, RequestedByTaskID: pid, WorkspaceMode: "collection", Depth: depth, AllowDedupe: false,
+					SpawnedByTaskID: pid, BlockingCallerTaskID: blocking,
+				})
+				if e != nil {
 					return false, e
 				}
+				staged = true
 			}
-			_ = s.Store.Event(S(collection, "project_id"), collectionID, "", "", "PREFLIGHT_FLOOR_STAGED", Row{"coordinator_task_id": pid, "explore_task_id": S(stagedExplore, "id"), "critic_task_id": S(stagedCritic, "id")})
-			tasks, _ = s.Store.ListTasks(collectionID)
-			active = activeTasks(tasks)
-			writeTasks = Rows{}
-			writeIDs = map[string]bool{}
-			planReviews = Rows{}
-			for _, t := range active {
-				if S(t, "profile") == "implement" && (S(t, "status") == TaskPending || S(t, "status") == TaskReady) {
-					writeTasks = append(writeTasks, t)
-					writeIDs[S(t, "id")] = true
+			var stagedCritic Row
+			if !genHasProfile("critic") {
+				// The staged critic depends on THIS generation's explore (the newly staged
+				// one if present, else the pre-existing generation explore) plus any
+				// pre-existing generation research, degrading to explore-only when no
+				// research exists (the all-false gate-free classification never stages one).
+				deps := []string{}
+				if genExplore := stagedExplore; genExplore != nil {
+					deps = append(deps, S(genExplore, "id"))
+				} else if genExplore := genProfile("explore"); genExplore != nil {
+					deps = append(deps, S(genExplore, "id"))
 				}
-				if S(t, "profile") == "plan_review" {
-					planReviews = append(planReviews, t)
+				for i := len(active) - 1; i >= 0; i-- {
+					st := S(active[i], "status")
+					if S(active[i], "profile") == "research" && S(active[i], "requested_by_task_id") == pid && st != TaskCancelled && st != TaskSuperseded {
+						deps = append(deps, S(active[i], "id"))
+						break
+					}
+				}
+				var e error
+				stagedCritic, _, e = s.Store.CreateTask(CreateTaskOptions{
+					ProjectID: S(collection, "project_id"), CollectionID: collectionID, Profile: "critic",
+					Title:        "Preflight implementation plan",
+					Objective:    criticObjective,
+					Reason:       "Artifact preflight floor: a gate-free coherent write-bearing Collection must have an independent critic preflight before write work.",
+					ParentTaskID: pid, RequestedByTaskID: pid, DependsOn: deps, WorkspaceMode: "collection", Depth: depth, AllowDedupe: false,
+					SpawnedByTaskID: pid, BlockingCallerTaskID: blocking,
+				})
+				if e != nil {
+					return false, e
+				}
+				staged = true
+			}
+			if staged {
+				changed = true
+				// The tasks that now satisfy this generation's floor: the newly staged ones,
+				// falling back to the pre-existing generation task for whichever half was
+				// not backfilled.
+				floorExplore := stagedExplore
+				if floorExplore == nil {
+					floorExplore = genProfile("explore")
+				}
+				floorCritic := stagedCritic
+				if floorCritic == nil {
+					floorCritic = genProfile("critic")
+				}
+				// Atomically attach the floor critic as a prerequisite of any existing
+				// nonterminal final plan review, reusing the cycle-guard-reject pattern so
+				// no cycle and no second plan-review generation is ever created. When only
+				// the explore was backfilled and a generation critic already exists, no
+				// explore->critic edge is added: the claim floor is terminal-COMPLETE-only,
+				// so the pre-existing critic and the newly staged explore each independently
+				// reaching COMPLETE is sufficient, and rewriting a coordinator-authored
+				// critic's dependencies would be an unnecessary, more invasive mutation.
+				if floorCritic != nil {
+					for _, pr := range planReviews {
+						st := S(pr, "status")
+						if st == TaskComplete || st == TaskFailed || st == TaskCancelled || st == TaskSuperseded {
+							continue
+						}
+						prDeps, _ := s.Store.Dependencies(S(pr, "id"))
+						if depsIDSet(prDeps)[S(floorCritic, "id")] {
+							continue
+						}
+						if path, _ := s.Store.DependencyPath(S(pr, "id"), S(floorCritic, "id")); path != nil {
+							continue
+						}
+						if e := s.Store.AddDependency(S(pr, "id"), S(floorCritic, "id")); e != nil {
+							var cyc *DependencyCycleError
+							if errors.As(e, &cyc) {
+								_ = s.Store.Event(S(collection, "project_id"), collectionID, S(pr, "id"), "", "DEPENDENCY_CYCLE_REJECTED", Row{"from_task_id": S(floorCritic, "id"), "to_task_id": S(pr, "id"), "context": "preflight_floor_staging", "error": e.Error()})
+								continue
+							}
+							return false, e
+						}
+					}
+				}
+				_ = s.Store.Event(S(collection, "project_id"), collectionID, "", "", "PREFLIGHT_FLOOR_STAGED", Row{"coordinator_task_id": pid, "explore_task_id": S(floorExplore, "id"), "critic_task_id": S(floorCritic, "id")})
+				tasks, _ = s.Store.ListTasks(collectionID)
+				active = activeTasks(tasks)
+				writeTasks = Rows{}
+				writeIDs = map[string]bool{}
+				planReviews = Rows{}
+				for _, t := range active {
+					if S(t, "profile") == "implement" && (S(t, "status") == TaskPending || S(t, "status") == TaskReady) {
+						writeTasks = append(writeTasks, t)
+						writeIDs[S(t, "id")] = true
+					}
+					if S(t, "profile") == "plan_review" {
+						planReviews = append(planReviews, t)
+					}
 				}
 			}
 		}

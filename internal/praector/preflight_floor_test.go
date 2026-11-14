@@ -167,6 +167,127 @@ func TestPreflightFloorCoordinatorAuthoredTakesZeroStaging(t *testing.T) {
 	}
 }
 
+// (b2) MIXED-AUTHORING backfill (explore-only): a coordinator that authored an
+// explore but NOT a critic must have the missing critic half backfilled, because
+// the claim floor (preflightFloorAllowsClaimLocked) requires explore AND critic
+// INDEPENDENTLY. Before this repair the staging gate was paired (stage only when
+// BOTH were absent), so an explore-only graph staged nothing and the implement was
+// held permanently as PREFLIGHT_FLOOR_HELD with no self-heal. The authoritative
+// seam asserted is Store.ClaimTask, driven through the real scheduler planning pass.
+func TestPreflightFloorBackfillsMissingCriticForExploreOnlyCoordinator(t *testing.T) {
+	assertFloorObjectiveAllFalse(t)
+	s, cfg, c, coord := gateFreeFloorCollection(t, floorObjective)
+	impl := floorImplement(t, s, c, coord)
+	if _, _, err := s.CreateTask(CreateTaskOptions{ProjectID: S(c, "project_id"), CollectionID: S(c, "id"), Profile: "explore", Title: "Explore requested by coordinator", Objective: "map the surface", Reason: "coordinator", ParentTaskID: S(coord, "id"), RequestedByTaskID: S(coord, "id"), WorkspaceMode: "collection", Depth: 1, AllowDedupe: false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskStatus(S(coord, "id"), TaskComplete, "coordinator handed off"); err != nil {
+		t.Fatal(err)
+	}
+	sched := newFloorScheduler(t, s, cfg)
+	if _, err := sched.enforcePlanningPolicy(S(c, "id")); err != nil {
+		t.Fatal(err)
+	}
+	explorations := profileTasksIn(t, s, c, "explore")
+	critics := profileTasksIn(t, s, c, "critic")
+	if len(explorations) != 1 || len(critics) != 1 {
+		t.Fatalf("an explore-only coordinator graph must backfill exactly one critic while reusing the authored explore, got %d/%d", len(explorations), len(critics))
+	}
+	if S(explorations[0], "title") != "Explore requested by coordinator" {
+		t.Fatal("the backfill must reuse the coordinator-authored explore, not stage a new one")
+	}
+	if !dependencyIncludes(t, s, critics[0], S(explorations[0], "id")) {
+		t.Fatal("the backfilled critic must depend on the generation explore")
+	}
+	if ev := collectionEventsFor(t, s, c, "PREFLIGHT_FLOOR_STAGED"); len(ev) == 0 {
+		t.Fatal("backfilling the missing critic half must emit PREFLIGHT_FLOOR_STAGED")
+	}
+	reviews := planReviewsIn(t, s, c)
+	if len(reviews) != 1 {
+		t.Fatalf("backfill must not create a second plan-review generation, got %d", len(reviews))
+	}
+	if !dependencyIncludes(t, s, reviews[0], S(critics[0], "id")) {
+		t.Fatal("the final plan review must take the generation critic as a prerequisite")
+	}
+	// Passing the review releases the plan-review floor; the preflight floor now
+	// holds the implement because the backfilled critic is nonterminal.
+	completePlanReview(t, s, reviews[0], "pass")
+	if held, _, err := s.ClaimTask(S(impl, "id"), 3); err != nil {
+		t.Fatal(err)
+	} else if held != nil && S(held, "id") == S(impl, "id") {
+		t.Fatal("the implement must remain held while the backfilled preflight is nonterminal")
+	}
+	if ev := floorEventsFor(t, s, c, impl, "PREFLIGHT_FLOOR_HELD"); len(ev) == 0 {
+		t.Fatal("a passing plan review with an incomplete preflight must label the hold PREFLIGHT_FLOOR_HELD")
+	}
+	completeGenerationPreflights(t, s, c, coord)
+	claimed, _, err := s.ClaimTask(S(impl, "id"), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed == nil || S(claimed, "id") != S(impl, "id") {
+		t.Fatal("terminal preflights plus a passing review must release both floors")
+	}
+}
+
+// (b3) MIXED-AUTHORING backfill (critic-only): the symmetric case where a
+// coordinator authored a critic but NOT an explore. Staging existence is per
+// profile, so only the missing explore half is backfilled; the authored critic is
+// reused and zero extra critic tasks appear. Store.ClaimTask drives hold + release.
+func TestPreflightFloorBackfillsMissingExploreForCriticOnlyCoordinator(t *testing.T) {
+	assertFloorObjectiveAllFalse(t)
+	s, cfg, c, coord := gateFreeFloorCollection(t, floorObjective)
+	impl := floorImplement(t, s, c, coord)
+	if _, _, err := s.CreateTask(CreateTaskOptions{ProjectID: S(c, "project_id"), CollectionID: S(c, "id"), Profile: "critic", Title: "Critic requested by coordinator", Objective: "preflight", Reason: "coordinator", ParentTaskID: S(coord, "id"), RequestedByTaskID: S(coord, "id"), WorkspaceMode: "collection", Depth: 1, AllowDedupe: false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskStatus(S(coord, "id"), TaskComplete, "coordinator handed off"); err != nil {
+		t.Fatal(err)
+	}
+	sched := newFloorScheduler(t, s, cfg)
+	if _, err := sched.enforcePlanningPolicy(S(c, "id")); err != nil {
+		t.Fatal(err)
+	}
+	explorations := profileTasksIn(t, s, c, "explore")
+	critics := profileTasksIn(t, s, c, "critic")
+	if len(explorations) != 1 || len(critics) != 1 {
+		t.Fatalf("a critic-only coordinator graph must backfill exactly one explore while reusing the authored critic, got %d/%d", len(explorations), len(critics))
+	}
+	if S(critics[0], "title") != "Critic requested by coordinator" {
+		t.Fatal("the backfill must reuse the coordinator-authored critic, not stage a new one")
+	}
+	if ev := collectionEventsFor(t, s, c, "PREFLIGHT_FLOOR_STAGED"); len(ev) == 0 {
+		t.Fatal("backfilling the missing explore half must emit PREFLIGHT_FLOOR_STAGED")
+	}
+	if ev := collectionEventsFor(t, s, c, "PLANNING_POLICY_ENFORCED"); len(ev) != 0 {
+		t.Fatal("the gate-free floor path must never reuse PLANNING_POLICY_ENFORCED")
+	}
+	reviews := planReviewsIn(t, s, c)
+	if len(reviews) != 1 {
+		t.Fatalf("backfill must not create a second plan-review generation, got %d", len(reviews))
+	}
+	if !dependencyIncludes(t, s, reviews[0], S(critics[0], "id")) {
+		t.Fatal("the final plan review must take the generation critic as a prerequisite")
+	}
+	completePlanReview(t, s, reviews[0], "pass")
+	if held, _, err := s.ClaimTask(S(impl, "id"), 3); err != nil {
+		t.Fatal(err)
+	} else if held != nil && S(held, "id") == S(impl, "id") {
+		t.Fatal("the implement must remain held while the backfilled preflight is nonterminal")
+	}
+	if ev := floorEventsFor(t, s, c, impl, "PREFLIGHT_FLOOR_HELD"); len(ev) == 0 {
+		t.Fatal("a passing plan review with an incomplete preflight must label the hold PREFLIGHT_FLOOR_HELD")
+	}
+	completeGenerationPreflights(t, s, c, coord)
+	claimed, _, err := s.ClaimTask(S(impl, "id"), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed == nil || S(claimed, "id") != S(impl, "id") {
+		t.Fatal("terminal preflights plus a passing review must release both floors")
+	}
+}
+
 // (c) The implement claim is held with PREFLIGHT_FLOOR_HELD while this generation's
 // critic is nonterminal and claimable after the critic reaches terminal COMPLETE
 // plus a passing final plan review.
