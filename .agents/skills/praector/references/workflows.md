@@ -8,6 +8,7 @@ Confirm which Praector surface is actually available; the work and its rules are
 
 - **MCP:** the normal local endpoint is `http://127.0.0.1:8765/mcp`, hosted by a running `praector daemon`. If the `praector_*` tools are missing, report that connection/enablement is required — or fall back to the CLI if the binary is installed.
 - **CLI:** `command -v praector && praector --version`, and `praector doctor` for dependency/registration checks. A missing daemon does not block CLI use: an attached command runs the scheduler itself, while `--detach` queues for a daemon.
+- **Both:** when both are present, compare one cheap read from each (`praector_project_list` vs `praector project list`). Identical listings mean one store behind both adapters. Divergent listings — or one surface erroring where the other answers — mean separate endpoints (a daemon on a different `PRAECTOR_HOME` or an explicit `PRAECTOR_MCP` listener than the CLI's effective home): ask the user which surface to drive and verify every durable effect from that surface only.
 
 Never claim a queued or completed action when no surface could be reached.
 

@@ -9,10 +9,10 @@ Drive Praector as a durable control plane through either of its two adapters: th
 
 ## Choose the surface
 
-1. If `praector_*` MCP tools are advertised, use them (see [tool-catalog.md](references/tool-catalog.md)).
-2. Otherwise check the binary: `command -v praector && praector --version`, then use the CLI (see [references/cli.md](references/cli.md)).
-3. The CLI is the only route to real PR push, real acceptance, real cleanup, and streamed `--tail` logs; MCP is enqueue/plan-oriented with privileged writes behind a default-off opt-in.
-4. If neither exists, state that plainly. Do not fake a durable action with raw `git`/`dolt` commands.
+1. Detect both surfaces independently: MCP is present when `praector_*` tools are advertised (see [tool-catalog.md](references/tool-catalog.md)); the CLI is present when `command -v praector && praector --version` succeeds (see [references/cli.md](references/cli.md)).
+2. If only one exists, use it. If neither exists, state that plainly. Do not fake a durable action with raw `git`/`dolt` commands.
+3. When both exist, do not assume they share one backend. Compare one cheap read from each — `praector_project_list` vs `praector project list`. Identical listings mean one store behind both adapters: prefer MCP for reads and queueing, with the CLI as the only route to real PR push, real acceptance, real cleanup, and streamed `--tail` logs (MCP is enqueue/plan-oriented with privileged writes behind a default-off opt-in).
+4. Divergent listings — or one surface erroring where the other answers — mean **separate endpoints**: the daemon's home/listener differs from the CLI's effective `PRAECTOR_HOME` (e.g. a daemon started under a scratch `PRAECTOR_HOME` or an explicit `PRAECTOR_MCP` address). Do not guess which one the user means: ask which surface to drive, stay on the chosen one for the task, and re-read from that same surface to verify every durable effect.
 
 ## Load only the detail needed
 
