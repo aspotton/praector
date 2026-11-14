@@ -2153,7 +2153,17 @@ func (s *Store) planningGateAllowsClaimLocked(task Row) (bool, error) {
 		if !planningGateCoherent(col) {
 			return true, nil
 		}
-		return s.planReviewFloorAllowsClaimLocked(task)
+		// The preflight symmetry floor is ANDed into this SAME mode branch rather
+		// than added as a parallel predicate: the implement releases only when BOTH
+		// the plan-review decision and this generation's explore/critic preflight
+		// have reached terminal decisions. It is scoped to gate-free coherent
+		// collections (see preflightFloorAllowsClaimLocked), so a policy-required
+		// coherent collection keeps the classifier-driven checks below untouched.
+		prOK, err := s.planReviewFloorAllowsClaimLocked(task)
+		if err != nil || !prOK {
+			return prOK, err
+		}
+		return s.preflightFloorAllowsClaimLocked(task, col)
 	}
 	reviews, err := s.queryLocked("SELECT * FROM tasks WHERE collection_id=" + SQLLiteral(S(task, "collection_id")) + " AND profile='plan_review' AND status NOT IN ('CANCELLED','SUPERSEDED') ORDER BY created_at,id")
 	if err != nil {
@@ -2276,6 +2286,53 @@ func (s *Store) planReviewFloorAllowsClaimLocked(task Row) (bool, error) {
 	return strings.ToLower(strings.TrimSpace(S(JSONMap(S(review, "result_json")), "verdict"))) == "pass", nil
 }
 
+// preflightFloorAllowsClaimLocked is the artifact-derived preflight symmetry
+// floor: a sibling of planReviewFloorAllowsClaimLocked reached only from the SAME
+// coherent, not-plan-review-required mode branch in planningGateAllowsClaimLocked.
+// It proves the repository-exploration and critic preflight DECISIONS exist for
+// THIS coordinator generation, exactly as the plan-review floor proves a
+// plan-review decision exists. An implement claim is held until this generation's
+// explore AND critic have EACH reached a terminal COMPLETE status. Terminal
+// completion only: it deliberately does NOT invent a critic pass/fail verdict
+// (critic output is advisory guidance, not a gate verdict). "This generation" is
+// the same requested_by_task_id-of-the-latest-non-cancelled/non-superseded-
+// coordinator lookup the scheduler staging floor uses, so both layers agree. It is
+// a mode branch that the caller ANDs with the plan-review floor, NOT a second
+// parallel gate, and is scoped to GATE-FREE collections: any collection whose
+// classifier already required a gate keeps the existing policy-driven claim checks
+// below unchanged, and pre-cutoff (non-coherent) collections never reach it. This
+// is the claim-time complement to PREFLIGHT_FLOOR_STAGED, closing the live
+// gate-free-coherent gap (COL-4274d1d8d9-shaped) where an implement could be
+// claimed on plan_review evidence alone with zero preflight evidence.
+func (s *Store) preflightFloorAllowsClaimLocked(task Row, col Row) (bool, error) {
+	p := effectivePlanningPolicy(col)
+	if p.ExploreRequired || p.ResearchRequired || p.CriticRequired || p.PlanReviewRequired {
+		// Not gate-free: the classifier already drives the policy-required claim
+		// checks elsewhere, so the floor adds no hold here.
+		return true, nil
+	}
+	coords, err := s.queryLocked("SELECT id FROM tasks WHERE collection_id=" + SQLLiteral(S(task, "collection_id")) + " AND profile='coordinator' AND status NOT IN ('CANCELLED','SUPERSEDED') ORDER BY created_at,id")
+	if err != nil {
+		return false, err
+	}
+	if len(coords) == 0 {
+		// No coordinator generation to anchor this floor; the plan-review floor is
+		// the governing artifact and has already released.
+		return true, nil
+	}
+	coordID := S(coords[len(coords)-1], "id")
+	for _, profile := range []string{"explore", "critic"} {
+		gen, e := s.queryLocked("SELECT status FROM tasks WHERE collection_id=" + SQLLiteral(S(task, "collection_id")) + " AND profile=" + SQLLiteral(profile) + " AND requested_by_task_id=" + SQLLiteral(coordID) + " AND status NOT IN ('CANCELLED','SUPERSEDED') ORDER BY created_at,id")
+		if e != nil {
+			return false, e
+		}
+		if len(gen) == 0 || S(gen[len(gen)-1], "status") != TaskComplete {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // claimGateIsFloorMode reports whether an implement's claim decision was made
 // under the artifact floor rather than the policy-required path. It reuses the
 // same effectivePlanningPolicy / planningGateCoherent seam as the gate and makes
@@ -2344,6 +2401,7 @@ func (s *Store) decisionsLocked(projectID, collectionID string) (Rows, error) {
 func (s *Store) ClaimTask(tid string, maxAttempts int) (Row, Row, error) {
 	var task, attempt Row
 	floorHeld := false
+	floorPreflight := false
 	floorProjectID, floorCollectionID := "", ""
 	err := s.withLock(func() error {
 		rows, e := s.queryLocked("SELECT * FROM tasks WHERE id=" + SQLLiteral(tid) + " LIMIT 1")
@@ -2365,6 +2423,13 @@ func (s *Store) ClaimTask(tid string, maxAttempts int) (Row, Row, error) {
 			if isFloor, fe := s.claimGateIsFloorModeLocked(rows[0]); fe == nil && isFloor {
 				floorHeld = true
 				floorProjectID, floorCollectionID = S(rows[0], "project_id"), S(rows[0], "collection_id")
+				// The combined floor released the plan-review half but refused overall,
+				// so the preflight symmetry floor is the holding reason; otherwise the
+				// refusal is the plan-review floor. This only labels the already-made
+				// decision; it re-uses the same pure Locked check and gates nothing.
+				if prOK, pe := s.planReviewFloorAllowsClaimLocked(rows[0]); pe == nil && prOK {
+					floorPreflight = true
+				}
 			}
 			return nil
 		}
@@ -2414,10 +2479,17 @@ func (s *Store) ClaimTask(tid string, maxAttempts int) (Row, Row, error) {
 		return task, attempt, err
 	}
 	if floorHeld {
-		_ = s.Event(floorProjectID, floorCollectionID, tid, "", "PLAN_REVIEW_FLOOR_HELD", Row{
-			"hold_kind": "plan_review_floor",
-			"reason":    "implement claim held by the artifact-derived plan-review floor: the Collection has no terminal plan_review decision yet",
-		})
+		if floorPreflight {
+			_ = s.Event(floorProjectID, floorCollectionID, tid, "", "PREFLIGHT_FLOOR_HELD", Row{
+				"hold_kind": "preflight_floor",
+				"reason":    "implement claim held by the artifact-derived preflight floor: this coordinator generation's explore and critic preflight have not both reached terminal COMPLETE yet",
+			})
+		} else {
+			_ = s.Event(floorProjectID, floorCollectionID, tid, "", "PLAN_REVIEW_FLOOR_HELD", Row{
+				"hold_kind": "plan_review_floor",
+				"reason":    "implement claim held by the artifact-derived plan-review floor: the Collection has no terminal plan_review decision yet",
+			})
+		}
 	}
 	return task, attempt, err
 }
