@@ -382,8 +382,18 @@ func dependencyCycle(edges [][2]string) []string {
 	return nil
 }
 
+// dependencyEdgesLocked loads a collection's depends_on edges in a deterministic
+// order (ORDER BY from_task_id,to_task_id). Under the fixed relation the
+// task_edges PRIMARY KEY (from_task_id,to_task_id,relation) makes this a total
+// order, so every caller — the standalone/scheduler repair, the acyclicity check,
+// DependencyPath, and single-flight plan_review reuse — receives the same edge
+// ordering regardless of Dolt's implicit Prolly-Tree scan order. This mirrors the
+// batched bootstrap read (ORDER BY collection_id,from_task_id,to_task_id), which
+// is equivalent within a fixed collection. It only pins candidate/DELETE/event
+// and representative-path selection; the surviving-edge SET is unchanged because
+// computeLegacyRepairs reaches a fixpoint.
 func (s *Store) dependencyEdgesLocked(cid string) ([][2]string, error) {
-	rows, err := s.queryLocked("SELECT from_task_id,to_task_id FROM task_edges WHERE collection_id=" + SQLLiteral(cid) + " AND relation='depends_on'")
+	rows, err := s.queryLocked("SELECT from_task_id,to_task_id FROM task_edges WHERE collection_id=" + SQLLiteral(cid) + " AND relation='depends_on' ORDER BY from_task_id,to_task_id")
 	if err != nil {
 		return nil, err
 	}
@@ -475,8 +485,20 @@ func (s *Store) assertDependencyTasksInCollectionLocked(cid string, taskIDs []st
 	return nil
 }
 
+// repairLegacyDependencyCyclesLocked is the standalone/scheduler-time cycle
+// repair. Its per-collection task read is explicitly ordered (ORDER BY
+// created_at,id) — the collection-scoped equivalent of the batched bootstrap
+// read (ORDER BY collection_id,created_at,id), since collection_id is fixed by
+// the WHERE. This makes the scheduler RepairLegacyDependencyCycles path use the
+// same task/edge candidate ordering as the batched bootstrap path (edges via the
+// shared dependencyEdgesLocked helper). The `,id` primary-key tie-break is
+// load-bearing: created_at alone is not a total order. The repaired/surviving
+// edge SET remains order-independent because computeLegacyRepairs reaches a
+// fixpoint; the ordering only makes candidate selection, DELETE ordering, event
+// emission ordering, the first-task projectID pick, and representative
+// cycle/path selection deterministic.
 func (s *Store) repairLegacyDependencyCyclesLocked(collectionID string) (int, []string, error) {
-	taskRows, err := s.queryLocked("SELECT id,project_id,profile,status FROM tasks WHERE collection_id=" + SQLLiteral(collectionID))
+	taskRows, err := s.queryLocked("SELECT id,project_id,profile,status FROM tasks WHERE collection_id=" + SQLLiteral(collectionID) + " ORDER BY created_at,id")
 	if err != nil {
 		return 0, nil, err
 	}
@@ -579,8 +601,11 @@ func computeLegacyRepairs(taskByID map[string]Row, edges [][2]string) ([]legacyR
 // instead of issuing its own queryLocked reads. Its candidate-selection, DELETE,
 // LEGACY_DEPENDENCY_CYCLE_REPAIRED event, and single-commit sequence are identical
 // to the standalone repair, so a bootstrap batch produces byte-for-byte the same
-// durable outcome while the standalone RepairLegacyDependencyCycles path is
-// untouched.
+// durable outcome. The standalone RepairLegacyDependencyCycles path now reads its
+// tasks and edges in the same deterministic order (tasks by created_at,id and edges
+// by from_task_id,to_task_id) that the batched preloaded rows carry within a fixed
+// collection, so the two paths stay ordered symmetrically rather than the
+// standalone path being unordered.
 func (s *Store) repairLegacyDependencyCyclesLockedWithRows(collectionID string, taskRows, edgeRows Rows) (int, []string, error) {
 	taskByID := map[string]Row{}
 	projectID := ""
