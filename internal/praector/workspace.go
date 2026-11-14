@@ -135,6 +135,52 @@ func (w *GitWorkspace) RestoreReadOnlyWorkspace(worktree string, baseline Worksp
 	return err
 }
 
+// NewCommitsFrom reports whether the worktree HEAD introduces any commit that is
+// not reachable from base using a commit-reachability probe
+// (`git rev-list --count base..HEAD == 0`), never a working-tree diff: an attempt
+// can leave dirty or untracked files yet add zero commits, which is exactly the
+// phantom case the floor must catch. An undecidable probe — empty base or
+// worktree, or a git error — reports "has new commits" so the phantom floor never
+// blocks on a missing or failing probe (it fails open rather than rejecting real
+// work).
+func (w *GitWorkspace) NewCommitsFrom(worktree, base string) (bool, error) {
+	if base == "" || worktree == "" || !exists(worktree) {
+		return true, nil
+	}
+	p, err := w.git(worktree, false, "rev-list", "--count", base+"..HEAD")
+	if err != nil {
+		return true, err
+	}
+	if p.Code != 0 {
+		return true, fmt.Errorf("cannot count commits from base %s in %s: %s", base, worktree, strings.TrimSpace(firstNonEmpty(p.Stderr, p.Stdout)))
+	}
+	return strings.TrimSpace(p.Stdout) != "0", nil
+}
+
+// ResetImplementTaskToBase returns a phantom-flagged implementation task's own
+// attached worktree to its durable base commit and removes untracked leftovers,
+// scoped to that single worktree path and its own task branch. It adapts the
+// read-only restore pattern (force checkout + clean -fd) to the attached-branch
+// case: `reset --hard` clears tracked edits but NOT untracked files, so it is
+// paired with `clean -fd` to guarantee a phantom attempt's leftovers cannot leak
+// into the next attempt. HEAD is per-worktree, so this never moves shared refs or
+// any other worktree's HEAD.
+func (w *GitWorkspace) ResetImplementTaskToBase(task Row) error {
+	path := S(task, "worktree_path")
+	if path == "" || !exists(path) {
+		return nil
+	}
+	base := S(task, "base_commit")
+	if base == "" {
+		return nil
+	}
+	if _, err := w.git(path, true, "reset", "--hard", base); err != nil {
+		return err
+	}
+	_, err := w.git(path, true, "clean", "-fd")
+	return err
+}
+
 func (w *GitWorkspace) EnsureCollection(project, collection Row) (string, error) {
 	repo := w.RepoRoot(project)
 	branch := S(collection, "integration_branch")
@@ -269,6 +315,13 @@ func (w *GitWorkspace) PrepareTask(project, collection, task Row) (string, error
 	var base *string
 	if S(task, "base_commit") != "" {
 		v := S(task, "base_commit")
+		base = &v
+	} else if !branchExists {
+		// A fresh collection-mode branch forks at baseRef, so its creation head IS
+		// the durable base head. Recording it here (inherit-mode already carries one
+		// from CheckpointForDelegation) gives the phantom-write floor an authoritative
+		// commit-reachability anchor instead of leaving base_commit NULL.
+		v := head
 		base = &v
 	}
 	if err := w.Store.SetTaskWorkspace(S(task, "id"), strptr(taskPath), strptr(branch), base, strptr(head)); err != nil {

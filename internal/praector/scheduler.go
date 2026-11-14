@@ -1151,6 +1151,48 @@ func (s *Scheduler) handleReadOnlyCapabilityViolation(cfg ProjectConfig, task, a
 	return msg
 }
 
+// handlePhantomImplementation is the artifact-derived phantom-write floor: an
+// implement attempt that exited 0 WITHOUT a structured result and WITHOUT a single
+// new commit versus its durable base is an execution/protocol failure, not a
+// completion. It is shaped like handleMissingReviewVerdict /
+// handleReadOnlyCapabilityViolation: within the attempt budget it returns the task
+// to READY with a dedicated IMPLEMENT_PHANTOM_COMPLETION_REJECTED event carrying a
+// tail of the final text as evidence; on budget exhaustion it submits a failed
+// result so the shared coordinator-attention tail in ExecuteTask fires. The
+// caller only reaches this inside the no-structured-result fallback, so a
+// structured completion claiming success is never mechanically phantom-flagged
+// (semantic review, not this floor, catches dishonest-but-structured results).
+func (s *Scheduler) handlePhantomImplementation(cfg ProjectConfig, task, attempt Row, finalText string) string {
+	msg := "Implementation attempt exited with a clean success, no structured result, and no new commits versus its base commit; treated as a phantom completion, not a result."
+	if I(attempt, "attempt_no") < cfg.Limits.MaxAttemptsPerTask {
+		_ = s.Store.SetTaskStatus(S(task, "id"), TaskReady, "task "+S(task, "id")+": retry after phantom implementation completion")
+		_ = s.Store.Event(S(task, "project_id"), S(task, "collection_id"), S(task, "id"), S(attempt, "id"), "IMPLEMENT_PHANTOM_COMPLETION_REJECTED", Row{"attempt_no": I(attempt, "attempt_no"), "reason": msg, "final_text_tail": tailText(finalText, 2000)})
+	} else {
+		_, _ = s.Store.SubmitResult(S(task, "id"), Row{"status": "failed", "summary": msg, "artifacts": []any{}, "risks": []any{"Phantom implementation (no new commits and no structured result) after retry budget exhausted", "final_text_tail: " + tailText(finalText, 2000)}})
+	}
+	return msg
+}
+
+// submitFallbackTextCompletion records the exit-0 no-structured-result auto-complete
+// fallback (the only completion fallback path) for any profile. Because the
+// transcript is the only content, the durable result is explicitly marked
+// fallback_text_result=true and a RESULT_FALLBACK_TEXT audit-level event is emitted
+// (task+attempt scope, visible to ListEvents / praector events) so reviews and
+// traceability can mechanically distrust a transcript-style result. A worker-submitted
+// structured result never passes through here and therefore carries neither marker.
+// SubmitResult serializes the whole Row verbatim into result_json, so no schema change
+// is required. The other SubmitResult fallback sites (harness-failure and
+// checkpoint/integration-failure in ExecuteTask) record a failed status, not a
+// completion, so they intentionally carry no marker.
+func (s *Scheduler) submitFallbackTextCompletion(task, attempt Row, summary string) (Row, error) {
+	res, err := s.Store.SubmitResult(S(task, "id"), Row{"status": "complete", "summary": summary, "findings": []any{}, "evidence": []any{}, "artifacts": []any{}, "risks": []any{}, "unresolved": []any{}, "memory_candidates": []any{}, "decisions": []any{}, "fallback_text_result": true})
+	if err != nil {
+		return res, err
+	}
+	_ = s.Store.Event(S(task, "project_id"), S(task, "collection_id"), S(task, "id"), S(attempt, "id"), "RESULT_FALLBACK_TEXT", Row{"profile": S(task, "profile"), "fallback_text_result": true})
+	return res, nil
+}
+
 func (s *Scheduler) processResultMetadata(task Row) {
 	refreshed, err := s.Store.GetTask(S(task, "id"))
 	if err != nil {
@@ -1519,6 +1561,7 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 	workdir := ""
 	var readOnlyBaseline WorkspaceSnapshot
 	haveReadOnlyBaseline := false
+	phantomRejected := false
 	var harnessResult HarnessResult
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -1616,11 +1659,35 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 			if S(task, "profile") == "review" || S(task, "profile") == "plan_review" {
 				protocolFailure = s.handleMissingReviewVerdict(projectCfg, task, attempt)
 			} else {
-				summary := harnessResult.FinalText
-				if summary == "" {
-					summary = "OpenCode task completed without an explicit structured result."
+				// Phantom-write floor. This branch only runs while the task is still
+				// RUNNING, i.e. no structured result was submitted; a structured
+				// zero-commit completion is therefore exempt by construction. For the
+				// implement profile, an attempt that produced no new commit versus its
+				// durable base is an execution/protocol failure, not a completion. The
+				// zero-commit test is a commit-reachability probe on the live worktree
+				// (base_commit..HEAD), never a diff and never the mutable current_head
+				// that Checkpoint overwrites. The candidate worktree is reset first so a
+				// phantom attempt's leftover edits/untracked files cannot leak into the
+				// next attempt or be auto-committed by the checkpoint tail below.
+				phantom := false
+				if S(task, "profile") == "implement" {
+					if hasNew, probeErr := s.Workspace.NewCommitsFrom(workdir, S(current, "base_commit")); probeErr == nil && !hasNew {
+						phantom = true
+					}
 				}
-				_, _ = s.Store.SubmitResult(taskID, Row{"status": "complete", "summary": summary, "findings": []any{}, "evidence": []any{}, "artifacts": []any{}, "risks": []any{}, "unresolved": []any{}, "memory_candidates": []any{}, "decisions": []any{}})
+				if phantom {
+					if resetErr := s.Workspace.ResetImplementTaskToBase(current); resetErr != nil {
+						_ = s.Store.Event(S(current, "project_id"), S(current, "collection_id"), taskID, S(attempt, "id"), "IMPLEMENT_WORKSPACE_RESET_FAILED", Row{"error": resetErr.Error()})
+					}
+					protocolFailure = s.handlePhantomImplementation(projectCfg, task, attempt, harnessResult.FinalText)
+					phantomRejected = true
+				} else {
+					summary := harnessResult.FinalText
+					if summary == "" {
+						summary = "OpenCode task completed without an explicit structured result."
+					}
+					_, _ = s.submitFallbackTextCompletion(current, attempt, summary)
+				}
 			}
 		} else {
 			if I(attempt, "attempt_no") < projectCfg.Limits.MaxAttemptsPerTask {
@@ -1639,7 +1706,7 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 		current, _ = s.Store.GetTask(taskID)
 	}
 	profile := S(task, "profile")
-	if profile == "implement" {
+	if profile == "implement" && !phantomRejected {
 		head, e := s.Workspace.Checkpoint(current, I(attempt, "attempt_no"), "attempt-checkpoint")
 		if e != nil {
 			protocolFailure = "Implementation workspace checkpoint failed: " + e.Error()
