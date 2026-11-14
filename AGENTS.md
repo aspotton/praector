@@ -15,6 +15,7 @@ Before making architectural or behavioral changes, read:
    - Git/worktrees/acceptance: [`docs/WORKSPACES.md`](docs/WORKSPACES.md)
    - Dolt/state/recovery: [`docs/STATE_AND_RECOVERY.md`](docs/STATE_AND_RECOVERY.md)
    - operator-facing behavior: [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
+   - performance/query cost: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)
 
 The documentation index is [`docs/README.md`](docs/README.md).
 
@@ -71,6 +72,7 @@ docs/WORKSPACES.md           Git/worktree/integration/acceptance
 docs/STATE_AND_RECOVERY.md   Dolt/state machines/recovery
 docs/OPERATIONS.md           install/run/operate/troubleshoot
 docs/DEVELOPMENT.md          code layout/change guidance
+docs/PERFORMANCE.md          performance baselines and query-cost optimization tracker
 cmd/praector/main.go              native executable entry point
 internal/praector/cli.go          CLI parser and operator commands
 internal/praector/service.go        shared typed domain service layer (CLI/MCP parity seam)

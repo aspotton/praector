@@ -19,6 +19,7 @@ Roadmap: [`../ROADMAP.md`](../ROADMAP.md)
 | [`STATE_AND_RECOVERY.md`](STATE_AND_RECOVERY.md) | Dolt schema, task/attempt/session states, events, memory, crash recovery |
 | [`OPERATIONS.md`](OPERATIONS.md) | Installation, project setup, running, observing, accepting, cleanup, troubleshooting |
 | [`DEVELOPMENT.md`](DEVELOPMENT.md) | Source layout, extension rules, testing and documentation maintenance |
+| [`PERFORMANCE.md`](PERFORMANCE.md) | Performance baselines, query-cost investigation, and iterative optimization tracker |
 
 ## Reading paths
 

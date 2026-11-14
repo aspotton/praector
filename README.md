@@ -206,6 +206,7 @@ The documentation is intentionally split so both humans and coding agents can fi
 | Dolt schema, states, events, memory, crash recovery | [`docs/STATE_AND_RECOVERY.md`](docs/STATE_AND_RECOVERY.md) |
 | Installation, operating workflows, troubleshooting | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) |
 | Repository layout, invariants, contribution workflow | [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) |
+| Performance baselines and query-cost optimization tracker | [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) |
 | Instructions for AI/coding agents modifying this repository | [`AGENTS.md`](AGENTS.md) |
 
 ### Recommended reading paths
