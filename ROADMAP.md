@@ -49,7 +49,7 @@ Exercise `praector collection pr` beyond the current happy-path coverage:
 
 ### Remaining black-box acceptance tests
 
-- Naturally exercise semantic implementation failure -> failed review -> repair -> **fresh durable post-repair review Task** in a real run. Automated regression coverage already exists; the goal is live end-to-end evidence without intentionally instructing an agent to violate acceptance requirements. Now reachable: the post-repair review's `verifies` carry is deterministic scheduler-side wiring (`Scheduler.ensureReview`), so a failed-then-repaired Collection reconciles to `COMPLETE` on its own — the live fail-to-repair-to-fresh-review black-box evidence can be harvested from a naturally-occurring run rather than a constructed one.
+- Naturally exercise semantic implementation failure -> failed review -> repair -> **fresh durable post-repair review Task** in a real run. Automated regression coverage already exists; the goal is live end-to-end evidence without intentionally instructing an agent to violate acceptance requirements. Now reachable: the post-repair review's `verifies` carry is a **daemon-enforced invariant** — wired by `Scheduler.ensureReview` at integration time and retroactively backfilled by `Scheduler.backfillRepairLineageCarryEdges` in the daemon's per-tick `BLOCKED` reconcile — so a failed-then-repaired Collection reconciles to `COMPLETE` on its own even if the cycle settled before the wiring existed; the live fail-to-repair-to-fresh-review black-box evidence can be harvested from a naturally-occurring run rather than a constructed one.
 - Continue crash/restart tests around narrow task/session handoff boundaries.
 
 ## 2. Platform support
