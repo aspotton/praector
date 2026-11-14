@@ -81,7 +81,7 @@ Two distinct measurement contexts appear in this tracker and must not be conflat
 
 The 51 → 3 `dolt sql` and bootstrap-repair 49 → 2 figures in the Results tracker are **clean-benchmark** numbers; they are not a live-environment capture.
 
-The **remaining live `project list` `dolt sql` count** (the post-optimization count one would read from the real store with the daemon active) is **not-captured-in-this-environment**: reproducing it needs the PATH-shim wrapped against the live user store (per the Reproduction methodology), which was not run here. Until such a live capture is recorded, treat only the seeded `project list` figures above as the `project list` measurement, and do not present the clean-benchmark `dolt sql` counts as live-environment counts.
+The **live post-optimization `project list` and `status` counts** are now captured directly against the real, populated user store with a normal `praector daemon` active, under the same PATH-shim methodology (see the Reproduction methodology above). They are recorded in the "Live Phase 1.1 captures" subsection of the Results tracker and are kept separate from both the seeded 23-collection clean benchmark and the original live baseline above. These are live-environment captures, not the clean-benchmark `dolt sql` counts.
 
 ## Reproduction methodology
 
@@ -571,6 +571,46 @@ permutation; and `TestBootstrapCycleRepairDeterministicEmission` asserts the bat
 edge read's `ORDER BY` is present, the surviving edge SET matches the expected repaired
 outcome, and the emitted DELETE order is deterministic. `TestBootstrapBatchedRepairMatchesStandaloneRepair`
 still passes byte-for-byte.
+
+### Live Phase 1.1 captures (live environment)
+
+These are **live-environment** captures — the real, populated user store with a normal
+`praector daemon` active — and are deliberately kept distinct from both the seeded
+23-collection clean benchmark (the "Phase 1 / Phase 1.1 measured result" tables above)
+and the original live baseline in the "Measured baseline" section. They are **not** a
+seeded benchmark and must not be conflated with the clean-benchmark `dolt sql` counts.
+
+Methodology and environment:
+
+- PATH-shim wrapping of every Dolt invocation, forwarding to the real binary; totals read with `grep -c '^sql'` plus the `dolt add`/`commit` processes (per the Reproduction methodology above).
+- Installed `praector 0.2.5` binary; `main` commit `5c12bff6`; Dolt `2.7.2`; the live user store; a normal `praector daemon` running during measurement.
+- Caveat: `praector status` is not purely read-only — its terminal-state reconciliation can write durable state, so a `status` capture may include terminal-state Dolt `add`/`commit` writes. Read these as realistic operational measurements, not immutable snapshots.
+- Determinism/ordering claims below are scoped to **Dolt 2.7.x** (verified on `2.7.2`); they are not a permanent cross-version guarantee.
+
+Observed live totals and wall times:
+
+| Command | `dolt sql` | `dolt add`/`commit` | Total Dolt | Wall time |
+| --- | ---: | ---: | ---: | ---: |
+| `praector project list` | 3 | 2 | 5 | ~0.58–0.61 s |
+| `praector status COL-91f2bd6664` | 29 | 2 | 31 | ~4.90–5.11 s |
+| `praector status COL-504ca4be8f` | 29 | 2 | 31 | ~5.07 s |
+| `praector status --project PRJ-fe97887502` | 112 | 2 | 114 | ~18.79 s |
+
+Where a directly comparable documented baseline exists in the "Measured baseline" section, the before/after is:
+
+| Command | Baseline | Live Phase 1.1 |
+| --- | ---: | ---: |
+| `praector status COL-504ca4be8f` | 86 calls / 8.92 s | 31 calls / 5.07 s |
+| `praector status --project PRJ-fe97887502` | 169 calls / 21.96 s | 114 calls / 18.79 s |
+
+`praector status COL-91f2bd6664` is a **live-only** capture: no documented "before"
+baseline exists for it (only `COL-504ca4be8f` and `PRJ-fe97887502` are baselined
+above), so it is never presented as a before/after pair.
+
+Interpretation: bootstrap-dominated commands (`project list`) are now small (a single
+batched read + the command's own query). Collection `status` terminal-state
+reconciliation remains the dominant remaining cost, and project-wide `status` remains
+Phase 2 (collection-snapshot reconciliation) work rather than anything addressed here.
 
 ## Risks and open questions
 
