@@ -269,7 +269,7 @@ At least one Task is executing/verifying, a Task is runnable, or a durable harne
 
 Tasks remain incomplete, but none are currently executable/runnable and no durable harness Session is still running.
 
-The scheduler continuously reconciles this state.
+The scheduler continuously reconciles this state. One reconcile step is the **retroactive repair-lineage carry-edge backfill sweep** (`Scheduler.backfillRepairLineageCarryEdges`, run from `reconcileCollection` immediately before the terminal recompute). A `BLOCKED` Collection whose `failed review -> repair -> fresh passing review` cycle settled before the `Scheduler.ensureReview` carry wiring existed, or where the daemon died between integration and wiring, otherwise has a carrying pass review with no `verifies` edge onto the original implementation — a graph the coverage rule can never satisfy and no reachable graph movement can flip. The sweep reuses the exact original-set resolver `ensureReview` uses (no widened discovery, no third coverage path) to add only the genuinely-missing `implement -> passing review` `verifies` edges, emits one `REPAIR_LINEAGE_BACKFILLED` audit event per carrying review, and relies on the existing all-terminal + coverage recompute in the same tick to flip the healed Collection to `COMPLETE`. It is a strict no-op when the edges are already wired (healthy collections churn nothing) and is byte-idempotent across repeated ticks and a daemon restart. See `docs/AGENT_PROTOCOL.md` and `docs/OPERATIONS.md`.
 
 ## Attempts, retries, and limits
 

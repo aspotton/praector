@@ -1609,10 +1609,13 @@ func (s *Scheduler) observeStuckFloorHolds(c Row, tasks Rows, fp string) {
 
 // observeStuckCollectionBlock is the collection-level twin: a Collection that is
 // BLOCKED yet whose graph contains no nonterminal (or blocking) task can never move on
-// its own, so it is flagged once. Per decision DEC-33729a5439 the root cause of the
-// BLOCKED-with-a-passing-review exemplar (a missing verifies edge auto-carry) is
-// DEFERRED; this only DETECTS the stuck collection via the same fingerprint dedup. It
-// must not relax the independent-passing-review coverage rule.
+// its own, so it is flagged once. The root cause of the BLOCKED-with-a-passing-review
+// exemplar (a missing repair-lineage verifies carry edge) is now CLOSED in the daemon by
+// the retroactive backfill sweep (backfillRepairLineageCarryEdges), which runs earlier in
+// this same reconcile pass and heals such a collection to COMPLETE before it can look
+// stuck. This twin stays PURE DETECTION for any remaining structural stuck cause: it only
+// flags via the same fingerprint dedup and must not relax the independent-passing-review
+// coverage rule.
 func (s *Scheduler) observeStuckCollectionBlock(c Row, tasks Rows, fp string) {
 	if S(c, "status") != "BLOCKED" || s.stuckFloorAttentionOutstanding(tasks) {
 		return
@@ -1799,6 +1802,60 @@ func (s *Scheduler) projectLimits(pid string) Limits {
 	return DefaultLimits()
 }
 
+// repairOriginalImplementations is the SINGLE discovery rule that resolves the
+// original implementation tasks a failed review verified. It is shared verbatim
+// by the trigger-time seam (ensureReview) and the retroactive daemon reconcile
+// backfill sweep, so the carry-edge invariant is one rule and cannot fork between
+// the paths that wire it live and the path that heals it later. Two shapes are
+// resolved, exactly as ensureReview always has:
+//
+//  1. verifies edges INTO the failed review (scheduler-created review shape): the
+//     edge's from_task_id is an implementation the failed review was created to
+//     verify.
+//  2. the coordinator-created shape: a review requested with
+//     `praector task request --profile review` carries only depends_on edges and
+//     NO verifies edge, so a verifies-edge-only scan leaves its original
+//     implementation uncovered and the collection permanently BLOCKED. Every
+//     COMPLETE implement-profile depends_on prerequisite of the failed review is
+//     an implementation it reviewed.
+//
+// excludeIDs are sources already accounted for elsewhere (the repair
+// implementation or deps already collected) and are skipped. The verifies edges
+// this rule feeds are INSERT IGNORE with no dependency cycle guard, but they are
+// not part of the dependency DAG (dependencyEdgesLocked filters relation='depends_on'),
+// so they cannot close a cycle. Order is stable: verifies-edge sources first, then
+// depends_on-prerequisite sources.
+func (s *Scheduler) repairOriginalImplementations(cid string, failedReview Row, excludeIDs []string) ([]string, error) {
+	edges, err := s.Store.ListEdges(cid)
+	if err != nil {
+		return nil, err
+	}
+	sources := []string{}
+	for _, edge := range edges {
+		if S(edge, "relation") == "verifies" && S(edge, "to_task_id") == S(failedReview, "id") {
+			source := S(edge, "from_task_id")
+			if source != "" && !containsString(excludeIDs, source) && !containsString(sources, source) {
+				sources = append(sources, source)
+			}
+		}
+	}
+	for _, edge := range edges {
+		if S(edge, "relation") != "depends_on" || S(edge, "to_task_id") != S(failedReview, "id") {
+			continue
+		}
+		source := S(edge, "from_task_id")
+		if source == "" || containsString(excludeIDs, source) || containsString(sources, source) {
+			continue
+		}
+		src, e := s.Store.GetTask(source)
+		if e != nil || src == nil || S(src, "profile") != "implement" || S(src, "status") != TaskComplete {
+			continue
+		}
+		sources = append(sources, source)
+	}
+	return sources, nil
+}
+
 func (s *Scheduler) ensureReview(project, collection, impl Row) error {
 	var failedParentReview Row
 	if parentID := S(impl, "parent_task_id"); parentID != "" {
@@ -1836,45 +1893,16 @@ func (s *Scheduler) ensureReview(project, collection, impl Row) error {
 	reason := "Praector policy requires independent review of every implementation task."
 	originalVerificationSources := []string{}
 	if failedParentReview != nil {
-		edges, e := s.Store.ListEdges(S(impl, "collection_id"))
+		// Both the scheduler-created verifies-edge shape and the coordinator-created
+		// depends_on-prerequisite shape are resolved through the single shared
+		// repairOriginalImplementations rule so trigger-time wiring and the
+		// retroactive reconcile backfill sweep can never fork discovery semantics.
+		sources, e := s.repairOriginalImplementations(S(impl, "collection_id"), failedParentReview, deps)
 		if e != nil {
 			return e
 		}
-		for _, edge := range edges {
-			if S(edge, "relation") == "verifies" && S(edge, "to_task_id") == S(failedParentReview, "id") {
-				source := S(edge, "from_task_id")
-				if source != "" && !containsString(deps, source) {
-					deps = append(deps, source)
-					originalVerificationSources = append(originalVerificationSources, source)
-				}
-			}
-		}
-		// The verifies scan above is the scheduler-created discovery path and is
-		// necessary but not sufficient: a coordinator-created failed review
-		// (`praector task request --profile review`) carries only depends_on edges,
-		// so verifies-edge-only discovery leaves its original implementation
-		// uncovered and the collection permanently BLOCKED. Resolve the same
-		// originals deterministically from the failed review's own depends_on
-		// prerequisites: any COMPLETE implement-profile task it waits on is an
-		// implementation it reviewed. The verifies edges added for these sources
-		// are INSERT IGNORE with no dependency cycle guard, but they are not part
-		// of the dependency DAG (dependencyEdgesLocked filters relation='depends_on'),
-		// so they cannot close a cycle; the direct depends_on prerequisite is
-		// transitively redundant (the fresh review already reaches it through the
-		// failed review) and passes the atomic-batch acyclicity check.
-		for _, edge := range edges {
-			if S(edge, "relation") != "depends_on" || S(edge, "to_task_id") != S(failedParentReview, "id") {
-				continue
-			}
-			source := S(edge, "from_task_id")
-			if source == "" || source == S(impl, "id") || containsString(originalVerificationSources, source) {
-				continue
-			}
-			src, e := s.Store.GetTask(source)
-			if e != nil || src == nil || S(src, "profile") != "implement" || S(src, "status") != TaskComplete {
-				continue
-			}
-			originalVerificationSources = append(originalVerificationSources, source)
+		originalVerificationSources = sources
+		for _, source := range sources {
 			if !containsString(deps, source) {
 				deps = append(deps, source)
 			}
@@ -2300,6 +2328,117 @@ func (s *Scheduler) maxWorkersFor(collectionID string) int {
 	return max
 }
 
+// backfillRepairLineageCarryEdges is the retroactive, per-tick enforcement of the
+// repair-lineage carry invariant that ensureReview only wires at trigger time. A
+// failed-review -> repair -> fresh-passing-review cycle that settled under an older
+// binary, or where the daemon died between integration and wiring, leaves the carrying
+// pass review with no verifies edge onto the ORIGINAL implementation. Because
+// Store.ImplementationsMissingPassingReview counts coverage ONLY via verifies edges or
+// a review parent, no coordinator- or worker-reachable graph movement can ever flip such
+// a collection: it stays permanently BLOCKED while every signal reads reviewed-and-good
+// (this fired live for infinitum COL-4274d1d8d9).
+//
+// For every COMPLETE review whose result verdict=fail, the original implementation set is
+// resolved through the SINGLE shared repairOriginalImplementations rule (never a parallel
+// discovery query). Every later COMPLETE verdict=pass review that directly depends_on that
+// failed review — exactly the shape ensureReview would have wired at the time (its deps
+// always carry the failed review) — receives the missing implement->review verifies edges
+// via Store.AddEdge('verifies'), bypassing the dependency cycle guard by relation just as
+// the trigger-time edges do. Multi-generation repair chains reach a fixed point with a
+// for-changed loop, mirroring Store.RepairSupersededReviewLineage. The membership is
+// deliberately NOT widened to any passing review whose depends_on prerequisites happen to
+// include implements, so plain depends_on never counts as coverage (the coverage rule
+// stays zero-diff).
+//
+// It is a strict Go-side no-op when the edge already exists: the existing (from,to,
+// relation) keys are loaded from ListEdges first because AddEdge('verifies') commits even
+// on a zero-row INSERT IGNORE, so an unconditional per-tick write would churn Dolt on
+// healthy collections. It emits exactly one REPAIR_LINEAGE_BACKFILLED audit event per
+// carrying review only when an edge is genuinely added (detect-then-emit), so repeated
+// ticks and a simulated daemon restart are byte-idempotent. The status flip to COMPLETE is
+// left entirely to the existing UpdateCollectionTerminalState call already at the tail of
+// reconcileCollection (all-terminal + ImplementationsMissingPassingReview==empty); no
+// extra terminal wiring is added. Errors are tolerated by the caller so a sweep never
+// fails reconciliation.
+func (s *Scheduler) backfillRepairLineageCarryEdges(cid string) (int, error) {
+	if s.Store == nil {
+		return 0, nil
+	}
+	tasks, err := s.Store.ListTasks(cid)
+	if err != nil {
+		return 0, err
+	}
+	by := map[string]Row{}
+	for _, t := range tasks {
+		by[S(t, "id")] = t
+	}
+	edges, err := s.Store.ListEdges(cid)
+	if err != nil {
+		return 0, err
+	}
+	keys := map[string]bool{}
+	depFromFailed := map[string][]string{}
+	for _, e := range edges {
+		keys[S(e, "from_task_id")+"\x00"+S(e, "to_task_id")+"\x00"+S(e, "relation")] = true
+		if S(e, "relation") == "depends_on" {
+			depFromFailed[S(e, "from_task_id")] = append(depFromFailed[S(e, "from_task_id")], S(e, "to_task_id"))
+		}
+	}
+	failedReviews := []Row{}
+	for _, t := range tasks {
+		if S(t, "profile") == "review" && S(t, "status") == TaskComplete && strings.ToLower(strings.TrimSpace(S(M(t, "result"), "verdict"))) == "fail" {
+			failedReviews = append(failedReviews, t)
+		}
+	}
+	added := 0
+	changed := true
+	for changed {
+		changed = false
+		for _, fr := range failedReviews {
+			originals, err := s.repairOriginalImplementations(cid, fr, nil)
+			if err != nil {
+				return added, err
+			}
+			if len(originals) == 0 {
+				continue
+			}
+			for _, toID := range depFromFailed[S(fr, "id")] {
+				carrier := by[toID]
+				if carrier == nil || S(carrier, "profile") != "review" || S(carrier, "status") != TaskComplete {
+					continue
+				}
+				if strings.ToLower(strings.TrimSpace(S(M(carrier, "result"), "verdict"))) != "pass" {
+					continue
+				}
+				var carried []string
+				for _, impl := range originals {
+					k := impl + "\x00" + S(carrier, "id") + "\x00verifies"
+					if keys[k] {
+						continue
+					}
+					if err := s.Store.AddEdge(impl, S(carrier, "id"), cid, "verifies"); err != nil {
+						return added, err
+					}
+					keys[k] = true
+					added++
+					changed = true
+					carried = append(carried, impl)
+				}
+				if len(carried) > 0 {
+					c, _ := s.Store.GetCollection(cid)
+					// REPAIR_LINEAGE_BACKFILLED is deliberately kept OUT of
+					// stuckFloorNonMovementEvents: a backfill is a real graph
+					// mutation, so counting it as movement (which suppresses the
+					// stuck-floor / acceptance-readiness twins on the next tick) is
+					// the intended, stated choice rather than a silent side effect.
+					_ = s.Store.Event(S(c, "project_id"), cid, S(carrier, "id"), "", "REPAIR_LINEAGE_BACKFILLED", Row{"carrying_review_task_id": S(carrier, "id"), "failed_review_task_id": S(fr, "id"), "backfilled_implementation_task_ids": carried})
+				}
+			}
+		}
+	}
+	return added, nil
+}
+
 func (s *Scheduler) reconcileCollection(collectionID string) (string, error) {
 	_, cycle, err := s.Store.RepairLegacyDependencyCycles(collectionID)
 	if err != nil {
@@ -2343,6 +2482,15 @@ func (s *Scheduler) reconcileCollection(collectionID string) (string, error) {
 	// fails reconciliation (all durable errors are tolerated internally) so a stuck graph
 	// escalates instead of looking healthy while every other liveness mechanism stays silent.
 	s.observeStuckFloors(collectionID)
+	// Retroactive repair-lineage carry-edge backfill: heal a settled BLOCKED
+	// Collection whose failed-review -> repair -> fresh-passing-review cycle settled
+	// before/without ensureReview wiring. It is a strict no-op on healthy graphs and
+	// runs BEFORE the terminal recompute below so the same-tick
+	// UpdateCollectionTerminalState can flip a healed collection to COMPLETE. Its
+	// errors are tolerated internally so a sweep never fails reconciliation.
+	if _, err := s.backfillRepairLineageCarryEdges(collectionID); err != nil {
+		fmt.Printf("praector: collection %s repair-lineage backfill sweep failed: %v\n", collectionID, err)
+	}
 	return s.Store.UpdateCollectionTerminalState(collectionID)
 }
 
