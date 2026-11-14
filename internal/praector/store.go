@@ -1434,55 +1434,28 @@ func isGenerationCoordinatorTitle(title string) bool {
 }
 
 func (s *Store) CriticRevalidationState(cid string) (Row, error) {
+	// Thin loader over the shared decide core (DEC-3db2c25cd9). Every fingerprint
+	// the core computes reads exactly the ListTasks/ListEdges/GetCollection rows the
+	// previous inline MaterialPlanFingerprint + compat-block reads produced, and the
+	// core re-derives the latest critic task id to select its sealed baseline
+	// (equivalent to the old CriticPlanBaseline(latestCriticTaskID) read).
 	tasks, err := s.ListTasks(cid)
 	if err != nil {
 		return nil, err
 	}
-	var latest Row
-	for _, t := range tasks {
-		if S(t, "profile") == "critic" && S(t, "status") != TaskCancelled && S(t, "status") != TaskSuperseded {
-			latest = t
-		}
-	}
-	cur, err := s.MaterialPlanFingerprint(cid, false)
+	edges, err := s.ListEdges(cid)
 	if err != nil {
 		return nil, err
 	}
-	legacy, err := s.MaterialPlanFingerprint(cid, true)
+	collection, err := s.GetCollection(cid)
 	if err != nil {
 		return nil, err
 	}
-	tasksForCompat, err := s.ListTasks(cid)
+	baselineEvents, err := s.Query("SELECT collection_id,task_id,payload_json,created_at FROM events WHERE event_type='CRITIC_PLAN_BASELINE' AND collection_id=" + SQLLiteral(cid) + " ORDER BY created_at")
 	if err != nil {
 		return nil, err
 	}
-	edgesForCompat, err := s.ListEdges(cid)
-	if err != nil {
-		return nil, err
-	}
-	collForCompat, err := s.GetCollection(cid)
-	if err != nil {
-		return nil, err
-	}
-	v021 := MaterialPlanFingerprintV021(S(collForCompat, "objective"), tasksForCompat, edgesForCompat, false)
-	v021Legacy := MaterialPlanFingerprintV021(S(collForCompat, "objective"), tasksForCompat, edgesForCompat, true)
-	var base Row
-	if latest != nil {
-		base, _ = s.CriticPlanBaseline(S(latest, "id"))
-	}
-	sealed := S(base, "fingerprint")
-	compatible := ""
-	if sealed != "" && sealed != cur {
-		switch {
-		case sealed == legacy:
-			compatible = "legacy_raw_base_commit"
-		case sealed == v021:
-			compatible = "v0.2.1_material_plan"
-		case sealed == v021Legacy:
-			compatible = "v0.2.1_legacy_raw_base_commit"
-		}
-	}
-	return Row{"latest_critic_task_id": S(latest, "id"), "latest_critic_status": S(latest, "status"), "current_material_plan_fingerprint": cur, "sealed_fingerprint": sealed, "baseline_source": S(base, "source"), "compatible_via": nullable(compatible), "stale": latest != nil && sealed != "" && sealed != cur && compatible == ""}, nil
+	return criticRevalidationFromRows(collection, tasks, edges, baselineEvents), nil
 }
 func (s *Store) Dependencies(tid string) (Rows, error) {
 	return s.Query("SELECT t.* FROM task_edges e JOIN tasks t ON t.id=e.from_task_id WHERE e.to_task_id=" + SQLLiteral(tid) + " AND e.relation='depends_on' ORDER BY e.created_at")
@@ -3010,200 +2983,50 @@ func (s *Store) EventCreatedAt(id string) (createdAt string, found bool, err err
 }
 
 func (s *Store) RepairSupersededReviewLineage(cid string) (int, error) {
+	// Thin loader over the shared decide core (DEC-3db2c25cd9). The AddEdge/Event
+	// writes are unchanged; the core appends added edges to the throwaway bucket it
+	// is handed here, which this per-query path re-reads fresh downstream anyway.
 	tasks, err := s.ListTasks(cid)
 	if err != nil {
 		return 0, err
-	}
-	by := map[string]Row{}
-	for _, t := range tasks {
-		by[S(t, "id")] = t
 	}
 	edges, err := s.ListEdges(cid)
 	if err != nil {
 		return 0, err
 	}
-	keys := map[string]bool{}
-	sup := Rows{}
-	for _, e := range edges {
-		k := S(e, "from_task_id") + "\x00" + S(e, "to_task_id") + "\x00" + S(e, "relation")
-		keys[k] = true
-		if S(e, "relation") == "superseded_by" {
-			sup = append(sup, e)
-		}
-	}
-	repaired := 0
-	changed := true
-	for changed {
-		changed = false
-		incoming := []Row{}
-		for k := range keys {
-			p := strings.Split(k, "\x00")
-			incoming = append(incoming, Row{"from": p[0], "to": p[1], "rel": p[2]})
-		}
-		for _, e := range sup {
-			old := by[S(e, "from_task_id")]
-			rep := by[S(e, "to_task_id")]
-			if old == nil || rep == nil || S(old, "profile") != S(rep, "profile") || (S(old, "profile") != "review" && S(old, "profile") != "plan_review") {
-				continue
-			}
-			for _, x := range incoming {
-				if S(x, "to") != S(old, "id") {
-					continue
-				}
-				rel := S(x, "rel")
-				if rel != "depends_on" && !(rel == "verifies" && S(old, "profile") == "review") {
-					continue
-				}
-				k := S(x, "from") + "\x00" + S(rep, "id") + "\x00" + rel
-				if keys[k] {
-					continue
-				}
-				if er := s.AddEdge(S(x, "from"), S(rep, "id"), cid, rel); er != nil {
-					return repaired, er
-				}
-				keys[k] = true
-				repaired++
-				changed = true
-			}
-		}
-	}
-	if repaired > 0 {
-		c, _ := s.GetCollection(cid)
-		_ = s.Event(S(c, "project_id"), cid, "", "", "REVIEW_LINEAGE_REPAIRED", Row{"edges_added": repaired})
-	}
-	return repaired, nil
+	return s.repairSupersededReviewLineageFromRows(cid, tasks, &edges)
 }
 func (s *Store) ImplementationsMissingPassingReview(cid string) ([]string, error) {
+	// Thin loader over the shared decide core so the scheduler/claim path and the
+	// batched Status path cannot drift (DEC-3db2c25cd9).
 	tasks, err := s.ListTasks(cid)
 	if err != nil {
 		return nil, err
-	}
-	by := map[string]Row{}
-	for _, t := range tasks {
-		by[S(t, "id")] = t
 	}
 	edges, err := s.ListEdges(cid)
 	if err != nil {
 		return nil, err
 	}
-	ver := map[string][]string{}
-	for _, e := range edges {
-		if S(e, "relation") == "verifies" {
-			ver[S(e, "from_task_id")] = append(ver[S(e, "from_task_id")], S(e, "to_task_id"))
-		}
-	}
-	missing := []string{}
-	for _, t := range tasks {
-		if S(t, "profile") != "implement" || S(t, "status") != TaskComplete {
-			continue
-		}
-		cand := append([]string{}, ver[S(t, "id")]...)
-		pid := S(t, "parent_task_id")
-		if pid != "" && S(by[pid], "profile") == "review" {
-			cand = append(cand, pid)
-		}
-		pass := false
-		for _, rid := range cand {
-			r := by[rid]
-			if r != nil && S(r, "status") == TaskComplete && strings.ToLower(strings.TrimSpace(S(M(r, "result"), "verdict"))) == "pass" {
-				pass = true
-				break
-			}
-		}
-		if !pass {
-			missing = append(missing, S(t, "id"))
-		}
-	}
-	return missing, nil
+	return implementationsMissingPassingReviewFromRows(tasks, edges), nil
 }
 func (s *Store) ReconcileCollectionRevisions(cid string) (int, error) {
-	revs, err := s.ListCollectionRevisions(cid, "OPEN")
-	if err != nil || len(revs) == 0 {
+	// Thin loader over the shared decide core (DEC-3db2c25cd9). The wrapper path
+	// re-reads OPEN fresh on the next call, so it ignores the core's in-memory
+	// OPEN-mutation/flip bookkeeping (which the batched Status path uses).
+	open, err := s.ListCollectionRevisions(cid, "OPEN")
+	if err != nil {
 		return 0, err
 	}
 	tasks, err := s.ListTasks(cid)
 	if err != nil {
 		return 0, err
 	}
-	by := map[string]Row{}
-	for _, t := range tasks {
-		by[S(t, "id")] = t
-	}
 	edges, err := s.ListEdges(cid)
 	if err != nil {
 		return 0, err
 	}
-	ver := map[string][]string{}
-	for _, e := range edges {
-		if S(e, "relation") == "verifies" {
-			ver[S(e, "from_task_id")] = append(ver[S(e, "from_task_id")], S(e, "to_task_id"))
-		}
-	}
-	term := map[string]bool{TaskComplete: true, TaskCancelled: true, TaskSuperseded: true}
-	sat := 0
-	for _, rev := range revs {
-		created := S(rev, "created_at")
-		post := Rows{}
-		for _, t := range tasks {
-			if S(t, "created_at") > created {
-				post = append(post, t)
-			}
-		}
-		impl := Rows{}
-		bad := false
-		for _, t := range post {
-			if S(t, "profile") == "implement" {
-				impl = append(impl, t)
-			}
-			if !term[S(t, "status")] {
-				bad = true
-			}
-		}
-		if len(impl) == 0 || bad {
-			continue
-		}
-		completed := Rows{}
-		for _, t := range impl {
-			if S(t, "status") == TaskComplete {
-				completed = append(completed, t)
-			}
-		}
-		if len(completed) == 0 {
-			continue
-		}
-		rids := []string{}
-		all := true
-		for _, im := range completed {
-			passed := ""
-			for _, rid := range ver[S(im, "id")] {
-				r := by[rid]
-				if r != nil && S(r, "status") == TaskComplete && S(r, "created_at") > created && strings.ToLower(strings.TrimSpace(S(M(r, "result"), "verdict"))) == "pass" {
-					passed = rid
-					break
-				}
-			}
-			if passed == "" {
-				all = false
-				break
-			}
-			rids = append(rids, passed)
-		}
-		if !all {
-			continue
-		}
-		now := UTCNow()
-		if er := s.Mutate("UPDATE collection_revisions SET status='SATISFIED',satisfied_at="+SQLLiteral(now)+" WHERE id="+SQLLiteral(S(rev, "id"))+" AND status='OPEN'", "collection "+cid+": satisfy revision "+S(rev, "id")); er != nil {
-			return sat, er
-		}
-		c, _ := s.GetCollection(cid)
-		ids := []string{}
-		for _, t := range completed {
-			ids = append(ids, S(t, "id"))
-		}
-		_ = s.Event(S(c, "project_id"), cid, "", "", "COLLECTION_REVISION_SATISFIED", Row{"revision_id": S(rev, "id"), "implementation_task_ids": ids, "review_task_ids": rids})
-		sat++
-	}
-	return sat, nil
+	sat, _, err := s.reconcileRevisionsFromRows(cid, &open, tasks, edges)
+	return sat, err
 }
 func (s *Store) UpdateCollectionTerminalState(cid string) (string, error) {
 	_, _ = s.RepairSupersededReviewLineage(cid)
@@ -3217,54 +3040,32 @@ func (s *Store) UpdateCollectionTerminalState(cid string) (string, error) {
 		return S(c, "status"), e
 	}
 	open, _ := s.ListCollectionRevisions(cid, "OPEN")
-	successful := map[string]bool{TaskComplete: true, TaskCancelled: true, TaskSuperseded: true}
-	allTerm := true
-	hasComplete := false
-	hasExec := false
-	for _, t := range tasks {
-		st := S(t, "status")
-		if !successful[st] {
-			allTerm = false
-		}
-		if st == TaskComplete {
-			hasComplete = true
-		}
-		if st == TaskRunning || st == TaskVerifying {
-			hasExec = true
-		}
-	}
 	run, _ := s.RunnableTasks(cid, 1)
-	if !hasExec && len(run) == 0 {
+	runnable := len(run) > 0
+	// The terminal decide logic lives in the shared core (DEC-3db2c25cd9) so the
+	// scheduler/claim/delivery/CollectionShow/CollectionRevise callers and the
+	// batched Status path share one implementation. This wrapper keeps the same
+	// conditional probes the inline block used (running-session only when not
+	// already executing and nothing is runnable; critic state only on the
+	// COMPLETE-eligible branch).
+	allTerm, hasComplete, hasExec := collectionTerminalFlags(tasks)
+	runningSession := false
+	if !hasExec && !runnable {
 		if activeSession, sessionErr := s.HasRunningSession(cid); sessionErr == nil && activeSession {
-			hasExec = true
+			runningSession = true
 		}
 	}
-	desired := "BLOCKED"
-	if len(open) > 0 {
-		if hasExec || len(run) > 0 {
-			desired = "RUNNING"
-		}
-	} else if allTerm && hasComplete {
-		c, _ := s.GetCollection(cid)
-		dp := ClassifyDeliveryPolicy(S(c, "objective"))
-		completedImpl := 0
-		for _, t := range tasks {
-			if S(t, "profile") == "implement" && S(t, "status") == TaskComplete {
-				completedImpl++
-			}
-		}
-		missingDelivery := dp.ImplementationRequired && completedImpl == 0
-		mr, _ := s.ImplementationsMissingPassingReview(cid)
-		pp := effectivePlanningPolicy(c)
-		cs, _ := s.CriticRevalidationState(cid)
-		stale := pp.CriticRequired && B(cs, "stale")
-		if !missingDelivery && len(mr) == 0 && !stale {
-			desired = "COMPLETE"
-		}
-	} else if hasExec || len(run) > 0 {
-		desired = "RUNNING"
+	var edges Rows
+	var criticRow Row
+	if len(open) == 0 && allTerm && hasComplete {
+		// Edges are only needed on the COMPLETE-eligible branch, where the core
+		// computes the passing-review-coverage rule (mr); the critic state is read
+		// only here too, matching the reference read footprint.
+		edges, _ = s.ListEdges(cid)
+		criticRow, _ = s.CriticRevalidationState(cid)
 	}
 	c, _ := s.GetCollection(cid)
+	desired := terminalStateForCollection(c, tasks, edges, open, runnable, runningSession, criticRow)
 	if S(c, "status") != desired {
 		if err = s.SetCollectionStatus(cid, desired, desired == "COMPLETE" || desired == "BLOCKED"); err != nil {
 			return "", err

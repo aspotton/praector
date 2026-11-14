@@ -380,12 +380,12 @@ func formatCollectionStatus(c CollectionStatus) {
 	}
 }
 func cmdStatus(args []string) int {
-	p, e := parseArgs(args, map[string]bool{"project": true})
+	p, e := parseArgs(args, map[string]bool{"project": true, "no-reconcile": false, "observed": false})
 	if e != nil {
 		return fail(e)
 	}
 	if len(p.Pos) > 1 {
-		return fail(fmt.Errorf("usage: praector status [TARGET] [--project ID]"))
+		return fail(fmt.Errorf("usage: praector status [TARGET] [--project ID] [--no-reconcile|--observed]"))
 	}
 	svc, e := newService()
 	if e != nil {
@@ -395,7 +395,7 @@ func cmdStatus(args []string) int {
 	if len(p.Pos) > 0 {
 		target = p.Pos[0]
 	}
-	out, e := svc.Status(context.Background(), StatusInput{Target: target, ProjectID: p.str("project")})
+	out, e := svc.Status(context.Background(), StatusInput{Target: target, ProjectID: p.str("project"), NoReconcile: p.bool("no-reconcile") || p.bool("observed")})
 	if e != nil {
 		return fail(e)
 	}

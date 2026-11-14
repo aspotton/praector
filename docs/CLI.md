@@ -55,10 +55,12 @@ Before creating durable work, `praector run` preflights Git, Dolt, Praector itse
 ## Status
 
 ```bash
-praector status [TARGET] [--project PROJECT]
+praector status [TARGET] [--project PROJECT] [--no-reconcile]
 ```
 
 `TARGET` may be a Collection or Task ID. With no target, shows the current Project and its Collections.
+
+By default `status` reconciles collection terminal state, so it may write durable state (superseded-review-lineage repair, revision reconciliation, and status transitions) and create Dolt commits, exactly as before. Pass `--no-reconcile` (alias `--observed`) to render the stored state from a single batched snapshot with zero writes — no lineage repair, no revision satisfy, no status flip, and no `dolt add`/`commit`.
 
 Examples:
 
