@@ -31,6 +31,7 @@ internal/praector/
 ├── mcp_sse.go                SSE stream registry/level/replay wiring (state kept out of the mcp core)
 ├── mcp/                      dependency-light stdlib MCP core + streamable-HTTP/SSE transport
 ├── store.go                  Dolt persistence + graph/state operations
+├── store_status_snapshot.go  batched status read + shared terminal-decision cores
 ├── scheduler.go              execution/retry/recovery/review policy
 ├── policy.go                 deterministic planning/delivery classifier
 ├── envelope.go               Task Envelope/context compiler
@@ -217,6 +218,25 @@ Avoid:
 - provider-specific subprocess details;
 - ad hoc direct SQL when a store operation belongs in `store.go`;
 - asking the model to perform deterministic scheduling/recovery work.
+
+### `internal/praector/store_status_snapshot.go`
+
+Good place for:
+
+- the batched `Store.loadCollectionRows` status read built on `QueryMany`/`queryManyLocked`;
+- the pure status-decision cores (`terminalStateForCollection`,
+  `implementationsMissingPassingReviewFromRows`, `repairSupersededReviewLineageFromRows`,
+  `reconcileRevisionsFromRows`, `criticRevalidationFromRows`) that the cid wrappers in
+  `store.go` delegate to, keeping one decide implementation for both `Service.Status` and
+  the scheduler/claim/delivery/`CollectionShow`/`CollectionRevise` callers;
+- the `reconcileCollectionSnapshot` write-then-decide routine behind `Service.Status`.
+
+Avoid:
+
+- a second copy of the terminal/reconcile/critic decision logic (the cid wrappers must delegate, not fork);
+- merging the two differently-ordered task loaders (`ListTasks` `ORDER BY created_at` vs
+  `materialPlanFingerprintLocked` `ORDER BY created_at,id`);
+- `-b`/`-r jsonl`/BEGIN-transaction changes to the batched read; schema or index changes.
 
 ### `internal/praector/pull_request.go`
 

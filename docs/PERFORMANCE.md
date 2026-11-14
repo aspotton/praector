@@ -7,7 +7,7 @@ It is not release-notes prose: [`../CHANGELOG.md`](../CHANGELOG.md) remains the 
 ## Current status
 
 - Initial performance investigation: **complete**.
-- Code optimization: **Phase 1 landed** (multi-query seam + CLI bootstrap read batching). Phases 2–4 not yet landed.
+- Code optimization: **Phase 1 and Phase 2 landed** (multi-query seam + CLI bootstrap read batching; then collection-snapshot reconciliation for `status`). Phases 3–4 not yet landed.
 - Primary affected surface: `praector status`, CLI startup/bootstrap, terminal-state reconciliation, and idle daemon observability sweeps.
 - Primary conclusion: the dominant cost is **Dolt subprocess churn and repeated loading of the same state**, not slow SQL over the current dataset size.
 - Recommended order:
@@ -333,9 +333,51 @@ keeps issuing its own `queryLocked` reads.
 
 ### Phase 2 — Collection-snapshot reconciliation
 
-State: **planned**
+State: **landed**
 
-Introduce an internal snapshot for a collection containing the information needed by both terminal-state reconciliation and display:
+`praector status` now loads each collection's rows once via a single batched
+`dolt sql -r json -q` read and reconciles the status decision from that snapshot,
+preserving byte-for-byte the default path's durable side effects (superseded-review-lineage
+repair, revision reconciliation, `SetCollectionStatus` flips and commits, and every
+event). This is a read-path refactor, not a behavior change.
+
+- Batched loader: `Store.loadCollectionRows(ids…)` (`internal/praector/store_status_snapshot.go`),
+  built on the existing `QueryMany`/`queryManyLocked` primitive (`internal/praector/store.go`).
+  A single multi-SELECT reads collections, tasks, edges, all + OPEN revisions, latest
+  acceptance, latest PR, the per-collection runnable and running-session existence
+  probes, and the `CRITIC_PLAN_BASELINE` events, each bucketed back per collection in
+  Go. Tasks/edges reuse `ListTasks`/`ListEdges`' `ORDER BY created_at` (per collection)
+  and the existing `result_json → result` parse; they deliberately do **not** reuse
+  `materialPlanFingerprintLocked`'s `ORDER BY created_at,id`, and the two loaders stay
+  separate so the critic `stale` flag cannot flip. Runnable/running-session are per-collection
+  existence booleans with `WHERE` predicates identical to `RunnableTasks`/`HasRunningSession`.
+- Pure decision cores + delegating wrappers (single source of truth): `terminalStateForCollection`,
+  `implementationsMissingPassingReviewFromRows`, `repairSupersededReviewLineageFromRows`,
+  `reconcileRevisionsFromRows`, and `criticRevalidationFromRows` (reusing the existing
+  pure `MaterialPlanFingerprint`/`MaterialPlanFingerprintV021`). The unchanged cid wrappers
+  `UpdateCollectionTerminalState`, `ImplementationsMissingPassingReview`,
+  `RepairSupersededReviewLineage`, `ReconcileCollectionRevisions`, and
+  `CriticRevalidationState` now load-then-call these cores, so the scheduler, claim,
+  delivery-plan, and `CollectionShow`/`CollectionRevise` callers cannot drift from the
+  batched `Service.Status` path.
+- Read-after-write correctness: `reconcileCollectionSnapshot` runs the repair and
+  reconcile cores first (their `AddEdge`/SATISFIED writes refresh the in-memory edges and
+  OPEN-revision buckets), so the terminal core observes the same post-write row set the
+  per-query path would.
+- `collectionStatus` display reads from the same snapshot (`collectionStatusFromSnapshot`),
+  and the project loop no longer re-fetches the collection and re-lists tasks after the reconcile.
+- Opt-in non-reconciling status: `StatusInput.NoReconcile` (CLI `--no-reconcile`, alias
+  `--observed`, default off) renders the stored `collections.status` and the display view
+  from the batched snapshot with zero writes (no lineage repair, no revision satisfy, no
+  status flip, no `dolt add`/`commit`).
+
+The Dolt contract scope is pinned to 2.7.2 (latest 2.7.3 contract-unchanged); the batched
+read introduces no BEGIN/transaction (intra-batch consistency is the OS store lock, the
+documented invariant). The Phase-2 threat-model/external-conformance classifier gates are
+waived via a durable decision — the change touches only local `dolt sql`/`add`/`commit`
+subprocesses and exposes no network/remote/protocol surface — rather than being dropped.
+
+The snapshot contents are:
 
 - collection;
 - tasks;
@@ -344,23 +386,9 @@ Introduce an internal snapshot for a collection containing the information neede
 - all revisions;
 - latest acceptance;
 - latest PR;
-- runnable-task probe;
-- running-session probe;
+- runnable-task probe (existence);
+- running-session probe (existence);
 - relevant critic-baseline events.
-
-Refactor internal helpers to accept preloaded task/edge views rather than reloading them:
-
-- superseded review-lineage repair;
-- revision reconciliation;
-- terminal-state calculation;
-- passing-review coverage;
-- critic revalidation;
-- `collectionStatus`.
-
-Expected outcome:
-
-- a single collection requires a small number of SQL processes rather than dozens;
-- all validators operate on one internally consistent view while the Dolt lock is held.
 
 ### Phase 3 — Idle sweep cooldown
 
@@ -516,7 +544,7 @@ The optimization work is complete when:
 | Multi-query helper | **Landed** | One `dolt sql` per logical read | `QueryMany`/`queryManyLocked` batch N reads into one JSONL process | Read-side only; `{}`/blank → empty; statement-indexed errors |
 | Bootstrap batching | **Landed** | 51 `dolt sql` / 53 dolt / 2.75 s (`project list`, 23 collections) | 3 `dolt sql` / 5 dolt / 0.30 s; bootstrap repair alone 49 → 2 | Cycle + baseline repair outcomes unchanged |
 | Bootstrap batching refinement (Phase 1.1) | **Landed** | Revision-baseline repair issues one `tasks WHERE id IN` read per matching candidate | 0 such reads (satisfied from the batched snapshot); batched task/edge reads now carry a deterministic `ORDER BY` | Clean benchmark; per-candidate `collection_revisions`/`collections` reads retained; repair SET unchanged |
-| Snapshot reconciliation | Planned | 86+ queries single status | Pending | Preserve all terminal-state semantics |
+| Snapshot reconciliation (Phase 2) | **Landed** | ~31 `dolt sql` single collection; ~491 for a no-target project (pre-Phase-1.1) / ~114 (live post-Phase-1.1) | One batched snapshot read per collection: project-wide `status` is a constant **3** `dolt sql` regardless of collection count; single-collection default **6** total (incl. the flip write); `--no-reconcile` **1** read, **0** write | Read-path refactor; terminal-state/revision/coverage/repair semantics byte-identical; opt-in `--no-reconcile` zero-write render |
 | Sweep cooldown | Planned | One sweep per COMPLETE collection per second | Pending | Internal interval first |
 | Targeted indexes | Planned | No collection edge/event-type indexes | Pending | Needs idempotent migration |
 | Persistent/embedded Dolt | Deferred | Not measured | Deferred | Revisit only after batching |
@@ -571,6 +599,44 @@ permutation; and `TestBootstrapCycleRepairDeterministicEmission` asserts the bat
 edge read's `ORDER BY` is present, the surviving edge SET matches the expected repaired
 outcome, and the emitted DELETE order is deterministic. `TestBootstrapBatchedRepairMatchesStandaloneRepair`
 still passes byte-for-byte.
+
+### Phase 2 measured result (clean benchmark)
+
+These are **clean-benchmark** figures measured through the counting fake-Dolt seam
+(`PRAECTOR_FAKE_DOLT_LOG`, the same methodology the "prefer a counting fake-Dolt or
+wrapper seam" note above prescribes), not a live-environment capture. Each figure is the
+number of `dolt sql` subprocesses a single `praector status` launches:
+
+| Command | Before | After |
+| --- | ---: | ---: |
+| project-wide `status` — `dolt sql`, 2 collections | scales with collections | 3 |
+| project-wide `status` — `dolt sql`, 18 collections | scales with collections (~491 pre-Phase-1.1 / ~114 live post-Phase-1.1) | **3** (constant) |
+| single-collection `status COL-…` (reconciles a flip) — `dolt sql` | ~31 | 6 (incl. the status-flip write) |
+| single-collection `status COL-… --no-reconcile` — `dolt sql` | ~31 | 1 |
+| `status --no-reconcile` — `dolt add`/`commit`/writes | performs writes | **0** |
+
+The project-wide read count is now a **constant** independent of the collection count
+(the batched snapshot read plus the per-collection status-flip write are the only SQL;
+the display issues no extra per-collection process). The parity/HEAD/read-count guards
+live in `internal/praector/status_snapshot_test.go`:
+
+- `TestStatusBatchedMatchesReference` / `TestStatusSingleCollectionMatchesReference`: the
+  batched path yields an identical `CollectionStatus` display, identical final table rows
+  and collection status, and an identical event stream versus the reference
+  `UpdateCollectionTerminalState` + `collectionStatus` path, across seeds that include an
+  OPEN revision reconcile flips SATISFIED, a stale critic baseline, a collection with
+  multiple critic tasks, and a collection where repair adds an edge;
+- `TestStatusDefaultFlipsAndNoReconcileLeavesStateProvesZeroWrites`: default status still
+  performs the needed `SetCollectionStatus` flip write, while `--no-reconcile` leaves stored
+  state unchanged with zero write `dolt sql`;
+- `TestStatusReadCountConstantVsCollectionCount` / `TestStatusSingleAndNoReconcileReadCount`:
+  the constant-vs-count and single-collection / `--no-reconcile` read-count figures above;
+- `TestBatchedDocumentShapeAgainstRealDolt`: a real-Dolt 2.7.2 oracle that the batched
+  `dolt sql -r json -q` multi-SELECT document shape (one document per statement, `{}` for an
+  empty mid-batch member) decodes identically to the standalone reads.
+
+`TestSkillCLICommandHelpCoversCommandHelp` and the `serviceOps`/MCP parity tests still pass
+with the new `--no-reconcile` flag and the additive `StatusInput.NoReconcile` field.
 
 ### Live Phase 1.1 captures (live environment)
 

@@ -18,9 +18,9 @@ Register the current Git repository as a Praector project.
 
 Create a collection and execute its evolving work graph.
 `,
-	"status": `Usage: praector status [TARGET] [--project ID]
+	"status": `Usage: praector status [TARGET] [--project ID] [--no-reconcile]
 
-Show project, collection, or task status.
+Show project, collection, or task status. Pass --no-reconcile (alias --observed) to render the stored state without reconciling (zero writes).
 `,
 	"graph": `Usage: praector graph [COLLECTION] [--project ID]
 

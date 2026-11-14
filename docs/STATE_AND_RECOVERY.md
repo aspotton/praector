@@ -257,6 +257,19 @@ A non-zero OpenCode exit is a failed Attempt even if the durable Task is moved b
 
 Collection status is derived from its durable Task graph.
 
+`praector status` reconciles this derivation from a **batched snapshot read**: one
+`dolt sql -r json -q` multi-SELECT (`Store.loadCollectionRows`) loads each Collection's
+collections/tasks/edges/revisions/acceptance/PR/runnable/session/critic-baseline rows once,
+and the shared terminal-decision cores (`terminalStateForCollection` and its peers, which the
+unchanged cid wrappers also call, so no second decision implementation can drift) compute the
+same flip the per-query path would. The default status path keeps byte-identical durable side
+effects — the same superseded-review-lineage `AddEdge` repair, the same revision `SATISFIED`
+reconciliation, the same `SetCollectionStatus` flips, commits, and events — with only fewer read
+subprocesses; after those writes the cores observe the refreshed post-write edge/OPEN-revision
+buckets. The opt-in `praector status --no-reconcile` (alias `--observed`) renders the **stored**
+`collections.status` from the same snapshot with **zero** writes (no repair, no satisfy, no flip,
+no `dolt add`/`commit`). See `docs/PERFORMANCE.md` Phase 2.
+
 ### `COMPLETE`
 
 All Tasks are in successful terminal states (`COMPLETE`, `CANCELLED`, `SUPERSEDED`) and at least one completed work node exists.

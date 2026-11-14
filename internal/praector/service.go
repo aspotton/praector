@@ -300,8 +300,9 @@ func sortedCounts(rows Rows, key func(Row) string) []KV {
 
 // StatusInput is the input for `praector status [TARGET]`.
 type StatusInput struct {
-	Target    string // may be empty, COL-…, or T-…
-	ProjectID string // --project override when Target is not a resource id
+	Target      string // may be empty, COL-…, or T-…
+	ProjectID   string // --project override when Target is not a resource id
+	NoReconcile bool   // --no-reconcile/--observed: render stored state with zero writes
 }
 
 // StatusOutput is the polymorphic typed result for `praector status`.
@@ -320,12 +321,18 @@ type StatusOutput struct {
 func (s *Service) Status(ctx context.Context, in StatusInput) (StatusOutput, error) {
 	target := in.Target
 	if strings.HasPrefix(target, "COL-") {
-		_, _ = s.store.UpdateCollectionTerminalState(target)
-		c, e := s.store.GetCollection(target)
+		snaps, e := s.store.loadCollectionRows([]string{target})
 		if e != nil {
 			return StatusOutput{}, e
 		}
-		cs := s.collectionStatus(c)
+		sn := snaps[target]
+		if sn == nil || sn.collection == nil {
+			return StatusOutput{}, fmt.Errorf("collection not found: %s", target)
+		}
+		if !in.NoReconcile {
+			s.store.reconcileCollectionSnapshot(sn)
+		}
+		cs := s.collectionStatusFromSnapshot(sn.collection, sn)
 		return StatusOutput{Kind: "collection", Collection: &cs}, nil
 	}
 	if strings.HasPrefix(target, "T-") {
@@ -347,14 +354,51 @@ func (s *Service) Status(ctx context.Context, in StatusInput) (StatusOutput, err
 	if e != nil {
 		return StatusOutput{}, e
 	}
+	ids := make([]string, 0, len(cs))
+	for _, c := range cs {
+		ids = append(ids, S(c, "id"))
+	}
+	snaps, e := s.store.loadCollectionRows(ids)
+	if e != nil {
+		return StatusOutput{}, e
+	}
 	out := StatusOutput{Kind: "project", ProjectName: S(project, "name"), ProjectID: S(project, "id")}
 	for _, c := range cs {
-		_, _ = s.store.UpdateCollectionTerminalState(S(c, "id"))
-		fresh, _ := s.store.GetCollection(S(c, "id"))
-		st := s.collectionStatus(fresh)
+		sn := snaps[S(c, "id")]
+		if sn == nil || sn.collection == nil {
+			continue
+		}
+		if !in.NoReconcile {
+			s.store.reconcileCollectionSnapshot(sn)
+		}
+		st := s.collectionStatusFromSnapshot(sn.collection, sn)
 		out.Collections = append(out.Collections, &st)
 	}
 	return out, nil
+}
+
+// collectionStatusFromSnapshot gathers the collection display data from an
+// already-loaded batched snapshot. It performs no store reads and no mutation, so
+// the Status path issues no extra per-collection process for display (the display
+// SATISFIED flips already live in sn.allRevisions via reconcileCollectionSnapshot).
+func (s *Service) collectionStatusFromSnapshot(c Row, sn *collectionSnapshot) CollectionStatus {
+	st := CollectionStatus{
+		ID:        S(c, "id"),
+		Status:    S(c, "status"),
+		Title:     S(c, "title"),
+		Objective: S(c, "objective"),
+		Branch:    firstNonEmpty(S(c, "integration_branch"), "-"),
+	}
+	st.TaskCounts = sortedCounts(sn.tasks, func(t Row) string { return S(t, "status") })
+	for _, t := range sn.tasks {
+		if map[string]bool{TaskFailed: true, TaskRunning: true, TaskWaiting: true, TaskVerifying: true, TaskReady: true, TaskPending: true}[S(t, "status")] {
+			st.Active = append(st.Active, t)
+		}
+	}
+	st.Acceptance = sn.acceptance
+	st.PR = sn.pr
+	st.Revisions = sn.allRevisions
+	return st
 }
 
 // ---------------------------------------------------------------------------

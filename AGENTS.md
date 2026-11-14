@@ -76,8 +76,9 @@ docs/PERFORMANCE.md          performance baselines and query-cost optimization t
 cmd/praector/main.go              native executable entry point
 internal/praector/cli.go          CLI parser and operator commands
 internal/praector/service.go        shared typed domain service layer (CLI/MCP parity seam)
-internal/praector/store.go        Dolt persistence and graph operations
-internal/praector/scheduler.go    deterministic scheduler/executor/recovery
+ internal/praector/store.go        Dolt persistence and graph operations
+ internal/praector/store_status_snapshot.go  batched status read + shared terminal-decision cores
+ internal/praector/scheduler.go    deterministic scheduler/executor/recovery
 internal/praector/policy.go       deterministic pre-write risk/gate classifier
 internal/praector/mcp_server.go   MCP tool/resource bridge over the shared service layer
 internal/praector/mcp_sse.go      SSE stream registry/level/replay wiring (stream state kept out of the mcp core)
