@@ -1150,6 +1150,44 @@ func (s *Store) materialPlanFingerprintLocked(cid, obj string, legacy bool) (str
 	}
 	return MaterialPlanFingerprint(obj, t, e, legacy), nil
 }
+
+// generationCoordinatorTitles is the SINGLE named source of truth for the
+// coordinator titles that create a Collection generation. The store claim-time
+// preflight floor (preflightFloorAllowsClaimLocked) and the scheduler gate-free
+// staging floor (enforcePlanningPolicy) must resolve "which coordinator owns this
+// generation" from this one list so the two layers cannot drift: a coordinator
+// with any other title (attention, critic/research revalidation, delivery-policy
+// repair) is a within-generation helper that neither creates a generation nor
+// moves the anchor. It deliberately owns ONLY the title SET: every consuming site
+// keeps its own status conditions, and selectGenerationCoordinator (scheduler.go)
+// is a deliberately stricter variant (it also requires a stable generation state)
+// and must never be merged with this predicate.
+var generationCoordinatorTitles = []string{"Initial coordination", "Acceptance revision"}
+
+// generationCoordinatorTitlePredicate builds the SQL WHERE fragment that matches a
+// coordinator task whose title creates a generation. It is the store/SQL form of
+// the single named generation-title source and must stay byte-identical to the
+// inline clause it replaces (an OR of title equalities over generationCoordinatorTitles).
+func generationCoordinatorTitlePredicate() string {
+	parts := make([]string, len(generationCoordinatorTitles))
+	for i, title := range generationCoordinatorTitles {
+		parts[i] = "title=" + SQLLiteral(title)
+	}
+	return "(" + strings.Join(parts, " OR ") + ")"
+}
+
+// isGenerationCoordinatorTitle is the Go form of the single named generation-title
+// source (generationCoordinatorTitles), used by scheduler identity predicates that
+// evaluate a coordinator title in memory rather than in SQL.
+func isGenerationCoordinatorTitle(title string) bool {
+	for _, t := range generationCoordinatorTitles {
+		if t == title {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) CriticRevalidationState(cid string) (Row, error) {
 	tasks, err := s.ListTasks(cid)
 	if err != nil {
@@ -2321,7 +2359,7 @@ func (s *Store) preflightFloorAllowsClaimLocked(task Row, col Row) (bool, error)
 		// checks elsewhere, so the floor adds no hold here.
 		return true, nil
 	}
-	coords, err := s.queryLocked("SELECT id FROM tasks WHERE collection_id=" + SQLLiteral(S(task, "collection_id")) + " AND profile='coordinator' AND status NOT IN ('CANCELLED','SUPERSEDED') AND (title='Initial coordination' OR title='Acceptance revision') ORDER BY created_at,id")
+	coords, err := s.queryLocked("SELECT id FROM tasks WHERE collection_id=" + SQLLiteral(S(task, "collection_id")) + " AND profile='coordinator' AND status NOT IN ('CANCELLED','SUPERSEDED') AND " + generationCoordinatorTitlePredicate() + " ORDER BY created_at,id")
 	if err != nil {
 		return false, err
 	}

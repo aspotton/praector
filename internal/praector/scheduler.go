@@ -501,7 +501,11 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 			if policy.ResearchRequired && st == TaskComplete {
 				stableGenerationState = true
 			}
-			if S(rows[i], "profile") == "coordinator" && (S(rows[i], "title") == "Initial coordination" || S(rows[i], "title") == "Acceptance revision") && stableGenerationState {
+			// Deliberately stricter than the shared claim/staging floor: it resolves the
+			// generation-title SET through the single named isGenerationCoordinatorTitle
+			// helper, but additionally requires a stable generation state, so it stays a
+			// separate stricter variant and is never merged with the floor predicate.
+			if S(rows[i], "profile") == "coordinator" && isGenerationCoordinatorTitle(S(rows[i], "title")) && stableGenerationState {
 				return rows[i]
 			}
 		}
@@ -730,7 +734,7 @@ func (s *Scheduler) enforcePlanningPolicy(collectionID string) (bool, error) {
 		var floorCoordinator Row
 		for i := len(active) - 1; i >= 0; i-- {
 			st := S(active[i], "status")
-			if S(active[i], "profile") == "coordinator" && st != TaskCancelled && st != TaskSuperseded && (S(active[i], "title") == "Initial coordination" || S(active[i], "title") == "Acceptance revision") {
+			if S(active[i], "profile") == "coordinator" && st != TaskCancelled && st != TaskSuperseded && isGenerationCoordinatorTitle(S(active[i], "title")) {
 				floorCoordinator = active[i]
 				break
 			}
@@ -1490,6 +1494,250 @@ func (s *Scheduler) observeDirectiveTraceabilityGaps(collectionID string, consum
 	}
 }
 
+// stuckFloorRefusalThreshold is the number of floor-held refusals observed for the
+// same task within one no-graph-movement window before the stuck-floor liveness rule
+// raises a single non-blocking Coordinator attention. RunnableTasks re-attempts a
+// floor-held READY implement on every daemon poll cycle (it filters only on status +
+// dependency completion, never on the claim floor), so a permanently-held task emits a
+// *_FLOOR_HELD label each cycle. 3 is a small, conservative multiple of that cadence:
+// it ignores a one- or two-cycle transient (a prerequisite completing, a preflight
+// just staged) without waiting so long that a genuine floor-predicate disagreement
+// (the generation-anchor mismatch shape) keeps looking healthy to every existing
+// liveness mechanism. It is an internal constant by design: there is NO config knob,
+// CLI flag, or schema column for it.
+const stuckFloorRefusalThreshold = 3
+
+// stuckFloorNonMovementEvents are scheduler-internal labels that must NOT count as
+// graph movement in the stuck-floor liveness predicate. A floor-held READY implement
+// re-emits a PREFLIGHT_FLOOR_HELD / PLAN_REVIEW_FLOOR_HELD label every poll cycle, so
+// if those label events (or the COORDINATOR_ATTENTION_REQUESTED / STUCK_FLOOR_ATTENTION
+// events this rule itself raises) were treated as movement, the "no graph movement
+// since the last refusal" gate could never fire — the exact self-catch failure this
+// rule exists to prevent. Every OTHER event (a real task status transition, a
+// TASK_CREATED, an integration or result write) IS graph movement and suppresses the
+// rule, which also makes a successful later claim (task status -> RUNNING) reset it.
+var stuckFloorNonMovementEvents = map[string]bool{
+	"PREFLIGHT_FLOOR_HELD":            true,
+	"PLAN_REVIEW_FLOOR_HELD":          true,
+	"COORDINATOR_ATTENTION_REQUESTED": true,
+	"STUCK_FLOOR_ATTENTION":           true,
+}
+
+// stuckFloorStuckStatuses are task states that mean the graph may still move on its
+// own (active or pending work), so the per-task rule must not fire.
+var stuckFloorStuckStatuses = map[string]bool{
+	TaskPending: true, TaskReady: true, TaskRunning: true, TaskWaiting: true, TaskVerifying: true,
+}
+
+// stuckFloorActiveAttentionStatuses are the states in which a "Coordinator attention"
+// coordinator is still an outstanding graph shaper, so a stuck condition is already
+// being handled and the rule must not stack another attention on top of it (storm guard).
+var stuckFloorActiveAttentionStatuses = map[string]bool{
+	TaskPending: true, TaskReady: true, TaskRunning: true, TaskWaiting: true, TaskVerifying: true,
+}
+
+// observeStuckFloors is the scheduler-side stuck-floor liveness sweep. It runs from
+// reconcileCollection (both RunCollection and the Daemon loop, and the Daemon reconciles
+// BLOCKED collections too), so a floor-class bug that leaves a READY implement
+// permanently held or a Collection permanently BLOCKED with no active work surfaces as
+// exactly one non-blocking Coordinator attention instead of silently repeating an
+// identical refusal forever while crash recovery (RUNNING attempts) and attempt budgets
+// (FAILED tasks) both stay silent. It is keyed off the *_FLOOR_HELD labels and gated on
+// gate coherence, so pre-cutoff and policy-required collections are byte-identical by
+// construction (those modes never emit the labels and never reach the coherent branches).
+// It never fails reconciliation: every durable error is tolerated silently.
+func (s *Scheduler) observeStuckFloors(collectionID string) {
+	if s.Store == nil {
+		return
+	}
+	c, err := s.Store.GetCollection(collectionID)
+	if err != nil || !planningGateCoherent(c) {
+		return
+	}
+	tasks, err := s.Store.ListTasks(collectionID)
+	if err != nil {
+		return
+	}
+	fp, err := s.materialFingerprint(c, tasks, false)
+	if err != nil {
+		return
+	}
+	s.observeStuckFloorHolds(c, tasks, fp)
+	s.observeStuckCollectionBlock(c, tasks, fp)
+}
+
+// observeStuckFloorHolds raises a single deduplicated Coordinator attention for a
+// READY implement that has been floor-refused repeatedly with no graph movement and no
+// chance of the answer changing (no prerequisite RUNNING/WAITING, no movement since the
+// last refusal). It mirrors the non-blocking attention call shape at the integration-
+// failed and task-failed sites but drives the movement check through ListEvents with the
+// last floor-held event's (created_at,id) exclusive cursor, never a bounded tail.
+func (s *Scheduler) observeStuckFloorHolds(c Row, tasks Rows, fp string) {
+	pid, cid := S(c, "project_id"), S(c, "id")
+	for _, t := range tasks {
+		if S(t, "profile") != "implement" || S(t, "status") != TaskReady {
+			continue
+		}
+		tid := S(t, "id")
+		last, heldCount, holdKind, ok := s.stuckFloorLastRefusal(pid, cid, tid)
+		if !ok || heldCount < stuckFloorRefusalThreshold {
+			continue
+		}
+		// A prerequisite or a blocking parent that is RUNNING/WAITING means the graph
+		// may still move; a legitimate wait is not a stuck floor.
+		if s.stuckFloorPrereqActive(t) {
+			continue
+		}
+		// Any non-label event after the last refusal is graph movement; it suppresses
+		// the rule and a successful later claim (status -> RUNNING) resets the window.
+		if s.stuckFloorMovedSince(pid, cid, last) {
+			continue
+		}
+		// Dedup key is (task, material-plan fingerprint) so a genuinely stuck graph
+		// raises attention once and a real change re-arms it. An outstanding attention
+		// is already handling the condition (the attention task itself changes the
+		// fingerprint, so the marker alone would re-arm on the next cycle).
+		if s.stuckFloorAttentionRaised(pid, cid, tid, fp) || s.stuckFloorAttentionOutstanding(tasks) {
+			continue
+		}
+		reason := "Implement " + tid + " is held by the artifact " + holdKind +
+			" and has been refused repeatedly with no graph movement since the last refusal; the floor predicate may be disagreeing with the graph."
+		s.raiseStuckFloorAttention(pid, cid, tid, fp, holdKind, tid, reason)
+	}
+}
+
+// observeStuckCollectionBlock is the collection-level twin: a Collection that is
+// BLOCKED yet whose graph contains no nonterminal (or blocking) task can never move on
+// its own, so it is flagged once. Per decision DEC-33729a5439 the root cause of the
+// BLOCKED-with-a-passing-review exemplar (a missing verifies edge auto-carry) is
+// DEFERRED; this only DETECTS the stuck collection via the same fingerprint dedup. It
+// must not relax the independent-passing-review coverage rule.
+func (s *Scheduler) observeStuckCollectionBlock(c Row, tasks Rows, fp string) {
+	if S(c, "status") != "BLOCKED" || s.stuckFloorAttentionOutstanding(tasks) {
+		return
+	}
+	pid, cid := S(c, "project_id"), S(c, "id")
+	caller := ""
+	for _, t := range tasks {
+		if stuckFloorStuckStatuses[S(t, "status")] {
+			return // active/pending work exists; the graph may still move
+		}
+		if caller == "" && S(t, "profile") != "coordinator" && S(t, "status") == TaskComplete {
+			caller = S(t, "id") // a concrete non-coordinator COMPLETE task to anchor the attention
+		}
+	}
+	if caller == "" {
+		return // RequestCoordinatorAttention rejects a coordinator caller; need a concrete non-coordinator task
+	}
+	if s.stuckFloorAttentionRaised(pid, cid, "", fp) {
+		return
+	}
+	reason := "Collection " + cid + " is BLOCKED but its graph contains no nonterminal or blocking task, so no graph movement can occur; it may be stuck on a recovery or floor-predicate bug."
+	s.raiseStuckFloorAttention(pid, cid, "", fp, "collection_block", caller, reason)
+}
+
+// raiseStuckFloorAttention emits the durable STUCK_FLOOR_ATTENTION marker (the dedup
+// record keyed to the graph-state fingerprint) and requests a single NON-blocking
+// Coordinator attention. It tolerates the RequestCoordinatorAttention error (task/depth
+// caps) WITHOUT emitting a marker or crashing reconciliation, so the sweep can retry on
+// a later cycle rather than falsely satisfying its own dedup on a no-op.
+func (s *Scheduler) raiseStuckFloorAttention(pid, cid, taskID, fp, holdKind, callerID, reason string) {
+	if _, _, err := s.Store.RequestCoordinatorAttention(callerID, reason, false, s.projectLimits(pid)); err != nil {
+		return
+	}
+	_ = s.Store.Event(pid, cid, taskID, "", "STUCK_FLOOR_ATTENTION", Row{"fingerprint": fp, "hold_kind": holdKind})
+}
+
+// stuckFloorLastRefusal resolves the most recent floor-held label for the task by
+// (created_at,id) ordering plus the total label count and hold kind. It is the anchor
+// whose exact created_at string is fed back to ListEvents as the exclusive cursor
+// (research R1/R2), so no raw datetime-string equality is introduced.
+func (s *Scheduler) stuckFloorLastRefusal(pid, cid, tid string) (lastEvent Row, count int, holdKind string, ok bool) {
+	rows, err := s.Store.Query("SELECT id,created_at,event_type FROM events WHERE project_id=" + SQLLiteral(pid) + " AND collection_id=" + SQLLiteral(cid) + " AND task_id=" + SQLLiteral(tid) + " AND event_type IN ('PREFLIGHT_FLOOR_HELD','PLAN_REVIEW_FLOOR_HELD') ORDER BY created_at,id")
+	if err != nil || len(rows) == 0 {
+		return nil, 0, "", false
+	}
+	last := rows[len(rows)-1]
+	return last, len(rows), strings.TrimSuffix(S(last, "event_type"), "_HELD"), true
+}
+
+// stuckFloorMovedSince reports whether any non-label event occurred strictly after the
+// anchor floor-held event, using its (created_at,id) exclusive cursor via ListEvents.
+func (s *Scheduler) stuckFloorMovedSince(pid, cid string, anchor Row) bool {
+	if anchor == nil {
+		return true
+	}
+	after, err := s.Store.ListEvents(pid, cid, "", "", S(anchor, "created_at"), S(anchor, "id"), 0)
+	if err != nil {
+		return true
+	}
+	for _, ev := range after {
+		if !stuckFloorNonMovementEvents[S(ev, "event_type")] {
+			return true
+		}
+	}
+	return false
+}
+
+// stuckFloorPrereqActive reuses the blocking-parent RUNNING check plus WAITING status:
+// a hard dependency or a blocking parent that is not terminal means the graph may move.
+func (s *Scheduler) stuckFloorPrereqActive(task Row) bool {
+	deps, err := s.Store.Dependencies(S(task, "id"))
+	if err == nil {
+		for _, dep := range deps {
+			if st := S(dep, "status"); st == TaskRunning || st == TaskWaiting {
+				return true
+			}
+		}
+	}
+	if parentID := S(task, "parent_task_id"); parentID != "" {
+		if parent, err := s.Store.GetTask(parentID); err == nil {
+			if st := S(parent, "status"); st == TaskRunning || st == TaskWaiting {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// stuckFloorAttentionRaised reports whether a STUCK_FLOOR_ATTENTION marker already
+// exists for this scope at the CURRENT material-plan fingerprint. Matching on the
+// fingerprint (the same graph state the no-movement gate uses) means a stuck graph fires
+// once and a genuine change (a new fingerprint) re-arms the rule.
+func (s *Scheduler) stuckFloorAttentionRaised(pid, cid, tid, fp string) bool {
+	evts, err := s.Store.ListEvents(pid, cid, tid, "STUCK_FLOOR_ATTENTION", "", "", 0)
+	if err != nil {
+		return false
+	}
+	for _, ev := range evts {
+		if S(JSONMap(S(ev, "payload_json")), "fingerprint") == fp {
+			return true
+		}
+	}
+	return false
+}
+
+// stuckFloorAttentionOutstanding reports whether a "Coordinator attention" coordinator
+// is already nonterminal (running / ready / waiting). That attention is itself the
+// advisory graph-shaping response to a stuck state; stacking another every cycle would
+// storm, so the sweep waits for the coordinator to be handled.
+func (s *Scheduler) stuckFloorAttentionOutstanding(tasks Rows) bool {
+	for _, t := range tasks {
+		if S(t, "profile") == "coordinator" && S(t, "title") == "Coordinator attention" && stuckFloorActiveAttentionStatuses[S(t, "status")] {
+			return true
+		}
+	}
+	return false
+}
+
+// projectLimits resolves a project's durable limits for RequestCoordinatorAttention.
+func (s *Scheduler) projectLimits(pid string) Limits {
+	if p, err := s.Store.GetProject(pid); err == nil {
+		return s.limits(p)
+	}
+	return DefaultLimits()
+}
+
 func (s *Scheduler) ensureReview(project, collection, impl Row) error {
 	var failedParentReview Row
 	if parentID := S(impl, "parent_task_id"); parentID != "" {
@@ -1999,6 +2247,11 @@ func (s *Scheduler) reconcileCollection(collectionID string) (string, error) {
 	if _, err = s.Store.RefreshWaitingTasks(collectionID); err != nil {
 		return "", err
 	}
+	// Stuck-floor liveness: surface a permanently-held READY implement or a permanently
+	// BLOCKED no-work Collection as one non-blocking Coordinator attention. It never
+	// fails reconciliation (all durable errors are tolerated internally) so a stuck graph
+	// escalates instead of looking healthy while every other liveness mechanism stays silent.
+	s.observeStuckFloors(collectionID)
 	return s.Store.UpdateCollectionTerminalState(collectionID)
 }
 
