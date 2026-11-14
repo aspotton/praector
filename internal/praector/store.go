@@ -2295,8 +2295,18 @@ func (s *Store) planReviewFloorAllowsClaimLocked(task Row) (bool, error) {
 // explore AND critic have EACH reached a terminal COMPLETE status. Terminal
 // completion only: it deliberately does NOT invent a critic pass/fail verdict
 // (critic output is advisory guidance, not a gate verdict). "This generation" is
-// the same requested_by_task_id-of-the-latest-non-cancelled/non-superseded-
-// coordinator lookup the scheduler staging floor uses, so both layers agree. It is
+// resolved by the SAME title-based generation predicate the scheduler staging
+// floor uses (scheduler.go gateFree floorCoordinator): the latest coordinator
+// whose title is a generation-creating title ('Initial coordination' or
+// 'Acceptance revision'), excluding CANCELLED/SUPERSEDED. Every other coordinator
+// title (attention, critic/research revalidation, delivery-policy repair) is a
+// within-generation helper that neither creates a generation nor moves this
+// anchor, so the claim floor and the staging floor agree byte-for-byte on which
+// coordinator owns the generation. Because the per-profile check below is a
+// terminal-COMPLETE-only test, a FAILED (terminal non-COMPLETE) generation gate
+// does NOT self-release the floor: release happens only via the failed task's own
+// retry-then-coordinator-attention path, the fail-review repair lineage for plan
+// reviews, or an operator collection revision. It is
 // a mode branch that the caller ANDs with the plan-review floor, NOT a second
 // parallel gate, and is scoped to GATE-FREE collections: any collection whose
 // classifier already required a gate keeps the existing policy-driven claim checks
@@ -2311,7 +2321,7 @@ func (s *Store) preflightFloorAllowsClaimLocked(task Row, col Row) (bool, error)
 		// checks elsewhere, so the floor adds no hold here.
 		return true, nil
 	}
-	coords, err := s.queryLocked("SELECT id FROM tasks WHERE collection_id=" + SQLLiteral(S(task, "collection_id")) + " AND profile='coordinator' AND status NOT IN ('CANCELLED','SUPERSEDED') ORDER BY created_at,id")
+	coords, err := s.queryLocked("SELECT id FROM tasks WHERE collection_id=" + SQLLiteral(S(task, "collection_id")) + " AND profile='coordinator' AND status NOT IN ('CANCELLED','SUPERSEDED') AND (title='Initial coordination' OR title='Acceptance revision') ORDER BY created_at,id")
 	if err != nil {
 		return false, err
 	}
