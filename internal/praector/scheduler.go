@@ -1521,6 +1521,7 @@ var stuckFloorNonMovementEvents = map[string]bool{
 	"PLAN_REVIEW_FLOOR_HELD":          true,
 	"COORDINATOR_ATTENTION_REQUESTED": true,
 	"STUCK_FLOOR_ATTENTION":           true,
+	acceptanceReadinessEvent:          true,
 }
 
 // stuckFloorStuckStatuses are task states that mean the graph may still move on its
@@ -1646,6 +1647,66 @@ func (s *Scheduler) raiseStuckFloorAttention(pid, cid, taskID, fp, holdKind, cal
 		return
 	}
 	_ = s.Store.Event(pid, cid, taskID, "", "STUCK_FLOOR_ATTENTION", Row{"fingerprint": fp, "hold_kind": holdKind})
+}
+
+// acceptanceReadinessEvent is the durable dedup marker for the acceptance-readiness
+// observability sweep. Like the stuck-floor twin it is a scheduler-internal label and is
+// listed in stuckFloorNonMovementEvents so its own emission never masquerades as graph
+// movement for that sweep.
+const acceptanceReadinessEvent = "ACCEPTANCE_READINESS_WOULD_BLOCK"
+
+// observeAcceptanceReadiness is the acceptance-readiness observability twin of
+// observeStuckFloors. The reconcile loop only visits RUNNING/BLOCKED collections, so a
+// Collection that has already reached COMPLETE but whose graph cannot actually be accepted
+// is invisible until the operator runs `collection accept` and discovers it. This sweep
+// runs the SAME read-only acceptance decision checks the accept/PR path applies (via
+// acceptanceBlockReason) against a COMPLETE Collection and, when one would refuse it,
+// records exactly ONE deduplicated ACCEPTANCE_READINESS_WOULD_BLOCK event naming the first
+// would-block reason. It is observability ONLY: it never blocks, gates, pre-empts,
+// auto-accepts, or auto-merges; it never calls UpdateCollectionTerminalState (so a COMPLETE
+// Collection is never regressed to BLOCKED and no revision is satisfied); and it makes no
+// Git fast-forward probe (so it cannot mistake a git error for true divergence — the
+// fast-forward state remains the accept-time AcceptancePlan's authoritative call, per
+// research C-isancestor-error-conflation). Dedup is keyed on the current material-plan
+// fingerprint, so an unchanged Collection reports once and any real graph change re-arms it.
+func (s *Scheduler) observeAcceptanceReadiness(collectionID string) {
+	if s.Store == nil {
+		return
+	}
+	c, err := s.Store.GetCollection(collectionID)
+	if err != nil || S(c, "status") != "COMPLETE" {
+		return
+	}
+	tasks, err := s.Store.ListTasks(collectionID)
+	if err != nil {
+		return
+	}
+	fp, err := s.materialFingerprint(c, tasks, false)
+	if err != nil {
+		return
+	}
+	// recordEmptyHarvest=false keeps the predicate purely read-only (no audit-event write);
+	// no Git-derived config candidates are passed, matching the no-workspace-access caller
+	// path and leaving the deterministic store validators as the would-block source.
+	if _, e := acceptanceBlockReason(s.Store, c, S(c, "status"), false); e != nil {
+		s.raiseAcceptanceReadinessWarning(S(c, "project_id"), collectionID, fp, e.Error())
+	}
+}
+
+// raiseAcceptanceReadinessWarning emits the single deduplicated would-block marker for the
+// collection at the current fingerprint. A prior marker at the same fingerprint suppresses
+// re-emission; a genuine graph change (new fingerprint) re-arms it, matching the stuck-floor
+// dedup precedent.
+func (s *Scheduler) raiseAcceptanceReadinessWarning(pid, cid, fp, reason string) {
+	evts, err := s.Store.ListEvents(pid, cid, "", acceptanceReadinessEvent, "", "", 0)
+	if err == nil {
+		for _, ev := range evts {
+			if S(JSONMap(S(ev, "payload_json")), "fingerprint") == fp {
+				return
+			}
+		}
+	}
+	_ = s.Store.Event(pid, cid, "", "", acceptanceReadinessEvent, Row{"fingerprint": fp, "reason": reason})
 }
 
 // stuckFloorLastRefusal resolves the most recent floor-held label for the task by
@@ -2450,6 +2511,11 @@ func (s *Scheduler) Daemon(once bool, poll time.Duration) error {
 		}
 		for _, c := range collections {
 			if S(c, "status") != "RUNNING" && S(c, "status") != "BLOCKED" {
+				if S(c, "status") == "COMPLETE" {
+					// Acceptance-readiness observability: the reconcile pass only reaches
+					// RUNNING/BLOCKED Collections, so a COMPLETE one is swept here instead.
+					s.observeAcceptanceReadiness(S(c, "id"))
+				}
 				continue
 			}
 			_ = s.reconcileCollectionSafely(S(c, "id"))

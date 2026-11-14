@@ -840,24 +840,46 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 	if e != nil {
 		return nil, nil, e
 	}
+	tasks, e := acceptanceBlockReason(store, c, state, true, derivedCandidates...)
+	if e != nil {
+		return nil, nil, e
+	}
+	return c, tasks, nil
+}
+
+// acceptanceBlockReason is the PURE READ-ONLY half of acceptance validation: it runs
+// every durable decision check the accept/PR path applies (critic staleness, explicit
+// review verdict presence, directive traceability, review impact enumeration, candidate
+// decisions, and the ImplementationsMissingPassingReview coverage rule) WITHOUT calling
+// UpdateCollectionTerminalState. That prologue is deliberately kept out of this predicate
+// so a non-blocking observability sweep (Scheduler.observeAcceptanceReadiness) can run the
+// EXACT SAME checks on an already-COMPLETE Collection without regressing it to BLOCKED,
+// satisfying a revision, or pre-empting acceptance. validateCollectionForAcceptance keeps
+// the side-effecting prologue and forwards state (the value UpdateCollectionTerminalState
+// returned) plus recordEmptyHarvest=true, so the real accept/PR path is byte-identical to
+// before this split: same checks, same first-failure short-circuit, same error text, and
+// the same empty-harvest audit event. When recordEmptyHarvest is false (the sweep path) no
+// durable write is made at all. It returns (tasks, nil) when acceptance is clear, or
+// (nil, err) whose text is the would-block reason, naming the first blocking check.
+func acceptanceBlockReason(store *Store, c Row, state string, recordEmptyHarvest bool, derivedCandidates ...DerivedConfigCandidate) (Rows, error) {
 	critic, _ := store.CriticRevalidationState(S(c, "id"))
 	policy := effectivePlanningPolicy(c)
 	if state != TaskComplete && state != "COMPLETE" {
 		if policy.CriticRequired && B(critic, "stale") {
-			return nil, nil, fmt.Errorf("Collection %s has a stale required critic: sealed material-plan fingerprint %s != current %s. Re-run orchestration to complete critic revalidation before acceptance.", S(c, "id"), S(critic, "sealed_fingerprint"), S(critic, "current_material_plan_fingerprint"))
+			return nil, fmt.Errorf("Collection %s has a stale required critic: sealed material-plan fingerprint %s != current %s. Re-run orchestration to complete critic revalidation before acceptance.", S(c, "id"), S(critic, "sealed_fingerprint"), S(critic, "current_material_plan_fingerprint"))
 		}
-		return nil, nil, fmt.Errorf("Collection %s is %s, not COMPLETE", S(c, "id"), state)
+		return nil, fmt.Errorf("Collection %s is %s, not COMPLETE", S(c, "id"), state)
 	}
 	if policy.CriticRequired && B(critic, "stale") {
-		return nil, nil, fmt.Errorf("Collection %s has a stale required critic; acceptance requires a fresh critic seal.", S(c, "id"))
+		return nil, fmt.Errorf("Collection %s has a stale required critic; acceptance requires a fresh critic seal.", S(c, "id"))
 	}
 	tasks, e := store.ListTasks(S(c, "id"))
 	if e != nil {
-		return nil, nil, e
+		return nil, e
 	}
 	edges, e := store.ListEdges(S(c, "id"))
 	if e != nil {
-		return nil, nil, e
+		return nil, e
 	}
 	by := map[string]Row{}
 	for _, t := range tasks {
@@ -868,7 +890,7 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 				if v == "" {
 					v = "<missing>"
 				}
-				return nil, nil, fmt.Errorf("Review %s is COMPLETE but has verdict=%s; acceptance requires an explicit pass/fail verdict", S(t, "id"), v)
+				return nil, fmt.Errorf("Review %s is COMPLETE but has verdict=%s; acceptance requires an explicit pass/fail verdict", S(t, "id"), v)
 			}
 		}
 	}
@@ -880,7 +902,7 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 	}
 	legacyDecisions, e := store.ListDecisions(S(c, "project_id"), S(c, "id"))
 	if e != nil {
-		return nil, nil, e
+		return nil, e
 	}
 	legacyIDs := LegacyGateTraceabilityExceptionIDs(legacyDecisions, S(c, "id"))
 	// Per-consumer dedup for the empty-harvest event so repeated acceptance
@@ -920,7 +942,7 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 		if ancestors, e := store.DirectiveAncestors(S(t, "id")); e == nil {
 			if directives := InheritedDirectives(ancestors); len(directives) > 0 {
 				if e := ValidateDirectiveTraceability(M(t, "result"), directives, true, legacyIDs); e != nil {
-					return nil, nil, fmt.Errorf("Collection %s cannot be accepted: %w", S(c, "id"), e)
+					return nil, fmt.Errorf("Collection %s cannot be accepted: %w", S(c, "id"), e)
 				}
 			} else if len(ancestors) > 0 && !harvestedConsumers[S(t, "id")] {
 				// A directive-bearing ancestor that yielded zero harvestable
@@ -928,15 +950,21 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 				// empty harvest is auditable rather than silent. Observability
 				// only: acceptance is neither blocked nor newly gated. A
 				// genuinely directive-free lineage (no ancestor) stays silent.
-				ids := []string{}
-				for _, ancestor := range ancestors {
-					ids = append(ids, S(ancestor, "id"))
+				// The non-blocking readiness sweep calls with
+				// recordEmptyHarvest=false and stays purely read-only; it still
+				// marks the consumer seen so its in-call behavior matches the
+				// accept path exactly.
+				if recordEmptyHarvest {
+					ids := []string{}
+					for _, ancestor := range ancestors {
+						ids = append(ids, S(ancestor, "id"))
+					}
+					_ = store.RecordEmptyDirectiveHarvest(S(c, "project_id"), S(c, "id"), S(t, "id"), ids)
 				}
-				_ = store.RecordEmptyDirectiveHarvest(S(c, "project_id"), S(c, "id"), S(t, "id"), ids)
 				harvestedConsumers[S(t, "id")] = true
 			}
 		} else {
-			return nil, nil, e
+			return nil, e
 		}
 		if S(t, "profile") == "review" {
 			candidates := derivedCandidates
@@ -944,7 +972,7 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 				candidates = nil
 			}
 			if e := ValidateReviewImpactEnumeration(M(t, "result"), legacyIDs, candidates); e != nil {
-				return nil, nil, fmt.Errorf("Collection %s cannot be accepted: %w", S(c, "id"), e)
+				return nil, fmt.Errorf("Collection %s cannot be accepted: %w", S(c, "id"), e)
 			}
 			if decisionIDs := CandidateDecisionIDs(M(t, "result")); len(decisionIDs) > 0 {
 				known := map[string]bool{}
@@ -953,7 +981,7 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 				}
 				for _, decisionID := range decisionIDs {
 					if !known[decisionID] {
-						return nil, nil, fmt.Errorf("Collection %s cannot be accepted: candidate disposition decision_id %s is not a durable decision in this Collection", S(c, "id"), decisionID)
+						return nil, fmt.Errorf("Collection %s cannot be accepted: candidate disposition decision_id %s is not a durable decision in this Collection", S(c, "id"), decisionID)
 					}
 				}
 			}
@@ -977,10 +1005,10 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 			}
 		}
 		if !passed {
-			return nil, nil, fmt.Errorf("Implementation %s has no completed independent review with verdict=pass", S(t, "id"))
+			return nil, fmt.Errorf("Implementation %s has no completed independent review with verdict=pass", S(t, "id"))
 		}
 	}
-	return c, tasks, nil
+	return tasks, nil
 }
 
 func cmdCollection(args []string) int {
