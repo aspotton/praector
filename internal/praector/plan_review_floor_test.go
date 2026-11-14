@@ -40,6 +40,25 @@ func completePlanReview(t *testing.T, s *Store, review Row, verdict string) {
 	}
 }
 
+// completeGenerationPreflights marks every explore and critic task authored for
+// the coordinator generation COMPLETE. The preflight symmetry floor holds an
+// implement until this generation's explore AND critic each reach terminal
+// COMPLETE, so a plan-review-floor release test must also retire the preflight.
+func completeGenerationPreflights(t *testing.T, s *Store, c, coord Row) {
+	t.Helper()
+	rows, err := s.ListTasks(S(c, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if (S(r, "profile") == "explore" || S(r, "profile") == "critic") && S(r, "requested_by_task_id") == S(coord, "id") {
+			if err := s.Mutate("UPDATE tasks SET status="+SQLLiteral(TaskComplete)+",updated_at="+SQLLiteral(UTCNow())+" WHERE id="+SQLLiteral(S(r, "id")), "complete generation preflight "+S(r, "profile")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
 func floorEventsFor(t *testing.T, s *Store, c, task Row, evType string) Rows {
 	t.Helper()
 	evts, err := s.ListEvents(S(c, "project_id"), S(c, "id"), S(task, "id"), evType, "", "", 50)
@@ -102,6 +121,10 @@ func TestArtifactPlanReviewFloorBlocksClaimAndAutoStagesReview(t *testing.T) {
 	}
 
 	completePlanReview(t, s, reviews[0], "pass")
+	// The preflight symmetry floor additionally holds the implement until this
+	// generation's explore AND critic preflight reach terminal COMPLETE, so the
+	// combined release also requires the staged preflights to complete.
+	completeGenerationPreflights(t, s, c, coord)
 	claimed2, _, err := s.ClaimTask(S(impl, "id"), 3)
 	if err != nil {
 		t.Fatal(err)
