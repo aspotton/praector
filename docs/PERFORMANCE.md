@@ -7,12 +7,12 @@ It is not release-notes prose: [`../CHANGELOG.md`](../CHANGELOG.md) remains the 
 ## Current status
 
 - Initial performance investigation: **complete**.
-- Code optimization: **not yet landed**.
+- Code optimization: **Phase 1 landed** (multi-query seam + CLI bootstrap read batching). Phases 2–4 not yet landed.
 - Primary affected surface: `praector status`, CLI startup/bootstrap, terminal-state reconciliation, and idle daemon observability sweeps.
 - Primary conclusion: the dominant cost is **Dolt subprocess churn and repeated loading of the same state**, not slow SQL over the current dataset size.
 - Recommended order:
-  1. batch logical reads through a JSONL-aware multi-query helper;
-  2. batch CLI bootstrap invariant scans;
+  1. batch logical reads through a JSONL-aware multi-query helper — **landed** (`Store.QueryMany` / `queryManyLocked`);
+  2. batch CLI bootstrap invariant scans — **landed** (`Store.loadInvariantRowsLocked` drives one batched read across both bootstrap repairs);
   3. use one per-collection snapshot across status/terminal reconciliation;
   4. rate-limit idle COMPLETE-collection readiness sweeps;
   5. add targeted indexes through an idempotent migration path.
@@ -297,38 +297,28 @@ This path is an observability sweep, not a correctness gate. It is therefore a s
 
 ### Phase 1 — Multi-query and bootstrap batching
 
-State: **planned**
+State: **landed**
 
-Add:
+Adds `Store.QueryMany(queries ...string) ([]Rows, error)` and its internal
+`queryManyLocked` sibling (mirroring the existing `queryLocked`/`Query` split, so the
+locked variant is the only one safe to call inside Bootstrap's single `withLock`). It
+runs one `dolt sql -r json` subprocess for a semicolon-joined batch, decodes the
+newline-delimited JSON so document `i` maps to statement `i`, treats `{}` /
+`{"rows":[]}` / blank stdout as an empty result, and reports a statement-indexed
+error when a batch fails mid-way or returns a document count other than the number of
+statements. `Query`/`queryLocked` behavior is unchanged; `QueryMany` is additive and
+read-side only.
 
-```go
-func (s *Store) QueryMany(queries ...string) ([]Rows, error)
-func (s *Store) queryManyLocked(queries ...string) ([]Rows, error)
-```
-
-Requirements:
-
-- one Dolt process for all supplied statements;
-- JSONL decoding;
-- `{}` -> empty rows;
-- `{"rows": [...]}` -> rows;
-- statement-indexed errors;
-- preserve existing single-query behavior.
-
-Then combine bootstrap reads for:
-
-- inconsistent attempts;
-- critic baseline events;
-- collections;
-- relevant tasks;
-- dependency edges.
-
-The per-collection cycle-repair algorithm can remain unchanged while operating on a preloaded collection-to-rows mapping.
-
-Expected outcome:
-
-- bootstrap scan from dozens of queries to approximately 1–3 SQL processes;
-- fewer no-op Dolt startup costs for every CLI invocation.
+CLI bootstrap invariant repair (`repairInvariantsLocked` and its two sub-repairs) now
+loads the inconsistent-attempt scan, the critic-baseline event scan, the collection
+inventory, the task rows, and the `depends_on` dependency edges in a **single**
+`queryManyLocked` process (`loadInvariantRowsLocked`) and groups tasks/edges by
+collection in Go. The per-collection cycle-repair algorithm and the revision-baseline
+provenance repair (including the per-pair `collection_revisions ... LIMIT 1` selection)
+are byte-for-byte unchanged: the batched path feeds a preloaded-rows variant
+(`repairLegacyDependencyCyclesLockedAllWithRows` / `repairRevisionBaselineProvenanceLockedAll`),
+while the standalone `RepairLegacyDependencyCycles` (and the scheduler-time repair path)
+keeps issuing its own `queryLocked` reads.
 
 ### Phase 2 — Collection-snapshot reconciliation
 
@@ -511,12 +501,34 @@ The optimization work is complete when:
 | Phase | State | Baseline | Result | Notes |
 | --- | --- | --- | --- | --- |
 | Investigation | Landed in this tracker | 86 queries / 8.92 s single status | Evidence recorded | No runtime change |
-| Multi-query helper | Planned | Not measured | Pending | Requires JSONL-aware parsing and fake-Dolt support |
-| Bootstrap batching | Planned | ~50+ bootstrap SQL calls | Pending | Largest immediate low-risk win |
+| Multi-query helper | **Landed** | One `dolt sql` per logical read | `QueryMany`/`queryManyLocked` batch N reads into one JSONL process | Read-side only; `{}`/blank → empty; statement-indexed errors |
+| Bootstrap batching | **Landed** | 51 `dolt sql` / 53 dolt / 2.75 s (`project list`, 23 collections) | 3 `dolt sql` / 5 dolt / 0.30 s; bootstrap repair alone 49 → 2 | Cycle + baseline repair outcomes unchanged |
 | Snapshot reconciliation | Planned | 86+ queries single status | Pending | Preserve all terminal-state semantics |
 | Sweep cooldown | Planned | One sweep per COMPLETE collection per second | Pending | Internal interval first |
 | Targeted indexes | Planned | No collection edge/event-type indexes | Pending | Needs idempotent migration |
 | Persistent/embedded Dolt | Deferred | Not measured | Deferred | Revisit only after batching |
+
+### Phase 1 measured result
+
+Captured under the PATH-shim methodology against a benchmark DB seeded to the
+investigation snapshot scale (23 collections, 241 tasks, 603 edges, 262 attempts,
+1713 events), comparing the committed pre-change binary against this change's build:
+
+| Command | Before | After |
+| --- | ---: | ---: |
+| `praector project list` — `dolt sql` invocations | 51 | 3 |
+| `praector project list` — total `dolt` invocations | 53 | 5 |
+| `praector project list` — `dolt add`/`commit` | 2 | 2 |
+| `praector project list` — wall time | 2.75 s | 0.30 s |
+
+The `dolt sql` line for the batched bootstrap is a single process carrying all five
+reads (`attempts` / baseline `events` / `collections` / `tasks` / `task_edges`) joined
+by `;`, plus the one schema-initialization `sql` and the command's own `projects`
+query. Bootstrap invariant repair alone therefore dropped from 49 SQL processes (schema
++ global scans + one read pair per collection) to 2. `TestQueryManySingleProcessAndBootstrapBound`
+asserts the batch is one process and bootstrap stays bounded regardless of collection
+count, and `TestBootstrapBatchedRepairMatchesStandaloneRepair` asserts the batched run
+reproduces the standalone repair's durable outcome for all three repair paths.
 
 ## Risks and open questions
 

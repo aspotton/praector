@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -134,6 +135,82 @@ func (s *Store) Query(q string) (Rows, error) {
 	err := s.withLock(func() error { var e error; rows, e = s.queryLocked(q); return e })
 	return rows, err
 }
+
+// queryManyLocked runs every supplied SELECT through a single `dolt sql -r json`
+// subprocess (semicolon-joined) and decodes the newline-delimited JSON the CLI
+// emits for a multi-statement query. Document i maps to statement i by positional
+// order, so callers can read a bounded set of logical queries in one process while
+// keeping the results in the order the queries were issued.
+//
+// Both `{}` and `{"rows":[]}` (and, for a successful run that emitted no document
+// at all, blank stdout) decode to an empty Rows, matching real Dolt 2.7.2. A run
+// that failed mid-batch, or that returned a document count other than the number
+// of statements, is reported as an error naming the failing statement index rather
+// than silently truncating or shifting indices. It is the *Locked sibling of the
+// withLock-acquiring QueryMany and, like queryLocked, must only be called while the
+// caller already holds the store lock (Bootstrap/repair run inside one withLock).
+//
+// It is read-side only: intra-batch consistency rests solely on the OS file lock
+// held across the operation, not on any declared Dolt transaction (docs/
+// PERFORMANCE.md Risks). The joined statements must not contain a `;` inside a
+// string literal; the batched bootstrap reads only embed internal ids via
+// SQLLiteral plus fixed relation literals, so this holds at every call site.
+func (s *Store) queryManyLocked(queries ...string) ([]Rows, error) {
+	if len(queries) == 0 {
+		return nil, nil
+	}
+	joined := strings.Join(queries, ";")
+	// check=false so a mid-batch failure still yields the stdout documents Dolt
+	// emitted before the failing statement, which we use to attribute the index.
+	r, err := s.run([]string{s.Dolt, "sql", "-r", "json", "-q", joined}, "", false)
+	if err != nil {
+		return nil, fmt.Errorf("unable to run Dolt multi-query:\n%s: %w", joined, err)
+	}
+	out := strings.TrimSpace(r.Stdout)
+	results := make([]Rows, 0, len(queries))
+	if out != "" {
+		dec := json.NewDecoder(strings.NewReader(out))
+		dec.UseNumber()
+		for {
+			var p struct {
+				Rows Rows `json:"rows"`
+			}
+			if derr := dec.Decode(&p); derr != nil {
+				if errors.Is(derr, io.EOF) {
+					break
+				}
+				return nil, fmt.Errorf("unable to parse Dolt JSONL output at statement %d for queries:\n%s\nOutput:\n%s: %w", len(results), joined, out, derr)
+			}
+			results = append(results, p.Rows)
+		}
+	}
+	if len(results) != len(queries) {
+		if r.Code != 0 {
+			return nil, fmt.Errorf("Dolt multi-query failed at statement %d (exit %d): %s", len(results), r.Code, strings.TrimSpace(firstNonEmpty(r.Stderr, r.Stdout)))
+		}
+		if out == "" {
+			// A clean run that printed nothing maps every statement to an empty result.
+			return make([]Rows, len(queries)), nil
+		}
+		return nil, fmt.Errorf("Dolt multi-query returned %d result document(s) for %d statement(s) (failure at statement %d):\n%s", len(results), len(queries), len(results), out)
+	}
+	if r.Code != 0 {
+		return nil, fmt.Errorf("Dolt multi-query reported failure at statement %d (exit %d): %s", len(queries)-1, r.Code, strings.TrimSpace(firstNonEmpty(r.Stderr, r.Stdout)))
+	}
+	return results, nil
+}
+
+// QueryMany is the withLock-acquiring sibling of Query for a batch of SELECTs. It
+// mirrors the existing queryLocked/Query split: it must not be called from inside
+// an already-locked path (use queryManyLocked there or a nested acquire
+// self-deadlocks). Its read-side-only, non-transactional contract is documented on
+// queryManyLocked.
+func (s *Store) QueryMany(queries ...string) ([]Rows, error) {
+	var out []Rows
+	err := s.withLock(func() error { var e error; out, e = s.queryManyLocked(queries...); return e })
+	return out, err
+}
+
 func (s *Store) mutateLocked(q string) error {
 	_, err := s.run([]string{s.Dolt, "sql", "-q", q}, "", true)
 	return err
@@ -196,23 +273,57 @@ func (s *Store) Bootstrap() error {
 	})
 }
 
+// invariantRows holds the fixed set of global rows the CLI bootstrap repair needs,
+// loaded in one batched Dolt process so a bootstrap that finds nothing to repair
+// costs a small bounded number of `dolt sql` invocations rather than one per
+// collection. It is a read-only snapshot captured before any repair mutation runs,
+// so it is consistent for the whole repair (which holds the store lock throughout).
+type invariantRows struct {
+	inconsistent Rows
+	baseline     Rows
+	collections  Rows
+	tasks        Rows
+	edges        Rows
+}
+
+// loadInvariantRowsLocked reads the inconsistent-attempt scan, the critic-baseline
+// event scan, the collection inventory, the task rows, and the depends_on
+// dependency edges in a SINGLE queryManyLocked process. The collection inventory
+// and baseline events retain their ORDER BY created_at so the per-collection walk
+// and the "latest per task_id" selection are unchanged; tasks and edges project
+// collection_id so they can be grouped in Go without changing which rows feed the
+// (unchanged) per-collection repair decision logic.
+func (s *Store) loadInvariantRowsLocked() (*invariantRows, error) {
+	out, err := s.queryManyLocked(
+		"SELECT id FROM attempts WHERE status='SUCCEEDED' AND exit_code IS NOT NULL AND exit_code <> 0",
+		"SELECT task_id,payload_json,created_at FROM events WHERE event_type='CRITIC_PLAN_BASELINE' ORDER BY created_at",
+		"SELECT id FROM collections ORDER BY created_at",
+		"SELECT collection_id,id,project_id,profile,status,requested_by_task_id FROM tasks",
+		"SELECT collection_id,from_task_id,to_task_id FROM task_edges WHERE relation='depends_on'",
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &invariantRows{inconsistent: out[0], baseline: out[1], collections: out[2], tasks: out[3], edges: out[4]}, nil
+}
+
 func (s *Store) repairInvariantsLocked() error {
-	rows, err := s.queryLocked("SELECT id FROM attempts WHERE status='SUCCEEDED' AND exit_code IS NOT NULL AND exit_code <> 0")
+	loaded, err := s.loadInvariantRowsLocked()
 	if err != nil {
 		return err
 	}
-	if len(rows) > 0 {
+	if len(loaded.inconsistent) > 0 {
 		if err = s.mutateLocked("UPDATE attempts SET status='FAILED' WHERE status='SUCCEEDED' AND exit_code IS NOT NULL AND exit_code <> 0"); err != nil {
 			return err
 		}
-		if err = s.semanticCommitLocked(fmt.Sprintf("praector: repair %d inconsistent attempt status(es)", len(rows))); err != nil {
+		if err = s.semanticCommitLocked(fmt.Sprintf("praector: repair %d inconsistent attempt status(es)", len(loaded.inconsistent))); err != nil {
 			return err
 		}
 	}
-	if _, err = s.repairRevisionBaselineProvenanceLocked(); err != nil {
+	if _, err = s.repairRevisionBaselineProvenanceLockedAll(loaded.baseline); err != nil {
 		return err
 	}
-	_, err = s.repairLegacyDependencyCyclesLockedAll()
+	_, err = s.repairLegacyDependencyCyclesLockedAllWithRows(loaded)
 	return err
 }
 
@@ -391,42 +502,8 @@ func (s *Store) repairLegacyDependencyCyclesLocked(collectionID string) (int, []
 	if err != nil {
 		return 0, nil, err
 	}
-	type repair struct{ from, to, reason string }
-	var repairs []repair
-
-	for {
-		var candidate *repair
-		for _, edge := range edges {
-			source := taskByID[edge[0]]
-			target := taskByID[edge[1]]
-			reason := ""
-			if S(target, "profile") == "plan_review" && S(source, "profile") == "implement" {
-				reason = "legacy_plan_review_waited_for_implementation"
-			} else if S(target, "profile") == "plan_review" && S(source, "profile") == "coordinator" {
-				reason = "legacy_plan_review_waited_for_coordinator"
-			}
-			if reason == "" || dependencyPathInEdges(edges, edge[1], edge[0]) == nil {
-				continue
-			}
-			r := repair{from: edge[0], to: edge[1], reason: reason}
-			candidate = &r
-			break
-		}
-		if candidate == nil {
-			break
-		}
-		filtered := make([][2]string, 0, len(edges)-1)
-		for _, edge := range edges {
-			if edge[0] == candidate.from && edge[1] == candidate.to {
-				continue
-			}
-			filtered = append(filtered, edge)
-		}
-		edges = filtered
-		repairs = append(repairs, *candidate)
-	}
-
-	unresolved := dependencyCycle(edges)
+	repairs, remaining := computeLegacyRepairs(taskByID, edges)
+	unresolved := dependencyCycle(remaining)
 	if len(repairs) == 0 {
 		return 0, unresolved, nil
 	}
@@ -459,6 +536,136 @@ func (s *Store) repairLegacyDependencyCyclesLocked(collectionID string) (int, []
 	return len(repairs), unresolved, nil
 }
 
+// legacyRepair is one cycle-forming depends_on edge selected for removal, tagged
+// with the known legacy reason shape it matches.
+type legacyRepair struct{ from, to, reason string }
+
+// computeLegacyRepairs runs the (unchanged) legacy cycle-normalization candidate
+// selection over a collection's task rows and dependency edges. It returns the set
+// of edges to remove plus the remaining edge set after every candidate has been
+// dropped (a fixpoint, so the outcome does not depend on candidate order). The
+// standalone per-collection repair and the batched bootstrap preloaded-rows variant
+// share this so their candidate-selection decision stays byte-for-byte identical;
+// only how they obtain taskByID/edges differs.
+func computeLegacyRepairs(taskByID map[string]Row, edges [][2]string) ([]legacyRepair, [][2]string) {
+	var repairs []legacyRepair
+	for {
+		var candidate *legacyRepair
+		for _, edge := range edges {
+			source := taskByID[edge[0]]
+			target := taskByID[edge[1]]
+			reason := ""
+			if S(target, "profile") == "plan_review" && S(source, "profile") == "implement" {
+				reason = "legacy_plan_review_waited_for_implementation"
+			} else if S(target, "profile") == "plan_review" && S(source, "profile") == "coordinator" {
+				reason = "legacy_plan_review_waited_for_coordinator"
+			}
+			if reason == "" || dependencyPathInEdges(edges, edge[1], edge[0]) == nil {
+				continue
+			}
+			r := legacyRepair{from: edge[0], to: edge[1], reason: reason}
+			candidate = &r
+			break
+		}
+		if candidate == nil {
+			break
+		}
+		filtered := make([][2]string, 0, len(edges)-1)
+		for _, edge := range edges {
+			if edge[0] == candidate.from && edge[1] == candidate.to {
+				continue
+			}
+			filtered = append(filtered, edge)
+		}
+		edges = filtered
+		repairs = append(repairs, *candidate)
+	}
+	return repairs, edges
+}
+
+// repairLegacyDependencyCyclesLockedWithRows is the batched-bootstrap sibling of
+// repairLegacyDependencyCyclesLocked: it takes this collection's task rows and
+// depends_on edge rows (preloaded by loadInvariantRowsLocked and grouped in Go)
+// instead of issuing its own queryLocked reads. Its candidate-selection, DELETE,
+// LEGACY_DEPENDENCY_CYCLE_REPAIRED event, and single-commit sequence are identical
+// to the standalone repair, so a bootstrap batch produces byte-for-byte the same
+// durable outcome while the standalone RepairLegacyDependencyCycles path is
+// untouched.
+func (s *Store) repairLegacyDependencyCyclesLockedWithRows(collectionID string, taskRows, edgeRows Rows) (int, []string, error) {
+	taskByID := map[string]Row{}
+	projectID := ""
+	for _, row := range taskRows {
+		taskByID[S(row, "id")] = row
+		if projectID == "" {
+			projectID = S(row, "project_id")
+		}
+	}
+	edges := make([][2]string, 0, len(edgeRows))
+	for _, row := range edgeRows {
+		edges = append(edges, [2]string{S(row, "from_task_id"), S(row, "to_task_id")})
+	}
+	repairs, remaining := computeLegacyRepairs(taskByID, edges)
+	unresolved := dependencyCycle(remaining)
+	if len(repairs) == 0 {
+		return 0, unresolved, nil
+	}
+	now := UTCNow()
+	statements := make([]string, 0, len(repairs)*2)
+	var repairedEvents []eventRecord
+	for _, r := range repairs {
+		statements = append(statements,
+			"DELETE FROM task_edges WHERE collection_id="+SQLLiteral(collectionID)+" AND relation='depends_on' AND from_task_id="+SQLLiteral(r.from)+" AND to_task_id="+SQLLiteral(r.to),
+		)
+		if projectID != "" {
+			payload := JSONDumps(Row{"from_task_id": r.from, "to_task_id": r.to, "reason": r.reason})
+			eid := MakeID("EVT")
+			statements = append(statements,
+				"INSERT INTO events (id,project_id,collection_id,task_id,attempt_id,event_type,payload_json,created_at) VALUES ("+
+					SQLLiteral(eid)+","+SQLLiteral(projectID)+","+SQLLiteral(collectionID)+","+SQLLiteral(r.to)+",NULL,'LEGACY_DEPENDENCY_CYCLE_REPAIRED',"+SQLLiteral(payload)+","+SQLLiteral(now)+")",
+			)
+			repairedEvents = append(repairedEvents, eventRecord{ID: eid, ProjectID: projectID, CollectionID: collectionID, TaskID: r.to, EventType: "LEGACY_DEPENDENCY_CYCLE_REPAIRED", CreatedAt: now})
+		}
+	}
+	if err := s.mutateLocked(strings.Join(statements, ";")); err != nil {
+		return 0, unresolved, err
+	}
+	if err := s.semanticCommitLocked(fmt.Sprintf("praector: repair %d legacy dependency cycle edge(s) in %s", len(repairs), collectionID)); err != nil {
+		return 0, unresolved, err
+	}
+	for _, rec := range repairedEvents {
+		s.emitEvent(rec)
+	}
+	return len(repairs), unresolved, nil
+}
+
+// repairLegacyDependencyCyclesLockedAllWithRows is the batched global cycle-repair
+// walk used by CLI bootstrap. It groups the preloaded task and edge rows by
+// collection in Go and repairs each collection in the same ORDER BY created_at
+// order the standalone repairLegacyDependencyCyclesLockedAll walk uses, without
+// launching one queryLocked read pair per collection.
+func (s *Store) repairLegacyDependencyCyclesLockedAllWithRows(loaded *invariantRows) (int, error) {
+	tasksByCollection := map[string]Rows{}
+	edgesByCollection := map[string]Rows{}
+	for _, row := range loaded.tasks {
+		cid := S(row, "collection_id")
+		tasksByCollection[cid] = append(tasksByCollection[cid], row)
+	}
+	for _, row := range loaded.edges {
+		cid := S(row, "collection_id")
+		edgesByCollection[cid] = append(edgesByCollection[cid], row)
+	}
+	repaired := 0
+	for _, row := range loaded.collections {
+		cid := S(row, "id")
+		count, _, err := s.repairLegacyDependencyCyclesLockedWithRows(cid, tasksByCollection[cid], edgesByCollection[cid])
+		if err != nil {
+			return repaired, err
+		}
+		repaired += count
+	}
+	return repaired, nil
+}
+
 // RepairLegacyDependencyCycles normalizes the two hard-dependency cycle shapes
 // known to have been emitted by legacy Praector releases. Unknown cycles remain in
 // place for collection-local quarantine by the scheduler.
@@ -478,6 +685,17 @@ func (s *Store) repairRevisionBaselineProvenanceLocked() (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	return s.repairRevisionBaselineProvenanceLockedAll(rows)
+}
+
+// repairRevisionBaselineProvenanceLockedAll runs the revision critic-baseline
+// provenance repair over a caller-supplied set of CRITIC_PLAN_BASELINE event rows:
+// the batched bootstrap read supplies the already-scanned, ORDER BY created_at
+// snapshot, while the standalone wrapper above scans them itself. The per-critic
+// pair collection_revisions LIMIT 1 selection and the correction INSERT / single
+// commit output remain unchanged, so the durable outcome is identical whether the
+// initial scan was batched or issued on its own.
+func (s *Store) repairRevisionBaselineProvenanceLockedAll(rows Rows) (int, error) {
 	latest := map[string]Row{}
 	for _, row := range rows {
 		if id := S(row, "task_id"); id != "" {
