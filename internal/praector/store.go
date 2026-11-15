@@ -1457,8 +1457,81 @@ func (s *Store) CriticRevalidationState(cid string) (Row, error) {
 	}
 	return criticRevalidationFromRows(collection, tasks, edges, baselineEvents), nil
 }
+
+// Dependencies returns the direct depends_on prerequisites of a task. It is a
+// load-then-call delegator over the same row-resolved frontier the ancestry
+// walks use (dependsOnFrontierFromRows), so the frontier definition exists in
+// exactly one place. The owning collection is resolved by scalar subquery inside
+// the SAME single `dolt sql` process, so the read count per call is unchanged.
 func (s *Store) Dependencies(tid string) (Rows, error) {
-	return s.Query("SELECT t.* FROM task_edges e JOIN tasks t ON t.id=e.from_task_id WHERE e.to_task_id=" + SQLLiteral(tid) + " AND e.relation='depends_on' ORDER BY e.created_at")
+	tasks, edges, err := s.loadAncestryRows(tid)
+	if err != nil {
+		return nil, err
+	}
+	return dependsOnFrontierFromRows(tasks, edges, tid), nil
+}
+
+// ancestryRowStatements renders the one-process read of the task and edge rows the
+// ancestry walk needs: the tasks and the depends_on-relevant edges of the
+// collection that owns tid. The owning collection is resolved by a scalar
+// subquery on tasks.id, so no separate round trip is needed and the only embedded
+// value is SQLLiteral(tid) plus fixed relation literals (inherited
+// R-QUOTE-SPLIT). No transaction wrapper is added; consistency rests on the store
+// lock (inherited R-NO-TXN).
+func ancestryRowStatements(tid string) []string {
+	scope := "(SELECT collection_id FROM tasks WHERE id=" + SQLLiteral(tid) + ")"
+	return []string{
+		"SELECT * FROM tasks WHERE collection_id=" + scope + " ORDER BY collection_id,created_at",
+		"SELECT * FROM task_edges WHERE collection_id=" + scope + " ORDER BY collection_id,created_at",
+	}
+}
+
+// loadAncestryRows is the withLock-acquiring loader for the ancestry row set;
+// loadAncestryRowsLocked is its already-locked sibling. Both use the existing
+// QueryMany seam — no second snapshot mechanism.
+func (s *Store) loadAncestryRows(tid string) (Rows, Rows, error) {
+	var tasks, edges Rows
+	err := s.withLock(func() error {
+		var e error
+		tasks, edges, e = s.loadAncestryRowsLocked(tid)
+		return e
+	})
+	return tasks, edges, err
+}
+
+func (s *Store) loadAncestryRowsLocked(tid string) (Rows, Rows, error) {
+	out, err := s.queryManyLocked(ancestryRowStatements(tid)...)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(out) < 2 {
+		return nil, nil, fmt.Errorf("ancestry snapshot returned %d result document(s) for 2 statement(s)", len(out))
+	}
+	// Task rows are returned UNparsed (no `result` key), exactly as the removed
+	// per-node `SELECT t.*` reads returned them; the walk core parses `result`
+	// only for the completed ancestors it accepts.
+	return out[0], out[1], nil
+}
+
+// ancestorWalk / ancestorWalkLocked are the two load-then-call delegators every
+// ancestry walk goes through. acceptProfile is the ONLY per-caller difference
+// between the four exported/locked walks, and the legal forms are defined once in
+// ancestorProfileIsResearch / ancestorProfileIsDirectiveSource, so no inline
+// profile/status identity query can drift from the shared body.
+func (s *Store) ancestorWalk(tid string, acceptProfile func(profile string) bool) (Rows, error) {
+	tasks, edges, err := s.loadAncestryRows(tid)
+	if err != nil {
+		return nil, err
+	}
+	return ancestorWalkFromRows(tasks, edges, tid, acceptProfile), nil
+}
+
+func (s *Store) ancestorWalkLocked(tid string, acceptProfile func(profile string) bool) (Rows, error) {
+	tasks, edges, err := s.loadAncestryRowsLocked(tid)
+	if err != nil {
+		return nil, err
+	}
+	return ancestorWalkFromRows(tasks, edges, tid, acceptProfile), nil
 }
 
 // ResearchAncestors returns every completed research Task reachable through the
@@ -1466,86 +1539,14 @@ func (s *Store) Dependencies(tid string) (Rows, error) {
 // implementation that depends on a plan review which depends on research must
 // inherit that research even when the research Task is not a direct dependency.
 func (s *Store) ResearchAncestors(tid string) (Rows, error) {
-	seen := map[string]bool{tid: true}
-	queue := []string{tid}
-	byID := map[string]Row{}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		deps, err := s.Dependencies(cur)
-		if err != nil {
-			return nil, err
-		}
-		for _, dep := range deps {
-			id := S(dep, "id")
-			if id == "" {
-				continue
-			}
-			if S(dep, "profile") == "research" && S(dep, "status") == TaskComplete {
-				dep["result"] = JSONMap(S(dep, "result_json"))
-				byID[id] = dep
-			}
-			if !seen[id] {
-				seen[id] = true
-				queue = append(queue, id)
-			}
-		}
-	}
-	out := make(Rows, 0, len(byID))
-	for _, row := range byID {
-		out = append(out, row)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		a, b := S(out[i], "created_at"), S(out[j], "created_at")
-		if a == b {
-			return S(out[i], "id") < S(out[j], "id")
-		}
-		return a < b
-	})
-	return out, nil
+	return s.ancestorWalk(tid, ancestorProfileIsResearch)
 }
 
 // researchAncestorsLocked is the claim-time variant used while the Store lock
 // is already held. It mirrors ResearchAncestors without recursively acquiring
 // the filesystem lock.
 func (s *Store) researchAncestorsLocked(tid string) (Rows, error) {
-	seen := map[string]bool{tid: true}
-	queue := []string{tid}
-	byID := map[string]Row{}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		deps, err := s.queryLocked("SELECT t.* FROM task_edges e JOIN tasks t ON t.id=e.from_task_id WHERE e.to_task_id=" + SQLLiteral(cur) + " AND e.relation='depends_on' ORDER BY e.created_at")
-		if err != nil {
-			return nil, err
-		}
-		for _, dep := range deps {
-			id := S(dep, "id")
-			if id == "" {
-				continue
-			}
-			if S(dep, "profile") == "research" && S(dep, "status") == TaskComplete {
-				dep["result"] = JSONMap(S(dep, "result_json"))
-				byID[id] = dep
-			}
-			if !seen[id] {
-				seen[id] = true
-				queue = append(queue, id)
-			}
-		}
-	}
-	out := make(Rows, 0, len(byID))
-	for _, row := range byID {
-		out = append(out, row)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		a, b := S(out[i], "created_at"), S(out[j], "created_at")
-		if a == b {
-			return S(out[i], "id") < S(out[j], "id")
-		}
-		return a < b
-	})
-	return out, nil
+	return s.ancestorWalkLocked(tid, ancestorProfileIsResearch)
 }
 
 // DirectiveAncestors returns every completed critic/plan_review/advise Task
@@ -1555,86 +1556,14 @@ func (s *Store) researchAncestorsLocked(tid string) (Rows, error) {
 // when the critic Task is not a direct dependency. The traversal intentionally
 // mirrors ResearchAncestors so both mechanisms behave identically.
 func (s *Store) DirectiveAncestors(tid string) (Rows, error) {
-	seen := map[string]bool{tid: true}
-	queue := []string{tid}
-	byID := map[string]Row{}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		deps, err := s.Dependencies(cur)
-		if err != nil {
-			return nil, err
-		}
-		for _, dep := range deps {
-			id := S(dep, "id")
-			if id == "" {
-				continue
-			}
-			if directiveSourceProfiles[S(dep, "profile")] && S(dep, "status") == TaskComplete {
-				dep["result"] = JSONMap(S(dep, "result_json"))
-				byID[id] = dep
-			}
-			if !seen[id] {
-				seen[id] = true
-				queue = append(queue, id)
-			}
-		}
-	}
-	out := make(Rows, 0, len(byID))
-	for _, row := range byID {
-		out = append(out, row)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		a, b := S(out[i], "created_at"), S(out[j], "created_at")
-		if a == b {
-			return S(out[i], "id") < S(out[j], "id")
-		}
-		return a < b
-	})
-	return out, nil
+	return s.ancestorWalk(tid, ancestorProfileIsDirectiveSource)
 }
 
 // directiveAncestorsLocked is the claim-time variant used while the Store lock
 // is already held. It mirrors DirectiveAncestors without recursively acquiring
 // the filesystem lock, matching the researchAncestorsLocked convention.
 func (s *Store) directiveAncestorsLocked(tid string) (Rows, error) {
-	seen := map[string]bool{tid: true}
-	queue := []string{tid}
-	byID := map[string]Row{}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		deps, err := s.queryLocked("SELECT t.* FROM task_edges e JOIN tasks t ON t.id=e.from_task_id WHERE e.to_task_id=" + SQLLiteral(cur) + " AND e.relation='depends_on' ORDER BY e.created_at")
-		if err != nil {
-			return nil, err
-		}
-		for _, dep := range deps {
-			id := S(dep, "id")
-			if id == "" {
-				continue
-			}
-			if directiveSourceProfiles[S(dep, "profile")] && S(dep, "status") == TaskComplete {
-				dep["result"] = JSONMap(S(dep, "result_json"))
-				byID[id] = dep
-			}
-			if !seen[id] {
-				seen[id] = true
-				queue = append(queue, id)
-			}
-		}
-	}
-	out := make(Rows, 0, len(byID))
-	for _, row := range byID {
-		out = append(out, row)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		a, b := S(out[i], "created_at"), S(out[j], "created_at")
-		if a == b {
-			return S(out[i], "id") < S(out[j], "id")
-		}
-		return a < b
-	})
-	return out, nil
+	return s.ancestorWalkLocked(tid, ancestorProfileIsDirectiveSource)
 }
 func (s *Store) Dependents(tid string) (Rows, error) {
 	return s.Query("SELECT t.* FROM task_edges e JOIN tasks t ON t.id=e.to_task_id WHERE e.from_task_id=" + SQLLiteral(tid) + " AND e.relation='depends_on' ORDER BY e.created_at")

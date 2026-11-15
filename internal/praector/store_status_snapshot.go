@@ -1,6 +1,8 @@
 package praector
 
 import (
+	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -42,7 +44,13 @@ type collectionSnapshot struct {
 	runnable       bool
 	runningSession bool
 	baselineEvents Rows
-	flipped        []string
+	// decisions and events are filled ONLY by the acceptance variant of the
+	// loader (loadCollectionRowsWithAcceptance): the durable-decision inventory
+	// and the events harvest-marker window the acceptance predicate reads. The
+	// status-path loader leaves them nil.
+	decisions Rows
+	events    Rows
+	flipped   []string
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +371,145 @@ func terminalStateForCollection(collection Row, tasks, edges Rows, openRevisions
 }
 
 // ---------------------------------------------------------------------------
+// Pure ancestry-walk core (Phase 3.5)
+// ---------------------------------------------------------------------------
+
+// The four ancestry walks (ResearchAncestors / researchAncestorsLocked /
+// DirectiveAncestors / directiveAncestorsLocked) and the direct-dependency read
+// (Dependencies) share the single BFS body below. Each wrapper is a load-then-call
+// delegator, exactly like the terminal-state cores above, so no caller can drift
+// from another and a caller that already holds the collection's rows pays zero
+// additional reads.
+//
+// Membership semantics: the walk traverses the depends_on edges of the collection
+// that owns the start task. The removed per-node SQL carried no collection_id
+// predicate at all, so a cross-collection depends_on edge was the only way the
+// two could disagree; production edge writers derive collection_id exclusively
+// from the task's own collection and the dependency mutations reject
+// cross-collection task pairs, so no seam creates such an edge (pinned by
+// TestAncestryWalkCrossCollectionEdgeIsWriterInvariant). The collection-scoped
+// membership of the rows path is therefore the intended semantics.
+
+// dependsOnAdjacency indexes collection-scoped depends_on edges by to_task_id.
+// Each frontier is ordered by (created_at, from_task_id): the removed standalone
+// read ordered by e.created_at only, and Dolt row order among equal created_at
+// values is not a contract, so the from_task_id tie-break is what pins a
+// deterministic VISIT order that never depends on Go map iteration order.
+func dependsOnAdjacency(edges Rows) map[string]Rows {
+	adj := map[string]Rows{}
+	for _, e := range edges {
+		if S(e, "relation") != "depends_on" {
+			continue
+		}
+		to := S(e, "to_task_id")
+		adj[to] = append(adj[to], e)
+	}
+	for _, frontier := range adj {
+		sort.SliceStable(frontier, func(i, j int) bool {
+			a, b := S(frontier[i], "created_at"), S(frontier[j], "created_at")
+			if a == b {
+				return S(frontier[i], "from_task_id") < S(frontier[j], "from_task_id")
+			}
+			return a < b
+		})
+	}
+	return adj
+}
+
+// ancestorWalkFromRows is the ONE BFS body behind every ancestry walk: the
+// completed ancestors of tid, reachable through collection-scoped depends_on
+// edges, whose profile is accepted by acceptProfile. It performs no reads; the
+// only per-caller difference between the four walks is that predicate, and the
+// two legal forms live in ancestorProfileIsResearch /
+// ancestorProfileIsDirectiveSource so no new inline identity query can appear.
+// The output order is the walks' existing contract (created_at, then id), which
+// makes membership the only observable semantic.
+func ancestorWalkFromRows(tasks, edges Rows, tid string, acceptProfile func(profile string) bool) Rows {
+	by := map[string]Row{}
+	for _, t := range tasks {
+		by[S(t, "id")] = t
+	}
+	adj := dependsOnAdjacency(edges)
+	seen := map[string]bool{tid: true}
+	queue := []string{tid}
+	byID := map[string]Row{}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, e := range adj[cur] {
+			dep := by[S(e, "from_task_id")]
+			if dep == nil {
+				continue
+			}
+			id := S(dep, "id")
+			if id == "" {
+				continue
+			}
+			if acceptProfile(S(dep, "profile")) && S(dep, "status") == TaskComplete {
+				out := make(Row, len(dep))
+				for k, v := range dep {
+					out[k] = v
+				}
+				out["result"] = JSONMap(S(out, "result_json"))
+				byID[id] = out
+			}
+			if !seen[id] {
+				seen[id] = true
+				queue = append(queue, id)
+			}
+		}
+	}
+	out := make(Rows, 0, len(byID))
+	for _, row := range byID {
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := S(out[i], "created_at"), S(out[j], "created_at")
+		if a == b {
+			return S(out[i], "id") < S(out[j], "id")
+		}
+		return a < b
+	})
+	return out
+}
+
+// dependsOnFrontierFromRows is the already-loaded form of the per-task direct
+// dependency read: the task rows of every depends_on prerequisite of tid, in the
+// same deterministic (edge created_at, from_task_id) order the standalone
+// `... WHERE e.to_task_id=<tid> ... ORDER BY e.created_at` read visits them.
+func dependsOnFrontierFromRows(tasks, edges Rows, tid string) Rows {
+	by := map[string]Row{}
+	for _, t := range tasks {
+		by[S(t, "id")] = t
+	}
+	out := Rows{}
+	for _, e := range dependsOnAdjacency(edges)[tid] {
+		if dep := by[S(e, "from_task_id")]; dep != nil {
+			out = append(out, dep)
+		}
+	}
+	return out
+}
+
+// ancestorProfileIsResearch and ancestorProfileIsDirectiveSource are the ONLY two
+// profile-acceptance forms the ancestry walks use, mirroring the role-identity
+// single-helper discipline: a completed research Task is a research constraint
+// source, and a completed critic/plan_review/advise Task is a directive source.
+// The TaskComplete status half of both predicates is shared in the walk core.
+func ancestorProfileIsResearch(profile string) bool { return profile == "research" }
+
+func ancestorProfileIsDirectiveSource(profile string) bool { return directiveSourceProfiles[profile] }
+
+// materialFingerprintFromRows is the sibling core of Scheduler.materialFingerprint:
+// it consumes already-loaded rows instead of issuing its own ListEdges read, so a
+// caller holding a snapshot (the acceptance-readiness sweep) adds no read. The
+// shared pure MaterialPlanFingerprint input derivation is untouched, so every
+// other caller stays byte-identical.
+func materialFingerprintFromRows(objective string, tasks, edges Rows, legacy bool) string {
+	return MaterialPlanFingerprint(objective, tasks, edges, legacy)
+}
+
+// ---------------------------------------------------------------------------
 // Batched snapshot loader
 // ---------------------------------------------------------------------------
 
@@ -384,6 +531,72 @@ func terminalStateForCollection(collection Row, tasks, edges Rows, openRevisions
 //
 // It must be called while the caller holds no store lock (it uses QueryMany).
 func (s *Store) loadCollectionRows(ids []string) (map[string]*collectionSnapshot, error) {
+	return s.loadCollectionRowsFrom(collectionSnapshotStatements(ids), ids)
+}
+
+// loadCollectionRowsWithAcceptance is the acceptance-readiness variant of the
+// SAME batched loader: the identical statements 0..9 plus, APPENDED AT THE TAIL,
+// one per-collection decisions read and one per-collection events window read.
+// Nothing else may change: the positional document-to-statement mapping of
+// statements 0..9 is what the status cores rely on, so the extras are never
+// inserted before or between them.
+//
+// The decisions statement is not literally byte-identical to Store.ListDecisions
+// because the batch cannot know the project id before it reads the collections
+// row; it resolves project_id from the collections table by the same id instead of
+// embedding a Go-side project id. The per-collection membership that predicate
+// selects is identical (a decision row is attributed to a collection only when its
+// own project_id equals that collection's project_id and its collection_id is that
+// collection or NULL), and it can only ever be NARROWER than a project-wide
+// IN-list widening, so no decision that acceptance would honor is dropped and no
+// foreign one is admitted. The events statement IS byte-identical to
+// Store.EventsForCollection(cid, 200): same ORDER BY created_at DESC, same 200-row
+// window, never widened into an event_type-filtered IN-list.
+func (s *Store) loadCollectionRowsWithAcceptance(ids []string) (map[string]*collectionSnapshot, error) {
+	if len(ids) == 0 {
+		return map[string]*collectionSnapshot{}, nil
+	}
+	stmts := collectionSnapshotStatements(ids)
+	for _, id := range ids {
+		stmts = append(stmts, "SELECT * FROM decisions WHERE superseded_by IS NULL AND project_id IN (SELECT project_id FROM collections WHERE id="+SQLLiteral(id)+") AND (collection_id IS NULL OR collection_id="+SQLLiteral(id)+") ORDER BY created_at")
+	}
+	for _, id := range ids {
+		stmts = append(stmts, "SELECT * FROM events WHERE collection_id="+SQLLiteral(id)+" ORDER BY created_at DESC LIMIT 200")
+	}
+	snaps, err := s.loadCollectionRowsFrom(stmts, ids)
+	if err != nil {
+		return nil, err
+	}
+	return snaps, nil
+}
+
+// collectionSnapshotStatements is the single source of the batched status-path
+// statement list (statements 0..9). Both loadCollectionRows and
+// loadCollectionRowsWithAcceptance build from it so the two can never disagree on
+// what a snapshot read is.
+func collectionSnapshotStatements(ids []string) []string {
+	in := sqlIDList(ids)
+	runningWhere := "s.status='RUNNING'"
+	return []string{
+		"SELECT * FROM collections WHERE id IN " + in,
+		"SELECT * FROM tasks WHERE collection_id IN " + in + " ORDER BY collection_id,created_at",
+		"SELECT * FROM task_edges WHERE collection_id IN " + in + " ORDER BY collection_id,created_at",
+		"SELECT * FROM collection_revisions WHERE collection_id IN " + in + " ORDER BY collection_id,created_at",
+		"SELECT * FROM collection_revisions WHERE status='OPEN' AND collection_id IN " + in + " ORDER BY collection_id,created_at",
+		"SELECT * FROM collection_acceptances WHERE collection_id IN " + in + " ORDER BY collection_id,created_at DESC",
+		"SELECT * FROM collection_pull_requests WHERE provider='github' AND collection_id IN " + in + " ORDER BY collection_id,created_at DESC",
+		"SELECT DISTINCT t.collection_id FROM tasks t WHERE t.status IN ('READY','PENDING') AND NOT EXISTS (SELECT 1 FROM task_edges e JOIN tasks dep ON dep.id=e.from_task_id WHERE e.to_task_id=t.id AND e.relation='depends_on' AND dep.status!='COMPLETE') AND NOT EXISTS (SELECT 1 FROM task_edges eb JOIN attempts pa ON pa.task_id=eb.to_task_id JOIN sessions ps ON ps.attempt_id=pa.id WHERE eb.from_task_id=t.id AND eb.to_task_id=t.parent_task_id AND eb.relation='depends_on' AND ps.status='RUNNING')",
+		"SELECT DISTINCT t.collection_id FROM sessions s JOIN attempts a ON a.id=s.attempt_id JOIN tasks t ON t.id=a.task_id WHERE " + runningWhere,
+		"SELECT collection_id,task_id,payload_json,created_at FROM events WHERE event_type='CRITIC_PLAN_BASELINE' AND collection_id IN " + in + " ORDER BY collection_id,created_at",
+	}
+}
+
+// loadCollectionRowsFrom decodes a QueryMany batch produced by
+// collectionSnapshotStatements (optionally extended at the tail by the acceptance
+// variant) back into per-collection snapshots. Statements 10..10+len(ids)-1 are
+// the decisions reads and the following len(ids) statements the events windows;
+// both are optional and only decoded when present.
+func (s *Store) loadCollectionRowsFrom(stmts []string, ids []string) (map[string]*collectionSnapshot, error) {
 	snap := map[string]*collectionSnapshot{}
 	if len(ids) == 0 {
 		return snap, nil
@@ -391,32 +604,12 @@ func (s *Store) loadCollectionRows(ids []string) (map[string]*collectionSnapshot
 	for _, id := range ids {
 		snap[id] = &collectionSnapshot{}
 	}
-	in := sqlIDList(ids)
-	runningWhere := "s.status='RUNNING'"
-	tasksQ := "SELECT * FROM tasks WHERE collection_id IN " + in + " ORDER BY collection_id,created_at"
-	edgesQ := "SELECT * FROM task_edges WHERE collection_id IN " + in + " ORDER BY collection_id,created_at"
-	allRevQ := "SELECT * FROM collection_revisions WHERE collection_id IN " + in + " ORDER BY collection_id,created_at"
-	openRevQ := "SELECT * FROM collection_revisions WHERE status='OPEN' AND collection_id IN " + in + " ORDER BY collection_id,created_at"
-	acceptQ := "SELECT * FROM collection_acceptances WHERE collection_id IN " + in + " ORDER BY collection_id,created_at DESC"
-	prQ := "SELECT * FROM collection_pull_requests WHERE provider='github' AND collection_id IN " + in + " ORDER BY collection_id,created_at DESC"
-	runnableQ := "SELECT DISTINCT t.collection_id FROM tasks t WHERE t.status IN ('READY','PENDING') AND NOT EXISTS (SELECT 1 FROM task_edges e JOIN tasks dep ON dep.id=e.from_task_id WHERE e.to_task_id=t.id AND e.relation='depends_on' AND dep.status!='COMPLETE') AND NOT EXISTS (SELECT 1 FROM task_edges eb JOIN attempts pa ON pa.task_id=eb.to_task_id JOIN sessions ps ON ps.attempt_id=pa.id WHERE eb.from_task_id=t.id AND eb.to_task_id=t.parent_task_id AND eb.relation='depends_on' AND ps.status='RUNNING')"
-	sessionQ := "SELECT DISTINCT t.collection_id FROM sessions s JOIN attempts a ON a.id=s.attempt_id JOIN tasks t ON t.id=a.task_id WHERE " + runningWhere
-	baselineQ := "SELECT collection_id,task_id,payload_json,created_at FROM events WHERE event_type='CRITIC_PLAN_BASELINE' AND collection_id IN " + in + " ORDER BY collection_id,created_at"
-
-	out, err := s.QueryMany(
-		"SELECT * FROM collections WHERE id IN "+in,
-		tasksQ,
-		edgesQ,
-		allRevQ,
-		openRevQ,
-		acceptQ,
-		prQ,
-		runnableQ,
-		sessionQ,
-		baselineQ,
-	)
+	out, err := s.QueryMany(stmts...)
 	if err != nil {
 		return nil, err
+	}
+	if len(out) < len(stmts) {
+		return nil, fmt.Errorf("snapshot batch returned %d result document(s) for %d statement(s)", len(out), len(stmts))
 	}
 	// collections (statement 0), keyed by id.
 	for _, r := range out[0] {
@@ -469,6 +662,18 @@ func (s *Store) loadCollectionRows(ids []string) (map[string]*collectionSnapshot
 	for _, r := range out[9] { // critic baseline events
 		if sn, ok := snap[S(r, "collection_id")]; ok {
 			sn.baselineEvents = append(sn.baselineEvents, r)
+		}
+	}
+	// Acceptance-variant tail statements: one decisions read per collection, then
+	// one events window per collection, in the ids order they were appended in.
+	if len(out) > 10+len(ids) {
+		for i, id := range ids {
+			sn, ok := snap[id]
+			if !ok {
+				continue
+			}
+			sn.decisions = out[10+i]
+			sn.events = out[10+len(ids)+i]
 		}
 	}
 	return snap, nil
