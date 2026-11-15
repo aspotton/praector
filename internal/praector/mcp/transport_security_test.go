@@ -241,3 +241,118 @@ func TestLoopbackAuthorityUnit(t *testing.T) {
 		t.Errorf("authorityPort mismatch")
 	}
 }
+
+// newForeignServer returns the MCP core configured the way NewLoopbackServer
+// configures it for the allow_external opt-in bound to a non-loopback address:
+// AllowNonLoopback is the input knob and foreign is the derived per-server flag.
+func newForeignServer() *Server {
+	s := newTestServer()
+	s.AllowNonLoopback = true
+	s.foreign = true
+	return s
+}
+
+// newFlagOnLoopbackServer returns a server with the allow_external knob ON but a
+// loopback bind, so the derived foreign flag stays false and the strict
+// requestAuthorized path must run byte-identically.
+func newFlagOnLoopbackServer() *Server {
+	s := newTestServer()
+	s.AllowNonLoopback = true
+	s.foreign = false
+	return s
+}
+
+// postTo sends one POST to ts with an explicit Host, optional Origin, and the
+// given protocol-version header (empty means omit the header). It returns the
+// HTTP status code without asserting on it, so a caller can pin a dispatch (200),
+// an authority refusal (403), or a header refusal (400).
+func postTo(t *testing.T, ts *httptest.Server, host, origin, protoHeader string) int {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+	req, err := http.NewRequest(http.MethodPost, ts.URL+EndpointPath, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "" {
+		req.Host = host
+	}
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	if protoHeader != "" {
+		req.Header.Set(ProtocolVersionHeader, protoHeader)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
+
+// TestForeignModeMatrix proves the reduced authority check a foreign (allow_external
+// + non-loopback) server applies: a foreign Host with no Origin is dispatched; an
+// Origin whose port matches the Host port is accepted; a port-mismatched Origin
+// and a literal "null" Origin are both 403 before dispatch; and a foreign client
+// still reaches the MCP-Protocol-Version header gate (a missing header yields 400,
+// not a dispatch).
+func TestForeignModeMatrix(t *testing.T) {
+	ts := httptest.NewServer(newForeignServer().Handler())
+	defer ts.Close()
+
+	if code := postTo(t, ts, "evil.example:8765", "", ProtocolVersion); code != http.StatusOK {
+		t.Fatalf("foreign Host + no Origin must dispatch (200), got %d", code)
+	}
+	if code := postTo(t, ts, "evil.example:8765", "http://evil.example:8765", ProtocolVersion); code != http.StatusOK {
+		t.Fatalf("Origin with matching port must dispatch (200), got %d", code)
+	}
+	if code := postTo(t, ts, "evil.example:8765", "http://elsewhere.example:9999", ProtocolVersion); code != http.StatusForbidden {
+		t.Fatalf("Origin with mismatched port must be 403, got %d", code)
+	}
+	if code := postTo(t, ts, "evil.example:8765", "http://evil.example", ProtocolVersion); code != http.StatusForbidden {
+		t.Fatalf("Origin with no port against a ported Host must be 403 (port mismatch), got %d", code)
+	}
+	if code := postTo(t, ts, "evil.example:8765", "null", ProtocolVersion); code != http.StatusForbidden {
+		t.Fatalf("literal null Origin must be 403, got %d", code)
+	}
+	// The authority gate runs above method dispatch, so a foreign client that
+	// passes the Origin check but omits the protocol-version header still hits the
+	// header gate and gets 400 (a header failure), never a dispatch.
+	if code := postTo(t, ts, "evil.example:8765", "", ""); code != http.StatusBadRequest {
+		t.Fatalf("foreign client with a missing protocol-version header must be 400, got %d", code)
+	}
+	// The null-Origin authority refusal precedes the header gate (403, not 400).
+	if code := postTo(t, ts, "evil.example:8765", "null", ""); code != http.StatusForbidden {
+		t.Fatalf("null-Origin refusal must precede the header gate (403), got %d", code)
+	}
+}
+
+// TestFlagOnLoopbackByteIdentical pins that the allow_external knob ON with a
+// loopback bind (derived foreign flag false) is byte-identical to the strict
+// path: a foreign Host and a null Origin are refused exactly as on the default
+// server, while a loopback Host with no Origin still dispatches.
+func TestFlagOnLoopbackByteIdentical(t *testing.T) {
+	strict := httptest.NewServer(newTestServer().Handler())
+	defer strict.Close()
+	flagOn := httptest.NewServer(newFlagOnLoopbackServer().Handler())
+	defer flagOn.Close()
+
+	for _, c := range []struct{ host, origin string }{
+		{"evil.example:8765", ""},
+		{"evil.example:8765", "http://evil.example:8765"},
+		{"evil.example", ""},
+	} {
+		want := postTo(t, strict, c.host, c.origin, ProtocolVersion)
+		got := postTo(t, flagOn, c.host, c.origin, ProtocolVersion)
+		if want != got {
+			t.Errorf("flag-on+loopback diverged from strict for Host=%q Origin=%q: strict=%d flagOn=%d", c.host, c.origin, want, got)
+		}
+		if got != http.StatusForbidden {
+			t.Errorf("flag-on+loopback must refuse foreign Host=%q Origin=%q with 403, got %d", c.host, c.origin, got)
+		}
+	}
+	// A loopback Host with no Origin still dispatches on the flag-on+loopback path.
+	if code := postTo(t, flagOn, "127.0.0.1:8765", "", ProtocolVersion); code != http.StatusOK {
+		t.Fatalf("loopback Host + no Origin must still dispatch under flag-on+loopback, got %d", code)
+	}
+}

@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/datascape/praector/internal/praector/mcp"
 )
 
 type parsedArgs struct {
@@ -480,13 +482,33 @@ func cmdDaemon(args []string) int {
 				fmt.Fprintf(os.Stderr, "mcp listener: %v\n", err)
 			}
 		}()
-		fmt.Printf("MCP listener enabled on %s (loopback only)\n", mcpSrv.Addr)
+		for _, line := range mcpBannerLines(mcpSrv.Addr) {
+			fmt.Println(line)
+		}
 	}
 	fmt.Println("praector daemon running (Ctrl-C to stop)")
 	if e = sched.Daemon(p.bool("once"), time.Second); e != nil {
 		return fail(e)
 	}
 	return 0
+}
+
+// mcpBannerLines returns the daemon startup banner lines for an enabled MCP
+// listener. A loopback bind prints the historical "loopback only" line
+// byte-identically. A non-loopback bind (the explicit allow_external opt-in)
+// prints the enabled line plus a loud WARNING: the unauthenticated control plane
+// becomes reachable by any host that can route to the address. It recommends
+// keeping [mcp] privileged off, prefers the docker bridge IP over 0.0.0.0, and
+// warns against public tunnels. The reduced foreign Origin/port checks are
+// DNS-rebinding/CSRF-shaped defense-in-depth only, never authentication.
+func mcpBannerLines(addr string) []string {
+	if mcp.IsLoopbackAddr(addr) {
+		return []string{fmt.Sprintf("MCP listener enabled on %s (loopback only)", addr)}
+	}
+	return []string{
+		fmt.Sprintf("MCP listener enabled on %s", addr),
+		fmt.Sprintf("WARNING: the MCP control plane is UNAUTHENTICATED and now reachable by any host that can route to %s. Keep [mcp] privileged = OFF, prefer binding the docker bridge IP over 0.0.0.0, and do not expose this address through a public tunnel. The remaining Origin/port checks are DNS-rebinding/CSRF-shaped defense-in-depth only — they are NOT authentication or access control.", addr),
+	}
 }
 
 func cmdTask(args []string) int {

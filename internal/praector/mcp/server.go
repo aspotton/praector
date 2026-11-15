@@ -92,6 +92,19 @@ type Server struct {
 	// stream. When nil the transport preserves the historical behavior and returns
 	// 405 for a GET (so POST-only deployments are byte-for-byte unchanged).
 	Streams StreamHandler
+	// AllowNonLoopback is the explicit operator opt-in (the [mcp] allow_external
+	// knob) permitting NewLoopbackServer to bind a non-loopback address. It is the
+	// INPUT knob; the actual foreign relaxation is derived once at construction as
+	// `AllowNonLoopback && !IsLoopbackAddr(addr)` and stored in foreign below. It
+	// NEVER relaxes authentication or the protocol-version header gate; it only
+	// selects the reduced DNS-rebinding/CSRF-shaped Origin check for foreign hosts.
+	AllowNonLoopback bool
+	// foreign is the immutable, per-server derived flag set once inside
+	// NewLoopbackServer BEFORE Handler() is captured, so serveStreamable reads it
+	// through the captured *Server pointer. It is true only when AllowNonLoopback
+	// is set AND the bound addr is genuinely non-loopback; a flag-on + loopback
+	// bind stays byte-identical to the strict requestAuthorized path.
+	foreign bool
 }
 
 // handle processes one decoded request and returns the response to send back. A

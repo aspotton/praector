@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -314,5 +315,42 @@ func TestNewLoopbackServerRefusesNonLoopback(t *testing.T) {
 	}
 	if _, err := NewLoopbackServer("127.0.0.1:0", newTestServer()); err != nil {
 		t.Fatalf("expected acceptance for loopback bind: %v", err)
+	}
+}
+
+// TestNewLoopbackServerAllowsNonLoopbackOnlyWithFlag proves the allow_external
+// opt-in is the sole gate on a non-loopback bind: the flag-off path keeps refusing
+// (and names the opt-in in the error), while flag-on accepts a non-loopback addr.
+// It also pins the derived per-server foreign flag: true only for a flag-on +
+// non-loopback bind, false for a flag-on + loopback bind.
+func TestNewLoopbackServerAllowsNonLoopbackOnlyWithFlag(t *testing.T) {
+	// Flag off: refusal text must name the opt-in so an operator knows how to enable it.
+	_, err := NewLoopbackServer("0.0.0.0:9999", newTestServer())
+	if err == nil {
+		t.Fatal("flag-off non-loopback bind must be refused")
+	}
+	if !strings.Contains(err.Error(), "allow_external") || !strings.Contains(err.Error(), "PRAECTOR_MCP_ALLOW_EXTERNAL") {
+		t.Fatalf("refusal error must name the opt-in, got: %v", err)
+	}
+
+	// Flag on + non-loopback addr: accepted, and the derived foreign flag is true.
+	srv := newTestServer()
+	srv.AllowNonLoopback = true
+	if _, err := NewLoopbackServer("0.0.0.0:9999", srv); err != nil {
+		t.Fatalf("flag-on non-loopback bind must be accepted: %v", err)
+	}
+	if !srv.foreign {
+		t.Fatal("derived foreign flag must be true for flag-on + non-loopback bind")
+	}
+
+	// Flag on + loopback addr: accepted, and the derived foreign flag stays false
+	// (byte-identical strict path).
+	lb := newTestServer()
+	lb.AllowNonLoopback = true
+	if _, err := NewLoopbackServer("127.0.0.1:0", lb); err != nil {
+		t.Fatalf("flag-on loopback bind must be accepted: %v", err)
+	}
+	if lb.foreign {
+		t.Fatal("derived foreign flag must be false for flag-on + loopback bind")
 	}
 }
