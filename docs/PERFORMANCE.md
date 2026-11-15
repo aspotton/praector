@@ -7,7 +7,7 @@ It is not release-notes prose: [`../CHANGELOG.md`](../CHANGELOG.md) remains the 
 ## Current status
 
 - Initial performance investigation: **complete**.
-- Code optimization: **Phase 1 and Phase 2 landed** (multi-query seam + CLI bootstrap read batching; then collection-snapshot reconciliation for `status`). Phases 3–4 not yet landed.
+- Code optimization: **Phase 1, Phase 2, and Phase 3 landed** (multi-query seam + CLI bootstrap read batching; then collection-snapshot reconciliation for `status`; then a 30s idle acceptance-readiness sweep cooldown). Phase 4 not yet landed.
 - Primary affected surface: `praector status`, CLI startup/bootstrap, terminal-state reconciliation, and idle daemon observability sweeps.
 - Primary conclusion: the dominant cost is **Dolt subprocess churn and repeated loading of the same state**, not slow SQL over the current dataset size.
 - Recommended order:
@@ -275,7 +275,7 @@ That sweep:
 
 The emitted readiness event is deduplicated by material-plan fingerprint, but deduplication prevents repeated writes, not repeated predicate evaluation. Consequently, a completely idle system can repeatedly execute expensive acceptance predicates against unchanged COMPLETE collections.
 
-This path is an observability sweep, not a correctness gate. It is therefore a strong candidate for a cooldown or event-driven recheck.
+This path is an observability sweep, not a correctness gate. Phase 3 landed a 30s in-memory per-collection cooldown on it (`Scheduler.readySwept`); an event-driven recheck via the store event-emit seam remains the further upgrade path.
 
 ## Root-cause classification
 
@@ -392,15 +392,21 @@ The snapshot contents are:
 
 ### Phase 3 — Idle sweep cooldown
 
-State: **planned**
+State: **landed**
 
-Rate-limit acceptance-readiness sweeps for unchanged COMPLETE collections. The first implementation can use an in-memory interval such as 60 seconds and retain the existing material-fingerprint dedup marker.
+`Scheduler.observeAcceptanceReadiness` now carries a per-collection in-memory cooldown gate (`Scheduler.readySwept map[string]time.Time`, `acceptanceReadinessCooldown = 30 * time.Second`). After the existing nil-store guard it returns early when a sweep for that collection ran less than 30s ago, otherwise it records `time.Now()` and proceeds exactly as before. The interval is **30s, deliberately not the 60s the earlier sketch suggested**: cost scales as 1/interval, so 30s already removes ~97% of the churn and 60s buys an unmeasurable extra ~0.5 invocations/s while doubling the only real downside. The sweep stays purely read-only and observability-only: same `acceptanceBlockReason(recordEmptyHarvest=false)` predicate, same fingerprint-keyed dedup in `raiseAcceptanceReadinessWarning`, no Git fast-forward probe, and it never gates or blocks any work path. A collection with no `readySwept` entry (nil map or zero-value time) is swept immediately, so a collection that newly becomes COMPLETE is still observed on the tick it flips — the cooldown only ever delays re-reporting something already settled. Cooldown decisions use monotonic-preserving comparisons on a raw `time.Now()` value (`now.Sub(last) < cooldown`) so a step/NTP clock change cannot freeze or prematurely re-arm the sweep.
 
-Expected outcome:
+Measured outcome (authoritative via the PATH-shim `dolt sql` invocation-count seam — see methodology warning — with `PRAECTOR_FAKE_DOLT_LOG`):
+
+- **Before:** one predicate evaluation per COMPLETE collection per 1s poll tick. Measured through the seam, a single full sweep of a graph that walks the whole predicate is **10 `dolt sql` invocations**, so a 30-tick (30s) window for one COMPLETE collection is **~301 `dolt sql` invocations (~10/s)**. Live against the real user store (idle since 2026-11-11 22:54, 29 COMPLETE + 2 BLOCKED across 6 projects), the idle daemon's floor was **~8 unique daemon-child `dolt` PIDs/s** (118 in a 15s ps sample, itself an *undercount* — see below) and `/proc/<daemon>/io` showed **14.2 MB/s written and 13,590 read-syscalls/s** with zero durable work — consistent with this every-tick sweep.
+- **After:** the same 30-tick window for one COMPLETE collection is **10 `dolt sql` invocations** — a single sweep, a **~30× / ~97% reduction** in the acceptance-readiness sweep's Dolt churn per collection, with the `ACCEPTANCE_READINESS_WOULD_BLOCK` marker still emitted exactly once per fingerprint.
+- **Methodology warning (verified, not just asserted):** sampling a process tree with `ps`/`pgrep`, or reading only the daemon parent's `/proc/<pid>/io`, **UNDERCOUNTS to zero** while the sweep is churning. Each `dolt` child lives under ~50 ms, so a plain `pgrep -P` snapshot loses half the exits to a race, and the read/write syscalls land in the transient children (whose `/proc` entries vanish before sampling), not the daemon parent. A live 39.7s parent/ps sample during an idle sweep showed a misleading `0/s` and `0` children. The PATH-shim wrapper (`dolt` invoked through a counting shim) or a child `/proc/<pid>/io` delta are the authoritative counters; a clean process listing is **not** evidence of idleness.
+
+Outcome:
 
 - substantially lower background Dolt traffic on an idle system;
-- no change to acceptance or terminal-state correctness;
-- delayed observability only, which is acceptable for the non-gating sweep.
+- no change to acceptance or terminal-state correctness or to the fingerprint dedup semantics;
+- delayed observability only — an out-of-band edit to an already-settled COMPLETE collection reports its would-block marker up to 30s late — which is acceptable for the non-gating sweep. The upgrade path is to invalidate the entry from the store's event-emit seam instead, but `Store.emitter` is a single optional SSE-only sink (nil when MCP is disabled), so that is not a one-line reuse.
 
 ### Phase 4 — Targeted indexes
 
@@ -545,7 +551,7 @@ The optimization work is complete when:
 | Bootstrap batching | **Landed** | 51 `dolt sql` / 53 dolt / 2.75 s (`project list`, 23 collections) | 3 `dolt sql` / 5 dolt / 0.30 s; bootstrap repair alone 49 → 2 | Cycle + baseline repair outcomes unchanged |
 | Bootstrap batching refinement (Phase 1.1) | **Landed** | Revision-baseline repair issues one `tasks WHERE id IN` read per matching candidate | 0 such reads (satisfied from the batched snapshot); batched task/edge reads now carry a deterministic `ORDER BY` | Clean benchmark; per-candidate `collection_revisions`/`collections` reads retained; repair SET unchanged |
 | Snapshot reconciliation (Phase 2) | **Landed** | ~31 `dolt sql` single collection; ~491 for a no-target project (pre-Phase-1.1) / ~114 (live post-Phase-1.1) | One batched snapshot read per collection: project-wide `status` is a constant **3** `dolt sql` regardless of collection count; single-collection default **6** total (incl. the flip write); `--no-reconcile` **1** read, **0** write | Read-path refactor; terminal-state/revision/coverage/repair semantics byte-identical; opt-in `--no-reconcile` zero-write render |
-| Sweep cooldown | Planned | One sweep per COMPLETE collection per second | Pending | Internal interval first |
+| Sweep cooldown | **Landed** | One sweep per COMPLETE collection per second (~10 `dolt sql`/s per collection; ~8 daemon-child PIDs/s live idle) | 30s in-memory per-collection gate (`readySwept`): one sweep per COMPLETE collection per 30s → **~301 → 10 `dolt sql` per 30s window (~97% less)**; exactly one `ACCEPTANCE_READINESS_WOULD_BLOCK` still; first-tick unconditional | Internal 30s constant, no config/CLI/schema surface; sweep stays read-only/observability-only, no gate/block; monotonic-preserving compare; `ps`/parent-`/proc` undercounts to 0 — PATH-shim seam authoritative |
 | Targeted indexes | Planned | No collection edge/event-type indexes | Pending | Needs idempotent migration |
 | Persistent/embedded Dolt | Deferred | Not measured | Deferred | Revisit only after batching |
 

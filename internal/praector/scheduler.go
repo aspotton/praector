@@ -23,6 +23,7 @@ type Scheduler struct {
 	MaxWorkersOverride  int
 	quarantined         map[string]bool
 	reportedQuarantines map[string]bool
+	readySwept          map[string]time.Time
 }
 
 func NewScheduler(store *Store, cfg GlobalConfig, maxWorkers int) (*Scheduler, error) {
@@ -30,7 +31,7 @@ func NewScheduler(store *Store, cfg GlobalConfig, maxWorkers int) (*Scheduler, e
 	if err != nil {
 		return nil, err
 	}
-	return &Scheduler{Store: store, Cfg: cfg, Workspace: workspace, MaxWorkersOverride: maxWorkers, quarantined: map[string]bool{}, reportedQuarantines: map[string]bool{}}, nil
+	return &Scheduler{Store: store, Cfg: cfg, Workspace: workspace, MaxWorkersOverride: maxWorkers, quarantined: map[string]bool{}, reportedQuarantines: map[string]bool{}, readySwept: map[string]time.Time{}}, nil
 }
 
 func (s *Scheduler) ExclusiveScheduler() (*FileLock, error) {
@@ -1658,6 +1659,14 @@ func (s *Scheduler) raiseStuckFloorAttention(pid, cid, taskID, fp, holdKind, cal
 // movement for that sweep.
 const acceptanceReadinessEvent = "ACCEPTANCE_READINESS_WOULD_BLOCK"
 
+// acceptanceReadinessCooldown rate-limits the idle acceptance-readiness observability
+// sweep per collection. An idle daemon previously walked every COMPLETE collection's
+// read-only acceptance predicate on every 1s poll tick, spawning a dolt child each call
+// (~8/s observed with zero durable work). Cost scales as 1/interval, so 30s removes ~97%
+// of that churn; 60s buys an unmeasurable extra ~0.5 invocations/s while doubling the only
+// real downside. Deliberately NOT the 60s the Phase 3 tracker sketch suggested.
+const acceptanceReadinessCooldown = 30 * time.Second
+
 // observeAcceptanceReadiness is the acceptance-readiness observability twin of
 // observeStuckFloors. The reconcile loop only visits RUNNING/BLOCKED collections, so a
 // Collection that has already reached COMPLETE but whose graph cannot actually be accepted
@@ -1676,6 +1685,26 @@ func (s *Scheduler) observeAcceptanceReadiness(collectionID string) {
 	if s.Store == nil {
 		return
 	}
+	// ponytail: per-collection cooldown gate for the idle observability sweep. Ceiling:
+	// an out-of-band edit to an already-settled COMPLETE collection reports its would-block
+	// marker up to acceptanceReadinessCooldown (30s) late, and Go's monotonic clock stops
+	// while the machine is suspended (so a suspend/step-clock edge can delay a re-sweep; a
+	// long-running server daemon is not expected to suspend, and this is advisory only).
+	// Upgrade path: invalidate the entry from the store's event-emit seam on a real change
+	// instead — but Store.emitter is a single optional SSE-only sink installed only by the
+	// SSE hub and nil when MCP is disabled, so this is not a one-line reuse. readySwept is
+	// never pruned, sharing quarantined/reportedQuarantines' lifecycle.
+	// A collection with no entry (nil map or zero time) falls through and is swept now, so
+	// a collection newly flipped to COMPLETE is observed on the flip tick; the cooldown only
+	// ever delays re-evaluation of something already swept.
+	now := time.Now()
+	if last, ok := s.readySwept[collectionID]; ok && !last.IsZero() && now.Sub(last) < acceptanceReadinessCooldown {
+		return
+	}
+	if s.readySwept == nil {
+		s.readySwept = map[string]time.Time{}
+	}
+	s.readySwept[collectionID] = now
 	c, err := s.Store.GetCollection(collectionID)
 	if err != nil || S(c, "status") != "COMPLETE" {
 		return
