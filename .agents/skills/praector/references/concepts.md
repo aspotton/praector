@@ -10,7 +10,7 @@ The central invariant is:
 
 > Agents request durable work; they never own child-agent process lifecycle.
 
-The optional MCP server is a loopback-only adapter over the same typed service and Store operations used by the CLI. It is command/surface coverage parity, not unrestricted behavioral parity. Queue-writing MCP calls persist work for the daemon; they do not run a scheduler or worker inside the MCP request.
+The optional MCP server is a loopback-only-by-default adapter over the same typed service and Store operations used by the CLI (a non-loopback bind is available only via the explicit, default-off, unauthenticated `allow_external` opt-in). It is command/surface coverage parity, not unrestricted behavioral parity. Queue-writing MCP calls persist work for the daemon; they do not run a scheduler or worker inside the MCP request.
 
 Runtime state defaults to `~/.praector` and can be isolated with `PRAECTOR_HOME`. That home contains Dolt state, Attempt logs, managed worktrees, and state/scheduler locks. Only one scheduler/daemon owns execution for a given Praector home.
 
@@ -119,9 +119,9 @@ Operator retry after exhausted failure creates a replacement Task, marks the old
 
 ## MCP security and context
 
-The listener is local and unauthenticated, so it binds loopback only and validates Host and Origin to resist DNS rebinding. It advertises one implemented MCP revision and requires a matching protocol-version header after initialization. Loopback binding plus the Host/Origin authority gate and the protocol-version header **are** the security boundary; the SSE query parameters `project`/`collection`/`type`/`level` and the `logging/setLevel` level filter are delivery filters only, **not** authorization — any local process that reaches the loopback listener can subscribe to any collection's events.
+The listener is local and unauthenticated, so by default it binds loopback only and validates Host and Origin to resist DNS rebinding. Serving a non-loopback address requires the separate, explicit, **default-off** `allow_external` opt-in (`[mcp] allow_external` / `PRAECTOR_MCP_ALLOW_EXTERNAL`), which adds **no authentication**, prints a loud startup warning, and only relaxes the authority check to a CSRF/DNS-rebinding-shaped Origin/port match (dispatch a no-Origin request, reject a literal `null` Origin and an Origin/Host port mismatch) — **never** authentication or access control. It advertises one implemented MCP revision and requires a matching protocol-version header after initialization (enforced for foreign clients too). Loopback binding plus the Host/Origin authority gate and the protocol-version header **are** the security boundary; the SSE query parameters `project`/`collection`/`type`/`level` and the `logging/setLevel` level filter are delivery filters only, **not** authorization — any local process that reaches the listener can subscribe to any collection's events.
 
-MCP operations have no implicit daemon cwd. Project-aware tools need an explicit `PRJ-*`, `COL-*`, or `T-*` context; `praector_run` always needs `project`, and MCP `init` always needs an absolute `root_path`. A remote/cloud MCP client cannot reach the loopback listener without a separately designed remote boundary, which this release intentionally does not provide.
+MCP operations have no implicit daemon cwd. Project-aware tools need an explicit `PRJ-*`, `COL-*`, or `T-*` context; `praector_run` always needs `project`, and MCP `init` always needs an absolute `root_path`. A remote/cloud MCP client cannot reach the default loopback listener; the only way to serve one is the explicit, **unauthenticated** `allow_external` non-loopback bind, and a properly authenticated remote boundary remains intentionally out of this release.
 
 ## Push vs. poll
 

@@ -575,8 +575,11 @@ The design leaves room for later additions without making them current dependenc
   decoupled from the reconcile loop and `scheduler.lock`. It performs only Store
   reads and durable enqueues on the same gated paths, never constructs a
   scheduler, and never launches processes or runs a collection inline. It is
-  disabled by default, binds loopback only, and defers auth/identity to the
-  remote boundary. The surface is **commandHelp-driven**: each CLI command maps
+  disabled by default, binds loopback only by default, and defers auth/identity to
+  the remote boundary. A non-loopback bind is possible only via the explicit,
+  default-off `allow_external` opt-in (with a genuinely non-loopback addr), which
+  adds no authentication, prints a loud startup warning, and relaxes only the
+  authority gate to a CSRF/DNS-rebinding-shaped Origin check — never access control. The surface is **commandHelp-driven**: each CLI command maps
   to exactly one MCP tool (leaf command) or resource (command namespace /
   launch-only command) through the shared `serviceOps` registry, giving
   **command/surface coverage parity** (the surfaces cannot drift) rather than a
@@ -600,7 +603,10 @@ The design leaves room for later additions without making them current dependenc
     loopback-only and unauthenticated — validates each request's Host/Origin as a
     loopback authority before dispatch (HTTP 403 on a foreign, literal `null`, or
     otherwise-opaque Origin), as DNS-rebinding defense in depth on top of the
-    socket-bind gate. MCP operations carry no implicit daemon cwd (a tool
+    socket-bind gate. Under the `allow_external` foreign mode a reduced
+    CSRF/DNS-rebinding-shaped check applies instead (dispatch a no-Origin request,
+    403 a literal `null` Origin and an Origin/Host port mismatch), while the
+    protocol-header gate stays enforced; this reduced check is never authorization. MCP operations carry no implicit daemon cwd (a tool
     inferring a project requires an explicit `PRJ-*`/`COL-*`/`T-*` identifier, and
     a collection-only context resolves its owning project via a fail-closed
     store-backed resolver), `init` requires an absolute `root_path`, and resources

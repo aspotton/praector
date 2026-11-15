@@ -5,7 +5,7 @@ description: "Operate and explain Praector's durable agent-work control plane th
 
 # Praector
 
-Drive Praector as a durable control plane through either of its two adapters: the local `praector` executable or the loopback MCP server. Both call the same typed service and store paths, so the mental model, gates, states, and authorization rules below are identical. Praector owns task-graph state, retries, scheduling, isolated Git worktrees, integration, and review; neither adapter launches worker agents inline as part of your session.
+Drive Praector as a durable control plane through either of its two adapters: the local `praector` executable or the loopback-by-default MCP server (a non-loopback bind is available only via the explicit, default-off, unauthenticated `allow_external` opt-in). Both call the same typed service and store paths, so the mental model, gates, states, and authorization rules below are identical. Praector owns task-graph state, retries, scheduling, isolated Git worktrees, integration, and review; neither adapter launches worker agents inline as part of your session.
 
 ## Choose the surface
 

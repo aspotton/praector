@@ -126,7 +126,7 @@ curl -NsG http://127.0.0.1:8765/mcp \
   --data-urlencode 'collection=COL-...'
 ```
 
-Pass a previous `id:` (the durable `EVT` id) back as a `Last-Event-ID` header to resume. Live delivery and replay share the same `project`/`collection`/`type`/`level` scoping, and the stream is **observation-only**: it launches no scheduler and bypasses no gate. These query parameters are delivery filters only, not authorization; loopback plus the Host/Origin authority gate plus the `MCP-Protocol-Version` header are the security boundary. Prefer `praector events` whenever the caller cannot hold a connection open across a process boundary, no daemon is running, or a one-shot audit is enough. See [Operations § Server-initiated event stream](../../../../docs/OPERATIONS.md#server-initiated-event-stream-sse) for the full contract.
+Pass a previous `id:` (the durable `EVT` id) back as a `Last-Event-ID` header to resume. Live delivery and replay share the same `project`/`collection`/`type`/`level` scoping, and the stream is **observation-only**: it launches no scheduler and bypasses no gate. These query parameters are delivery filters only, not authorization; loopback plus the Host/Origin authority gate plus the `MCP-Protocol-Version` header are the security boundary (a non-loopback bind via the default-off `allow_external` opt-in relaxes only the authority gate to a CSRF/DNS-rebinding-shaped Origin check, never authorization). Prefer `praector events` whenever the caller cannot hold a connection open across a process boundary, no daemon is running, or a one-shot audit is enough. See [Operations § Server-initiated event stream](../../../../docs/OPERATIONS.md#server-initiated-event-stream-sse) for the full contract.
 
 ## Verifying a CLI action
 
