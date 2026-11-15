@@ -7,15 +7,16 @@ It is not release-notes prose: [`../CHANGELOG.md`](../CHANGELOG.md) remains the 
 ## Current status
 
 - Initial performance investigation: **complete**.
-- Code optimization: **Phase 1, Phase 2, and Phase 3 landed** (multi-query seam + CLI bootstrap read batching; then collection-snapshot reconciliation for `status`; then a 30s idle acceptance-readiness sweep cooldown). Phase 4 not yet landed.
+- Code optimization: **Phase 1, Phase 2, Phase 3, and Phase 3.5 landed** (multi-query seam + CLI bootstrap read batching; then collection-snapshot reconciliation for `status`; then a 30s idle acceptance-readiness sweep cooldown; then the acceptance predicate's ancestry walk moved onto already-loaded rows, so one sweep of one Collection is one batched read). Phase 4 not yet landed.
 - Primary affected surface: `praector status`, CLI startup/bootstrap, terminal-state reconciliation, and idle daemon observability sweeps.
 - Primary conclusion: the dominant cost is **Dolt subprocess churn and repeated loading of the same state**, not slow SQL over the current dataset size.
 - Recommended order:
   1. batch logical reads through a JSONL-aware multi-query helper — **landed** (`Store.QueryMany` / `queryManyLocked`);
   2. batch CLI bootstrap invariant scans — **landed** (`Store.loadInvariantRowsLocked` drives one batched read across both bootstrap repairs);
-  3. use one per-collection snapshot across status/terminal reconciliation;
-  4. rate-limit idle COMPLETE-collection readiness sweeps;
-  5. add targeted indexes through an idempotent migration path.
+   3. use one per-collection snapshot across status/terminal reconciliation — **landed** (`Store.loadCollectionRows` and the shared decision cores);
+   4. rate-limit idle COMPLETE-collection readiness sweeps — **landed** (`Scheduler.readySwept`, 30s per collection);
+   5. evaluate the acceptance predicate, including its ancestor walks, from already-loaded rows — **landed** (`ancestorWalkFromRows` + `loadCollectionRowsWithAcceptance`, one read per swept collection);
+   6. add targeted indexes through an idempotent migration path.
 
 ## Investigation snapshot
 
@@ -273,9 +274,11 @@ That sweep:
 4. evaluates `acceptanceBlockReason()`;
 5. may traverse directive ancestors and other acceptance validators.
 
+Before Phase 3.5, item 5 was the expensive part: the directive/research ancestry walk launched one `dolt sql` per BFS node. It now walks the already-loaded rows.
+
 The emitted readiness event is deduplicated by material-plan fingerprint, but deduplication prevents repeated writes, not repeated predicate evaluation. Consequently, a completely idle system can repeatedly execute expensive acceptance predicates against unchanged COMPLETE collections.
 
-This path is an observability sweep, not a correctness gate. Phase 3 landed a 30s in-memory per-collection cooldown on it (`Scheduler.readySwept`); an event-driven recheck via the store event-emit seam remains the further upgrade path.
+This path is an observability sweep, not a correctness gate. Phase 3 landed a 30s in-memory per-collection cooldown on it (`Scheduler.readySwept`), and Phase 3.5 moved the predicate's directive/research ancestry walk onto already-loaded rows, so one sweep of one Collection is now **one** batched `dolt sql` read plus the dedup `ListEvents`. An event-driven recheck via the store event-emit seam remains a further upgrade path but is no longer the dominant cost lever.
 
 ## Root-cause classification
 
@@ -408,6 +411,22 @@ Outcome:
 - no change to acceptance or terminal-state correctness or to the fingerprint dedup semantics;
 - delayed observability only — an out-of-band edit to an already-settled COMPLETE collection reports its would-block marker up to 30s late — which is acceptable for the non-gating sweep. The upgrade path is to invalidate the entry from the store's event-emit seam instead, but `Store.emitter` is a single optional SSE-only sink (nil when MCP is disabled), so that is not a one-line reuse.
 
+### Phase 3.5 — Pure-core ancestry walk for the acceptance-readiness sweep
+
+State: **landed**
+
+Phase 3 reduced how *often* the readiness sweep runs; it deliberately left the per-sweep cost untouched, so one evaluation of one Collection still launched roughly ten `dolt sql` processes. The dominant remaining item was the predicate's directive/research ancestry walk: `Store.DirectiveAncestors` / `Store.ResearchAncestors` performed a breadth-first walk over `depends_on` edges issuing **one `dolt sql` per visited node** (a `task_edges` JOIN per frontier node), and `acceptanceBlockReason` also re-read the collection's tasks, edges, critic-baseline events, reviews/verdicts, and candidate decisions individually, plus a separate material-fingerprint tasks/edges pair.
+
+Phase 3.5 moves that walk onto rows instead of subprocesses, reusing the Phase 2 batched snapshot machinery rather than adding a second read path:
+
+- the BFS body is now a **pure Go core** — `ancestorWalkFromRows(tasks, edges, tid, acceptProfile)` in `internal/praector/store_status_snapshot.go` performs the same cycle-guarded, deterministically-ordered walk (frontier ordered by `created_at, from_task_id`, accepted rows copied and appended to, final `created_at,id` sort) over an already-loaded task/edge row set, with the profile filter injected as `ancestorProfileIsResearch` / `ancestorProfileIsDirectiveSource`;
+- `Store.ResearchAncestors`, `Store.researchAncestorsLocked`, `Store.DirectiveAncestors`, `Store.directiveAncestorsLocked`, and `Store.Dependencies` become **load-then-call delegators**: they load the task and edge rows through one two-statement batched read (`ancestryRowStatements` / `loadAncestryRows`, the collection's `tasks` and `task_edges`, the collection resolved by a scalar subquery because the caller only knows a task id) and hand them to the same core. Their signatures, returned membership, and error text are unchanged, so the Envelope compiler, the claim-time directive gate, and the scheduler callers need no change;
+- `acceptanceBlockReason` splits the same way: `acceptanceBlockReasonFromRows` holds the predicate verbatim (critic staleness from `criticRevalidationFromRows`, coverage, verdict, directive traceability with the walk now row-fed, impact enumeration, candidate decisions from the snapshot's tail statement, and the 200-row empty-harvest event window from the snapshot's events rows), and the cid-facing entry point loads one `loadCollectionRowsWithAcceptance` snapshot and delegates. Verdicts and the six error strings are byte-for-byte identical;
+- `Scheduler.observeAcceptanceReadiness` loads **one** snapshot per swept Collection and passes it to both `acceptanceBlockReasonFromRows` and the new `materialFingerprintFromRows`, so the fingerprint costs zero additional reads instead of its own tasks/edges pair;
+- the snapshot statement prefix stays byte-identical to Phase 2's `collectionSnapshotStatements` (statements 0..9), with the extra decisions and per-collection events-LIMIT-200 statements appended at the **tail** so the shared `status` path is untouched. One deviation is recorded rather than glossed: the appended decisions statement resolves `project_id` through `project_id IN (SELECT project_id FROM collections WHERE id=…)` because the batch cannot know the project id before reading `collections`; membership is identical and never wider than `ListDecisions`'s.
+
+Consistency comes from the store file lock, as elsewhere — no `START TRANSACTION`/`COMMIT`, no `-b`, no `-r jsonl`/`-f file`/server mode, and Dolt 2.7.x only.
+
 ### Phase 4 — Targeted indexes
 
 State: **planned**
@@ -493,7 +512,10 @@ Function names are more durable than line numbers. At the time of investigation:
 | Terminal reconciliation | `Store.UpdateCollectionTerminalState()` |
 | Coverage validator | `Store.ImplementationsMissingPassingReview()` |
 | Critic revalidation | `Store.CriticRevalidationState()` |
-| Acceptance predicate | `acceptanceBlockReason()` in `internal/praector/cli.go` |
+| Acceptance predicate | `acceptanceBlockReason()` / `acceptanceBlockReasonFromRows()` in `internal/praector/cli.go` |
+| Ancestry walk core (no reads) | `ancestorWalkFromRows()` / `dependsOnAdjacency()` / `ancestorProfileIsResearch` / `ancestorProfileIsDirectiveSource` in `internal/praector/store_status_snapshot.go` |
+| Ancestry row loader | `ancestryRowStatements()` / `Store.loadAncestryRows()` / `Store.loadAncestryRowsLocked()` in `internal/praector/store.go` |
+| Acceptance-variant snapshot loader | `Store.loadCollectionRowsWithAcceptance()` / `materialFingerprintFromRows()` |
 | Daemon polling | `Scheduler.Daemon()` in `internal/praector/scheduler.go` |
 | Acceptance readiness sweep | `Scheduler.observeAcceptanceReadiness()` |
 | Embedded schema | `internal/assets/schema.sql` |
@@ -537,6 +559,7 @@ The optimization work is complete when:
 - bootstrap invariant scanning uses a bounded small number of SQL processes;
 - one status path loads each collection’s tasks/edges once per reconciliation phase;
 - idle daemon acceptance sweeps are rate-limited;
+- the acceptance predicate, including its ancestor walks, evaluates from already-loaded rows rather than one read per graph node;
 - existing cycle repair, terminal-state, review-coverage, revision, and acceptance semantics remain unchanged;
 - targeted indexes are added idempotently or their omission is explicitly measured and justified;
 - `make check` passes;
@@ -552,6 +575,7 @@ The optimization work is complete when:
 | Bootstrap batching refinement (Phase 1.1) | **Landed** | Revision-baseline repair issues one `tasks WHERE id IN` read per matching candidate | 0 such reads (satisfied from the batched snapshot); batched task/edge reads now carry a deterministic `ORDER BY` | Clean benchmark; per-candidate `collection_revisions`/`collections` reads retained; repair SET unchanged |
 | Snapshot reconciliation (Phase 2) | **Landed** | ~31 `dolt sql` single collection; ~491 for a no-target project (pre-Phase-1.1) / ~114 (live post-Phase-1.1) | One batched snapshot read per collection: project-wide `status` is a constant **3** `dolt sql` regardless of collection count; single-collection default **6** total (incl. the flip write); `--no-reconcile` **1** read, **0** write | Read-path refactor; terminal-state/revision/coverage/repair semantics byte-identical; opt-in `--no-reconcile` zero-write render |
 | Sweep cooldown | **Landed** | One sweep per COMPLETE collection per second (~10 `dolt sql`/s per collection; ~8 daemon-child PIDs/s live idle) | 30s in-memory per-collection gate (`readySwept`): one sweep per COMPLETE collection per 30s → **~301 → 10 `dolt sql` per 30s window (~97% less)**; exactly one `ACCEPTANCE_READINESS_WOULD_BLOCK` still; first-tick unconditional | Internal 30s constant, no config/CLI/schema surface; sweep stays read-only/observability-only, no gate/block; monotonic-preserving compare; `ps`/parent-`/proc` sampling unreliable (two live samples disagreed: `0/s` vs ~8/s) — PATH-shim seam authoritative |
+| Acceptance-predicate ancestry walk (Phase 3.5) | **Landed** | One acceptance-readiness sweep ≈10 `dolt sql` per collection, incl. one per-node `task_edges JOIN tasks` read per BFS ancestor node | **One** batched `dolt sql` per swept collection (N collections → N invocations), 0 per-node reads, 0 extra reads for the material-plan fingerprint; would-block path adds only the dedup `ListEvents` + marker write | Pure-core walk over already-loaded rows (`ancestorWalkFromRows`); the four `*Ancestors`/`Dependencies` wrappers and `acceptanceBlockReason` became load-then-call delegators with byte-identical membership, verdicts, and error text; no gate/cycle-guard/fingerprint-dedup/cooldown change; appended snapshot statements are tail-only so the shared `status` path is byte-identical; live idle-daemon re-capture not re-run (sandbox-blocked) |
 | Targeted indexes | Planned | No collection edge/event-type indexes | Pending | Needs idempotent migration |
 | Persistent/embedded Dolt | Deferred | Not measured | Deferred | Revisit only after batching |
 
@@ -644,6 +668,28 @@ live in `internal/praector/status_snapshot_test.go`:
 `TestSkillCLICommandHelpCoversCommandHelp` and the `serviceOps`/MCP parity tests still pass
 with the new `--no-reconcile` flag and the additive `StatusInput.NoReconcile` field.
 
+### Phase 3.5 measured result (counting seam)
+
+These figures are measured through the counting `dolt sql` seam (`PRAECTOR_FAKE_DOLT_LOG`, the same seam the Phase 2 figures above use and the same PATH-shim methodology the wrapper note above prescribes), not a live-environment capture. Each figure counts `dolt sql` subprocesses launched by one acceptance-readiness sweep:
+
+| Operation | Before | After |
+| --- | ---: | ---: |
+| one sweep of one settled, acceptable `COMPLETE` collection | ~10 `dolt sql` (the Phase 3 seam figure for a full predicate walk) | **1** batched `dolt sql` |
+| one sweep over N settled `COMPLETE` collections (N = 3 seeded) | scales per collection, ~10 each | **exactly N** — one batched read per collection |
+| per-BFS-node ancestry read (`task_edges e JOIN tasks t … WHERE e.to_task_id=`) | one per visited node | **0** |
+| material-plan fingerprint inside the same sweep | its own tasks/edges pair | **0 extra reads** (same snapshot) |
+| would-block path (marker fires) | predicate reads + dedup read + marker write | the one snapshot batch + the dedup `ListEvents` + the marker write |
+
+The floor guards are durable tests in `internal/praector/ancestry_rows_test.go`:
+
+- `TestAcceptanceReadinessSweepIssuesOneBatchPerCollection` / `TestAcceptanceReadinessSweepOverNCollectionsIssuesNBatches`: the read-budget rows above (one batched read per collection, N collections → N invocations, zero per-node JOIN reads, decisions/events riding inside the same process);
+- the three-way parity tests: a copied reference of the removed SQL predicate, the cid-facing wrapper, and the rows path produce the **identical** first-block message for all six would-block reasons, and the empty-harvest write is still reachable from the rows path;
+- `TestAncestryWalkCrossCollectionEdgeIsWriterInvariant`: a seeded stray edge into another collection's task admits no foreign ancestor;
+- the over-200-events window test: the snapshot's tail events statement equals `EventsForCollection(cid, 200)`;
+- the pure-walk and frontier tests: `ancestorWalkFromRows` performs no reads and the frontier visit order is `(created_at, from_task_id)`-stable under shuffled input.
+
+**Live capture status:** the idle-daemon child-`cmdline` re-measurement against the real user store was **not** re-run for this phase — the worker sandbox for the landing attempt blocks the out-of-tree writes and binary execution the live harness needs. The Phase 3 live figures above therefore remain the last live-environment capture of this sweep, and are explicitly **pre-Phase-3.5**; the per-collection floor they imply (~10 reads per sweep, ~8 daemon-child PIDs/s) is superseded by the seam-measured **one read per collection per 30s window** recorded here. A live re-capture is the first item under Risks and open questions.
+
 ### Live Phase 1.1 captures (live environment)
 
 These are **live-environment** captures — the real, populated user store with a normal
@@ -692,6 +738,8 @@ Phase 2 (collection-snapshot reconciliation) work rather than anything addressed
 - `status` can create durable terminal-state updates and commits. Benchmarks should compare the same realistic collection states.
 - Existing databases have already been created from the current schema, so index definitions must have a migration path rather than only appearing in `schema.sql`.
 - Sweep cooldown trades observability latency for background cost. The cooldown should be justified and measured rather than introduced as a configuration-heavy feature.
+- **Open:** the post-Phase-3.5 idle-daemon live re-capture (PATH-shim `dolt sql` counts plus the child-`cmdline` classification against the real user store) has not been run; the phase's floor is recorded from the counting seam. Re-run it on a 0.2.6+ daemon and record it here, remembering that process sampling is unreliable in both directions and a child-`/proc` or shim counter is authoritative.
+- Row-fed walks read the row set captured under the file lock at the start of the predicate, so a concurrent commit landing mid-predicate is observed as of the snapshot rather than mid-walk. That is the same consistency model every other batched path already relies on (no declared transaction), and it cannot widen any membership rule, but it does mean a walk and a concurrent write are ordered by the lock rather than linearized.
 - The daemon may have an active project/collection mix different from the benchmark database. Separate idle-daemon measurements from interactive CLI measurements.
 
 ## Maintenance rules

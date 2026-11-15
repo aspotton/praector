@@ -862,7 +862,43 @@ func validateCollectionForAcceptance(store *Store, c Row, derivedCandidates ...D
 // durable write is made at all. It returns (tasks, nil) when acceptance is clear, or
 // (nil, err) whose text is the would-block reason, naming the first blocking check.
 func acceptanceBlockReason(store *Store, c Row, state string, recordEmptyHarvest bool, derivedCandidates ...DerivedConfigCandidate) (Rows, error) {
-	critic, _ := store.CriticRevalidationState(S(c, "id"))
+	// Load-then-call delegator over the shared predicate core (the same
+	// pure-core + delegating-wrapper convention the Phase 2 terminal-state cores
+	// use), so the accept/PR path and the non-blocking readiness sweep run ONE
+	// decide implementation and cannot drift. Every row set the predicate reads
+	// comes from ONE batched snapshot process instead of one read per decision
+	// (plus one read per BFS node for the directive ancestry walk, which is what
+	// Phase 3.5 removed): tasks, edges, critic-baseline events, the durable
+	// decision inventory, and the 200-row harvest-marker window.
+	cid := S(c, "id")
+	snaps, e := store.loadCollectionRowsWithAcceptance([]string{cid})
+	if e != nil {
+		return nil, e
+	}
+	sn := snaps[cid]
+	if sn == nil {
+		sn = &collectionSnapshot{collection: c}
+	}
+	return acceptanceBlockReasonFromRows(store, c, state, recordEmptyHarvest, sn, derivedCandidates...)
+}
+
+// acceptanceBlockReasonFromRows is the decide body of acceptanceBlockReason over
+// an already-loaded snapshot. It reproduces the first-failure order and the exact
+// message text of every would-block reason verbatim: a stale required critic seal
+// (both the non-COMPLETE and the COMPLETE form), the missing/non-pass review
+// verdict, the uncited inherited directive, the missing review impact
+// enumeration, the unknown candidate disposition, and the uncovered implementation.
+// The ancestry walk and the critic-revalidation check consume the snapshot's rows
+// (criticRevalidationFromRows / ancestorWalkFromRows) instead of issuing reads, so
+// the only durable write this predicate can still make is the empty-harvest audit
+// event, and only when recordEmptyHarvest is true.
+func acceptanceBlockReasonFromRows(store *Store, c Row, state string, recordEmptyHarvest bool, sn *collectionSnapshot, derivedCandidates ...DerivedConfigCandidate) (Rows, error) {
+	tasks, edges := sn.tasks, sn.edges
+	criticCollection := sn.collection
+	if criticCollection == nil {
+		criticCollection = c
+	}
+	critic := criticRevalidationFromRows(criticCollection, tasks, edges, sn.baselineEvents)
 	policy := effectivePlanningPolicy(c)
 	if state != TaskComplete && state != "COMPLETE" {
 		if policy.CriticRequired && B(critic, "stale") {
@@ -872,14 +908,6 @@ func acceptanceBlockReason(store *Store, c Row, state string, recordEmptyHarvest
 	}
 	if policy.CriticRequired && B(critic, "stale") {
 		return nil, fmt.Errorf("Collection %s has a stale required critic; acceptance requires a fresh critic seal.", S(c, "id"))
-	}
-	tasks, e := store.ListTasks(S(c, "id"))
-	if e != nil {
-		return nil, e
-	}
-	edges, e := store.ListEdges(S(c, "id"))
-	if e != nil {
-		return nil, e
 	}
 	by := map[string]Row{}
 	for _, t := range tasks {
@@ -900,21 +928,15 @@ func acceptanceBlockReason(store *Store, c Row, state string, recordEmptyHarvest
 			verifies[S(ed, "from_task_id")] = append(verifies[S(ed, "from_task_id")], S(ed, "to_task_id"))
 		}
 	}
-	legacyDecisions, e := store.ListDecisions(S(c, "project_id"), S(c, "id"))
-	if e != nil {
-		return nil, e
-	}
-	legacyIDs := LegacyGateTraceabilityExceptionIDs(legacyDecisions, S(c, "id"))
+	legacyIDs := LegacyGateTraceabilityExceptionIDs(sn.decisions, S(c, "id"))
 	// Per-consumer dedup for the empty-harvest event so repeated acceptance
 	// checks do not record the same consumer more than once. The scheduler
 	// observer emits it during sweeps; this seam covers consumers that reached
 	// acceptance without a sweep having observed them.
 	harvestedConsumers := map[string]bool{}
-	if harvestEvents, evErr := store.EventsForCollection(S(c, "id"), 200); evErr == nil {
-		for _, ev := range harvestEvents {
-			if S(ev, "event_type") == "DIRECTIVE_TRACEABILITY_EMPTY_HARVEST" {
-				harvestedConsumers[S(ev, "task_id")] = true
-			}
+	for _, ev := range sn.events {
+		if S(ev, "event_type") == "DIRECTIVE_TRACEABILITY_EMPTY_HARVEST" {
+			harvestedConsumers[S(ev, "task_id")] = true
 		}
 	}
 	// Candidates are recomputed from the final base...integration diff, so the
@@ -939,32 +961,29 @@ func acceptanceBlockReason(store *Store, c Row, state string, recordEmptyHarvest
 		if S(t, "status") != TaskComplete || strings.ToLower(strings.TrimSpace(S(M(t, "result"), "verdict"))) != "pass" {
 			continue
 		}
-		if ancestors, e := store.DirectiveAncestors(S(t, "id")); e == nil {
-			if directives := InheritedDirectives(ancestors); len(directives) > 0 {
-				if e := ValidateDirectiveTraceability(M(t, "result"), directives, true, legacyIDs); e != nil {
-					return nil, fmt.Errorf("Collection %s cannot be accepted: %w", S(c, "id"), e)
-				}
-			} else if len(ancestors) > 0 && !harvestedConsumers[S(t, "id")] {
-				// A directive-bearing ancestor that yielded zero harvestable
-				// directives is recorded here (outside the store lock) so the
-				// empty harvest is auditable rather than silent. Observability
-				// only: acceptance is neither blocked nor newly gated. A
-				// genuinely directive-free lineage (no ancestor) stays silent.
-				// The non-blocking readiness sweep calls with
-				// recordEmptyHarvest=false and stays purely read-only; it still
-				// marks the consumer seen so its in-call behavior matches the
-				// accept path exactly.
-				if recordEmptyHarvest {
-					ids := []string{}
-					for _, ancestor := range ancestors {
-						ids = append(ids, S(ancestor, "id"))
-					}
-					_ = store.RecordEmptyDirectiveHarvest(S(c, "project_id"), S(c, "id"), S(t, "id"), ids)
-				}
-				harvestedConsumers[S(t, "id")] = true
+		ancestors := ancestorWalkFromRows(tasks, edges, S(t, "id"), ancestorProfileIsDirectiveSource)
+		if directives := InheritedDirectives(ancestors); len(directives) > 0 {
+			if e := ValidateDirectiveTraceability(M(t, "result"), directives, true, legacyIDs); e != nil {
+				return nil, fmt.Errorf("Collection %s cannot be accepted: %w", S(c, "id"), e)
 			}
-		} else {
-			return nil, e
+		} else if len(ancestors) > 0 && !harvestedConsumers[S(t, "id")] {
+			// A directive-bearing ancestor that yielded zero harvestable
+			// directives is recorded here (outside the store lock) so the
+			// empty harvest is auditable rather than silent. Observability
+			// only: acceptance is neither blocked nor newly gated. A
+			// genuinely directive-free lineage (no ancestor) stays silent.
+			// The non-blocking readiness sweep calls with
+			// recordEmptyHarvest=false and stays purely read-only; it still
+			// marks the consumer seen so its in-call behavior matches the
+			// accept path exactly.
+			if recordEmptyHarvest {
+				ids := []string{}
+				for _, ancestor := range ancestors {
+					ids = append(ids, S(ancestor, "id"))
+				}
+				_ = store.RecordEmptyDirectiveHarvest(S(c, "project_id"), S(c, "id"), S(t, "id"), ids)
+			}
+			harvestedConsumers[S(t, "id")] = true
 		}
 		if S(t, "profile") == "review" {
 			candidates := derivedCandidates
@@ -976,7 +995,7 @@ func acceptanceBlockReason(store *Store, c Row, state string, recordEmptyHarvest
 			}
 			if decisionIDs := CandidateDecisionIDs(M(t, "result")); len(decisionIDs) > 0 {
 				known := map[string]bool{}
-				for _, decision := range legacyDecisions {
+				for _, decision := range sn.decisions {
 					known[S(decision, "id")] = true
 				}
 				for _, decisionID := range decisionIDs {

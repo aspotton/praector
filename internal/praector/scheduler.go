@@ -141,7 +141,7 @@ func (s *Scheduler) materialFingerprint(collection Row, tasks Rows, legacy bool)
 	if err != nil {
 		return "", err
 	}
-	return MaterialPlanFingerprint(S(collection, "objective"), tasks, edges, legacy), nil
+	return materialFingerprintFromRows(S(collection, "objective"), tasks, edges, legacy), nil
 }
 
 func (s *Scheduler) ensureMaterialCriticRevalidation(collection Row, active Rows, policy PlanningPolicy, critic, planReview Row) (Row, bool, error) {
@@ -1692,7 +1692,11 @@ func (s *Scheduler) observeAcceptanceReadiness(collectionID string) {
 	// long-running server daemon is not expected to suspend, and this is advisory only).
 	// Upgrade path: invalidate the entry from the store's event-emit seam on a real change
 	// instead — but Store.emitter is a single optional SSE-only sink installed only by the
-	// SSE hub and nil when MCP is disabled, so this is not a one-line reuse. readySwept is
+	// SSE hub and nil when MCP is disabled, so this is not a one-line reuse. It is also no
+	// longer the dominant cost lever: the predicate itself now evaluates from ONE batched
+	// snapshot read per collection (the directive/research ancestry walk runs over loaded
+	// rows instead of one dolt sql per BFS node), so a cooled-down window costs at most one
+	// read plus the dedup ListEvents. readySwept is
 	// never pruned, sharing quarantined/reportedQuarantines' lifecycle.
 	// A collection with no entry (nil map or zero time) falls through and is swept now, so
 	// a collection newly flipped to COMPLETE is observed on the flip tick; the cooldown only
@@ -1705,23 +1709,27 @@ func (s *Scheduler) observeAcceptanceReadiness(collectionID string) {
 		s.readySwept = map[string]time.Time{}
 	}
 	s.readySwept[collectionID] = now
-	c, err := s.Store.GetCollection(collectionID)
-	if err != nil || S(c, "status") != "COMPLETE" {
-		return
-	}
-	tasks, err := s.Store.ListTasks(collectionID)
+	// Phase 3.5: one batched snapshot per swept collection replaces the previous
+	// GetCollection + ListTasks + ListEdges + ListDecisions + EventsForCollection +
+	// one-read-per-BFS-node shape. The snapshot already carries the tasks, edges,
+	// critic-baseline events, durable decisions, and the 200-row harvest window the
+	// predicate consumes, so the shared rows cores run with zero further reads.
+	// The predicate is still invoked with recordEmptyHarvest=false (purely
+	// read-only: no audit-event write), without Git-derived config candidates
+	// (matching the no-workspace-access caller path, leaving the deterministic
+	// store validators as the would-block source), and WITHOUT any
+	// UpdateCollectionTerminalState or git fast-forward probe.
+	snaps, err := s.Store.loadCollectionRowsWithAcceptance([]string{collectionID})
 	if err != nil {
 		return
 	}
-	fp, err := s.materialFingerprint(c, tasks, false)
-	if err != nil {
+	sn := snaps[collectionID]
+	if sn == nil || S(sn.collection, "status") != "COMPLETE" {
 		return
 	}
-	// recordEmptyHarvest=false keeps the predicate purely read-only (no audit-event write);
-	// no Git-derived config candidates are passed, matching the no-workspace-access caller
-	// path and leaving the deterministic store validators as the would-block source.
-	if _, e := acceptanceBlockReason(s.Store, c, S(c, "status"), false); e != nil {
-		s.raiseAcceptanceReadinessWarning(S(c, "project_id"), collectionID, fp, e.Error())
+	fp := materialFingerprintFromRows(S(sn.collection, "objective"), sn.tasks, sn.edges, false)
+	if _, e := acceptanceBlockReasonFromRows(s.Store, sn.collection, S(sn.collection, "status"), false, sn); e != nil {
+		s.raiseAcceptanceReadinessWarning(S(sn.collection, "project_id"), collectionID, fp, e.Error())
 	}
 }
 
