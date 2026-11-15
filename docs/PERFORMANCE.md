@@ -7,7 +7,8 @@ It is not release-notes prose: [`../CHANGELOG.md`](../CHANGELOG.md) remains the 
 ## Current status
 
 - Initial performance investigation: **complete**.
-- Code optimization: **Phase 1, Phase 2, Phase 3, and Phase 3.5 landed** (multi-query seam + CLI bootstrap read batching; then collection-snapshot reconciliation for `status`; then a 30s idle acceptance-readiness sweep cooldown; then the acceptance predicate's ancestry walk moved onto already-loaded rows, so one sweep of one Collection is one batched read). Phase 4 not yet landed.
+- Code optimization: **Phase 1, Phase 2, Phase 3, and Phase 3.5 landed** (multi-query seam + CLI bootstrap read batching; then collection-snapshot reconciliation for `status`; then a 30s idle acceptance-readiness sweep cooldown; then the acceptance predicate's ancestry walk moved onto already-loaded rows, so one sweep of one Collection is one batched read). Phase 3.6 and Phase 4 not yet landed.
+- Live verification of Phase 3.5 (post-landing, real store): the mechanism is confirmed — one batched read per swept collection and **zero** per-node ancestry reads in the live idle path — but the aggregate idle win is only **~17%**, not the near-floor originally implied. The dominant remaining background cost is the daemon's own per-tick reconcile fan-out, which no earlier phase covered; see **Phase 3.6**. The original investigation misattributed those reads to the readiness sweep, and that correction is recorded in Phase 3.5 rather than quietly dropped.
 - Primary affected surface: `praector status`, CLI startup/bootstrap, terminal-state reconciliation, and idle daemon observability sweeps.
 - Primary conclusion: the dominant cost is **Dolt subprocess churn and repeated loading of the same state**, not slow SQL over the current dataset size.
 - Recommended order:
@@ -16,7 +17,8 @@ It is not release-notes prose: [`../CHANGELOG.md`](../CHANGELOG.md) remains the 
    3. use one per-collection snapshot across status/terminal reconciliation — **landed** (`Store.loadCollectionRows` and the shared decision cores);
    4. rate-limit idle COMPLETE-collection readiness sweeps — **landed** (`Scheduler.readySwept`, 30s per collection);
    5. evaluate the acceptance predicate, including its ancestor walks, from already-loaded rows — **landed** (`ancestorWalkFromRows` + `loadCollectionRowsWithAcceptance`, one read per swept collection);
-   6. add targeted indexes through an idempotent migration path.
+   6. batch the daemon's own per-tick reconcile fan-out — **planned** (`Scheduler.reconcileCollection` is not snapshot-based; this is where the remaining idle reads actually live, per the Phase 3.5 live re-capture);
+   7. add targeted indexes through an idempotent migration path.
 
 ## Investigation snapshot
 
@@ -427,6 +429,49 @@ Phase 3.5 moves that walk onto rows instead of subprocesses, reusing the Phase 2
 
 Consistency comes from the store file lock, as elsewhere — no `START TRANSACTION`/`COMMIT`, no `-b`, no `-r jsonl`/`-f file`/server mode, and Dolt 2.7.x only.
 
+#### Live verification (post-landing, real user store)
+
+The daemon was rebuilt and restarted on the post-3.5 binary and sampled over a 42s window — longer than the 30s cooldown — with the store genuinely idle (last durable event 2026-11-11, no work in flight). Classification is by child `cmdline` read from `/proc`; 222 of 350 distinct children were classified and the other 128 were reaped before their `cmdline` could be read, so the per-shape counts below are **floors** while the per-second total is exact.
+
+| live idle observation over 42s | count |
+| --- | ---: |
+| acceptance snapshots (≥10 statements; one batch per swept collection) | 16 |
+| per-node ancestry JOIN (`FROM task_edges e JOIN tasks t … WHERE e.to_task_id=`) | **0** |
+| children spawned through the 2-statement ancestry loader | **0** |
+| total distinct daemon children | 350 → **8.33/s** (vs ~10/s recorded pre-3.5) |
+
+Two conclusions, and the second matters more than the first:
+
+- **The mechanism landed as designed.** The sweep is one batched read per collection, and the per-node ancestry read is gone from the live idle path entirely.
+- **The aggregate idle win is ~17%, not the near-floor this phase implied — because of a misattribution in the original investigation, not a defect in the change.** The earlier live idle trace reported "~28× the `task_edges JOIN tasks … WHERE e.to_task_id=` shape" as the sweep's ancestry walk. That JOIN skeleton is shared by unrelated queries and was classified on the skeleton rather than the predicate. Splitting the 47 matches by predicate gives **32** reconcile-tick unmet-dependency probes, **15** coverage `COUNT(*)`s, and **zero** ancestry reads. The dominant background cost was therefore never the readiness sweep; it is the daemon's own per-tick reconcile fan-out, which no phase had addressed. See Phase 3.6.
+
+The interactive side is independently real and was measured directly against the live store: `collection accept --dry-run` on a settled COMPLETE collection went **39 → 22 `dolt sql`** and 6.26 s → 3.60 s with byte-identical output; `task list` (the per-task `Dependencies` path, the one plausible regression from the wider row payload the delegators fetch) stayed at **13 reads** and byte-identical output; and `status` stayed at **3 reads** with byte-identical output, confirming the tail-appended statements leave the shared path untouched. Timings include lock contention with the running daemon and are indicative; the read counts are exact.
+
+### Phase 3.6 — Daemon-tick reconciliation batching
+
+State: **planned** (new; surfaced by the Phase 3.5 live re-capture)
+
+This is the Phase 2 pattern applied to a surface Phase 2 did not cover. "Reconciliation" names two different functions here, and conflating them is exactly what produced the misattribution above:
+
+- `Store.reconcileCollectionSnapshot` is the batched core Phase 2 landed. It has exactly two callers — the single-target and project-wide `status` paths in `service.go`. The "one snapshot across terminal reconciliation" claim covers *that* path and nothing else.
+- `Scheduler.reconcileCollection` is the daemon's own reconcile, and it is not snapshot-based. Per collection, per tick, it fans out into five independent store operations, each acquiring the store and issuing its own reads:
+
+```text
+RepairLegacyDependencyCycles(collectionID)   1 read set
+EnsureCollectionEntrypoint(collectionID)     1 read set
+RefreshWaitingTasks(collectionID)  ×3        3 read sets
+UpdateCollectionTerminalState(collectionID)  1 read set
+```
+
+It is reached once per collection per tick through `Scheduler.reconcileCollectionSafely` (`scheduler.go:2622`, and `scheduler.go:2706` which iterates collections), and `scheduler.go` additionally holds ~29 raw `GetCollection`/`ListTasks`/`ListEdges` call sites. Those are the shapes the Phase 3.5 re-capture actually found in the idle window: per-collection `tasks`, `collections`, and `task_edges` reads, the `NOT EXISTS` unmet-dependency probe, the coverage `COUNT` join, and the `DISTINCT t.collection_id … status IN (…)` work probe.
+
+The work is to feed the tick one `loadCollectionRows` snapshot per collection and route the reconcile steps through `…FromRows` cores, reusing the existing seam rather than introducing another loader. Two constraints make this harder than Phase 2's version:
+
+1. **Most of the fan-out writes.** `RefreshWaitingTasks` and `UpdateCollectionTerminalState` mutate durable state and can create Dolt commits, so a batched variant must preserve the ordering Phase 2 already had to reason about — repair and reconcile cores first, then terminal-state flips, then reload. No declared transaction; the file lock remains the consistency model.
+2. **All five functions are shared with CLI paths.** A batched form must be tick-local or provably behavior-preserving for every caller. The safest cut is a tick-local snapshot plus rows variants of only the read portions, leaving the write entry points exactly where they are.
+
+Expected win: this is where the remaining idle background reads actually are, so it is the last batching item before embedded Dolt becomes the only remaining lever. It also decides Phase 4's real target — the `NOT EXISTS` and `COUNT` probes over `task_edges` are the shapes an index would help, which is a different and still-valid justification than the retired ancestry-read one.
+
 ### Phase 4 — Targeted indexes
 
 State: **planned**
@@ -465,6 +510,8 @@ Priority rationale:
 4. Project-created ordering supports project-wide collection listing.
 
 Index write-overhead should be measured individually after query batching. They are useful, but they are not the expected primary fix at current scale.
+
+**Rationale update after the Phase 3.5 live re-capture:** candidate 1 was originally justified by the per-node ancestry walk, and that read no longer exists. The surviving justifications over `task_edges` are the reconcile tick's `NOT EXISTS` unmet-dependency probe and the coverage `COUNT` join, which makes `task_edges(to_task_id, created_at)` the better-shaped candidate than `(collection_id, relation)`. Re-measure after Phase 3.6 — that work removes several of these probes outright, and an index on a query the tick stops issuing is pure write overhead.
 
 ### Deferred — Persistent or embedded Dolt
 
@@ -575,7 +622,8 @@ The optimization work is complete when:
 | Bootstrap batching refinement (Phase 1.1) | **Landed** | Revision-baseline repair issues one `tasks WHERE id IN` read per matching candidate | 0 such reads (satisfied from the batched snapshot); batched task/edge reads now carry a deterministic `ORDER BY` | Clean benchmark; per-candidate `collection_revisions`/`collections` reads retained; repair SET unchanged |
 | Snapshot reconciliation (Phase 2) | **Landed** | ~31 `dolt sql` single collection; ~491 for a no-target project (pre-Phase-1.1) / ~114 (live post-Phase-1.1) | One batched snapshot read per collection: project-wide `status` is a constant **3** `dolt sql` regardless of collection count; single-collection default **6** total (incl. the flip write); `--no-reconcile` **1** read, **0** write | Read-path refactor; terminal-state/revision/coverage/repair semantics byte-identical; opt-in `--no-reconcile` zero-write render |
 | Sweep cooldown | **Landed** | One sweep per COMPLETE collection per second (~10 `dolt sql`/s per collection; ~8 daemon-child PIDs/s live idle) | 30s in-memory per-collection gate (`readySwept`): one sweep per COMPLETE collection per 30s → **~301 → 10 `dolt sql` per 30s window (~97% less)**; exactly one `ACCEPTANCE_READINESS_WOULD_BLOCK` still; first-tick unconditional | Internal 30s constant, no config/CLI/schema surface; sweep stays read-only/observability-only, no gate/block; monotonic-preserving compare; `ps`/parent-`/proc` sampling unreliable (two live samples disagreed: `0/s` vs ~8/s) — PATH-shim seam authoritative |
-| Acceptance-predicate ancestry walk (Phase 3.5) | **Landed** | One acceptance-readiness sweep ≈10 `dolt sql` per collection, incl. one per-node `task_edges JOIN tasks` read per BFS ancestor node | **One** batched `dolt sql` per swept collection (N collections → N invocations), 0 per-node reads, 0 extra reads for the material-plan fingerprint; would-block path adds only the dedup `ListEvents` + marker write | Pure-core walk over already-loaded rows (`ancestorWalkFromRows`); the four `*Ancestors`/`Dependencies` wrappers and `acceptanceBlockReason` became load-then-call delegators with byte-identical membership, verdicts, and error text; no gate/cycle-guard/fingerprint-dedup/cooldown change; appended snapshot statements are tail-only so the shared `status` path is byte-identical; live idle-daemon re-capture not re-run (sandbox-blocked) |
+| Acceptance-predicate ancestry walk (Phase 3.5) | **Landed** | One acceptance-readiness sweep ≈10 `dolt sql` per collection, incl. one per-node `task_edges JOIN tasks` read per BFS ancestor node | **One** batched `dolt sql` per swept collection (N collections → N invocations), 0 per-node reads, 0 extra reads for the material-plan fingerprint; would-block path adds only the dedup `ListEvents` + marker write | Pure-core walk over already-loaded rows (`ancestorWalkFromRows`); the four `*Ancestors`/`Dependencies` wrappers and `acceptanceBlockReason` became load-then-call delegators with byte-identical membership, verdicts, and error text; no gate/cycle-guard/fingerprint-dedup/cooldown change; appended snapshot statements are tail-only so the shared `status` path is byte-identical; **live re-capture run post-landing**: 0 per-node reads and 16 batched snapshots per 42s idle window confirmed, aggregate idle spawn 10/s → 8.33/s (~17%), residual cost is the daemon tick (Phase 3.6) |
+| Daemon-tick reconcile fan-out (Phase 3.6) | Planned | ~8.33 daemon children/s idle; per collection per tick `tasks WHERE collection_id` (60), `collections WHERE id` (57), `NOT EXISTS` unmet-dep probe (32), `task_edges WHERE collection_id` (27), coverage `COUNT` (15), `DISTINCT collection_id` work probe (16) per 42s | Pending | Same Phase 2 pattern on a surface Phase 2 never covered; 4 of the 5 fan-out calls write durable state, and all five are shared with CLI paths |
 | Targeted indexes | Planned | No collection edge/event-type indexes | Pending | Needs idempotent migration |
 | Persistent/embedded Dolt | Deferred | Not measured | Deferred | Revisit only after batching |
 
@@ -688,7 +736,7 @@ The floor guards are durable tests in `internal/praector/ancestry_rows_test.go`:
 - the over-200-events window test: the snapshot's tail events statement equals `EventsForCollection(cid, 200)`;
 - the pure-walk and frontier tests: `ancestorWalkFromRows` performs no reads and the frontier visit order is `(created_at, from_task_id)`-stable under shuffled input.
 
-**Live capture status:** the idle-daemon child-`cmdline` re-measurement against the real user store was **not** re-run for this phase — the worker sandbox for the landing attempt blocks the out-of-tree writes and binary execution the live harness needs. The Phase 3 live figures above therefore remain the last live-environment capture of this sweep, and are explicitly **pre-Phase-3.5**; the per-collection floor they imply (~10 reads per sweep, ~8 daemon-child PIDs/s) is superseded by the seam-measured **one read per collection per 30s window** recorded here. A live re-capture is the first item under Risks and open questions.
+**Live capture status:** **re-run post-landing** against the real user store on a rebuilt, restarted daemon (see "Live verification" under Phase 3.5). The mechanism is confirmed live — one batched snapshot per swept collection, **0** per-node ancestry reads, **0** reads through the ancestry row loader — while the aggregate idle spawn rate moved only from ~10/s to **8.33/s**. The ~1 read per collection per 30s window recorded above is correct and is now also live-observed; what was wrong was the *share* attributed to the sweep. The residual is the daemon's per-tick reconcile fan-out (Phase 3.6), not the readiness sweep. Caveats on this capture: 128 of 350 children were reaped before their `cmdline` could be read, so per-shape counts are floors and only the per-second total is exact; and there is no simultaneous pre-change baseline, since the previous binary was replaced, so the 10/s → 8.33/s comparison spans time rather than running side by side.
 
 ### Live Phase 1.1 captures (live environment)
 
@@ -738,7 +786,8 @@ Phase 2 (collection-snapshot reconciliation) work rather than anything addressed
 - `status` can create durable terminal-state updates and commits. Benchmarks should compare the same realistic collection states.
 - Existing databases have already been created from the current schema, so index definitions must have a migration path rather than only appearing in `schema.sql`.
 - Sweep cooldown trades observability latency for background cost. The cooldown should be justified and measured rather than introduced as a configuration-heavy feature.
-- **Open:** the post-Phase-3.5 idle-daemon live re-capture (PATH-shim `dolt sql` counts plus the child-`cmdline` classification against the real user store) has not been run; the phase's floor is recorded from the counting seam. Re-run it on a 0.2.6+ daemon and record it here, remembering that process sampling is unreliable in both directions and a child-`/proc` or shim counter is authoritative.
+- **Resolved:** the post-Phase-3.5 idle-daemon live re-capture has been run against the real user store on a rebuilt, restarted daemon, and its result is recorded under Phase 3.5 ("Live verification"). It confirmed the mechanism and disproved the predicted floor; process sampling stays unreliable in both directions, so child-`/proc` `cmdline` classification or a shim counter remains the only authoritative method, and 128 of 350 children in this capture evaded `cmdline` reads entirely.
+- **Open:** Phase 3.6 has no measurement of its own yet. Before implementing it, re-capture the idle tick the same way and separate the five `Scheduler.reconcileCollection` fan-out calls by read set, so the batching is aimed at the read sets that actually dominate rather than at the aggregate count. Record whether the ~8.33/s is tick-frequency-bound or read-fan-out-bound — if it is tick-bound, batching reduces bytes and lock time but not subprocess count, and that changes the recommendation.
 - Row-fed walks read the row set captured under the file lock at the start of the predicate, so a concurrent commit landing mid-predicate is observed as of the snapshot rather than mid-walk. That is the same consistency model every other batched path already relies on (no declared transaction), and it cannot widen any membership rule, but it does mean a walk and a concurrent write are ordered by the lock rather than linearized.
 - The daemon may have an active project/collection mix different from the benchmark database. Separate idle-daemon measurements from interactive CLI measurements.
 
