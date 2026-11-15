@@ -39,7 +39,18 @@ func (s *Server) serveStreamable(w http.ResponseWriter, r *http.Request) {
 	// is rejected with 403 before a stream opens or any handler runs. This is
 	// defense in depth on top of the authoritative socket bind gate
 	// (NewLoopbackServer/IsLoopbackAddr); it does not replace them.
-	if !requestAuthorized(r) {
+	//
+	// A FOREIGN server (allow_external opt-in + a genuinely non-loopback bind, as
+	// derived once at construction) runs the reduced check below INSTEAD of
+	// requestAuthorized. A loopback server — including allow_external=true bound to
+	// a loopback address, whose foreign flag stays false — runs requestAuthorized
+	// UNCHANGED, byte-identical to the default DNS-rebinding defense.
+	if s.foreign {
+		if !foreignRequestAuthorized(r) {
+			http.Error(w, "forbidden: request origin not allowed", http.StatusForbidden)
+			return
+		}
+	} else if !requestAuthorized(r) {
 		http.Error(w, "forbidden: request authority is not loopback", http.StatusForbidden)
 		return
 	}
@@ -163,6 +174,32 @@ func requestAuthorized(r *http.Request) bool {
 	return authorityPort(u.Host) == authorityPort(r.Host)
 }
 
+// foreignRequestAuthorized is the REDUCED authority check used only by a foreign
+// server (the allow_external opt-in bound to a non-loopback address). It is a
+// DNS-rebinding / CSRF-shaped defense-in-depth control, NOT authentication or
+// access control: it never verifies the caller's identity and must never be
+// described as authorization. A foreign Host with NO Origin (a non-browser
+// client) is dispatched. A literal "null" (opaque/unique) Origin is refused. A
+// non-empty Origin must be http/https and its port must match the request Host's
+// port, which stops a page served from another origin/port from reaching this
+// unauthenticated listener. Unlike requestAuthorized it does NOT require the
+// Host or Origin host to be loopback, since the whole point of the opt-in is to
+// serve a non-loopback bind.
+func foreignRequestAuthorized(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	if origin == "null" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	return authorityPort(u.Host) == authorityPort(r.Host)
+}
+
 // loopbackAuthority reports whether a "host[:port]" authority names a loopback
 // interface: the hostname "localhost" or a 127.0.0.0/8 or [::1] address. A bare
 // or non-loopback host is refused.
@@ -219,12 +256,23 @@ func IsLoopbackAddr(addr string) bool {
 	return ip.IsLoopback()
 }
 
-// NewLoopbackServer builds an *http.Server bound to addr after asserting that
-// addr is loopback-only. Non-loopback binding is refused to preserve the local,
-// unauthenticated boundary (decision DEC-aacb7bfc23: auth/identity deferred).
+// NewLoopbackServer builds an *http.Server bound to addr. By default addr must be
+// loopback-only, preserving the local, unauthenticated boundary (decision
+// DEC-aacb7bfc23: auth/identity deferred). The single exception is the explicit,
+// default-OFF opt-in: when srv.AllowNonLoopback is set the non-loopback bind is
+// permitted, and the derived per-server foreign flag (srv.AllowNonLoopback &&
+// !IsLoopbackAddr(addr)) is recorded BEFORE Handler() is captured so serveStreamable
+// selects the reduced DNS-rebinding/CSRF-shaped Origin check for foreign hosts.
+// A flag-on + loopback addr leaves foreign false and stays byte-identical to the
+// strict path. The relaxation never derives authentication or access control.
 func NewLoopbackServer(addr string, srv *Server) (*http.Server, error) {
-	if !IsLoopbackAddr(addr) {
-		return nil, fmt.Errorf("MCP listener must bind loopback only; refusing %q", addr)
+	loopback := IsLoopbackAddr(addr)
+	if !loopback && !srv.AllowNonLoopback {
+		return nil, fmt.Errorf("MCP listener must bind loopback only; refusing %q (set [mcp] allow_external = true or PRAECTOR_MCP_ALLOW_EXTERNAL=1 to opt into a non-loopback bind)", addr)
 	}
+	// Set the derived flag on the Server BEFORE srv.Handler() captures the
+	// receiver, because serveStreamable is a *Server method and reads foreign via
+	// the captured pointer at request time.
+	srv.foreign = srv.AllowNonLoopback && !loopback
 	return &http.Server{Addr: addr, Handler: srv.Handler()}, nil
 }

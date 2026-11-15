@@ -764,12 +764,15 @@ func firstLine(s string) string {
 // newMCPServer builds the MCP core wired to the shared service layer. The
 // returned server performs no process work; it delegates to Service ops only.
 // privileged controls whether the collection-finalizing write tools are exposed.
-// When hub is non-nil the core also advertises the logging capability, accepts
+// allowExternal is the third, default-OFF opt-in that lets the listener serve a
+// non-loopback bind under the reduced DNS-rebinding/CSRF-shaped Origin check (it
+// never relaxes authentication or the protocol-version header gate). When hub is
+// non-nil the core also advertises the logging capability, accepts
 // logging/setLevel, and can open an observation-only SSE stream (state owned
 // entirely by the wiring layer, not the mcp package).
-func newMCPServer(svc *Service, privileged bool, hub *sseHub) *mcp.Server {
+func newMCPServer(svc *Service, privileged, allowExternal bool, hub *sseHub) *mcp.Server {
 	b := &mcpBridge{svc: svc, privileged: privileged}
-	s := &mcp.Server{ServerName: "praector", ServerVersion: Version, Tools: b, Resources: b}
+	s := &mcp.Server{ServerName: "praector", ServerVersion: Version, Tools: b, Resources: b, AllowNonLoopback: allowExternal}
 	if hub != nil {
 		s.Logging = hub
 		s.Streams = hub
@@ -786,7 +789,7 @@ func startMCPServer(svc *Service) (*http.Server, error) {
 	hub := newSSEHub(svc.store)
 	go hub.drain()
 	svc.store.SetEventSink(hub)
-	srv, err := mcp.NewLoopbackServer(cfg.Addr, newMCPServer(svc, cfg.Privileged, hub))
+	srv, err := mcp.NewLoopbackServer(cfg.Addr, newMCPServer(svc, cfg.Privileged, cfg.AllowExternal, hub))
 	if err != nil {
 		svc.store.SetEventSink(nil)
 		hub.Close()

@@ -197,21 +197,28 @@ praector daemon --max-workers 2
 When enabled, a running `praector daemon` also hosts a **loopback-only**
 (127.0.0.1) streamable-HTTP MCP listener as a background goroutine, so AI agents
 speaking MCP can drive the same durable control plane the CLI uses. It is
-**disabled by default** and always binds loopback only; authentication/identity
+**disabled by default** and **binds loopback only**; authentication/identity
 is deferred to the remote-access boundary and is not part of this local release.
+Serving a non-loopback address is a **separate, explicit, default-off**
+`allow_external` opt-in (below) and is an intentional deviation from the MCP
+specification's bind-to-loopback SHOULD — it adds **no authentication**, prints a
+loud startup warning, and only relaxes the authority gate to a DNS-rebinding/CSRF
+-shaped Origin check, never access control.
 
 Enable it in `~/.praector/config.toml`:
 
 ```toml
 [mcp]
 enabled = true
-addr = "127.0.0.1:8765"        # optional; loopback only
+addr = "127.0.0.1:8765"        # optional; loopback only by default
 privileged = false             # optional; expose privileged write tools (init/registration, pr/accept/cleanup) when the listener is already enabled
+allow_external = false         # optional; allow a NON-loopback bind addr under the reduced CSRF-shaped Origin check (default off; adds no authentication)
 ```
 
-`enabled` is the only setting that starts the listener; `privileged` never
-enables MCP by itself — it only widens the exposed tool surface on an
-already-enabled listener.
+`enabled` is the only setting that starts the listener; `privileged` and
+`allow_external` never enable MCP by itself — they only widen the exposed tool
+surface and the bind/authority posture on an already-enabled listener,
+respectively.
 
 or for a single invocation via the `PRAECTOR_MCP` environment override (a truthy
 token toggles enablement; any other value is treated as an explicit loopback
@@ -221,6 +228,7 @@ token toggles enablement; any other value is treated as an explicit loopback
 PRAECTOR_MCP=1 praector daemon
 PRAECTOR_MCP=127.0.0.1:9000 praector daemon
 PRAECTOR_MCP_PRIVILEGED=1 praector daemon   # on an already-enabled listener, also expose the privileged write tools (this alone does NOT start the listener)
+PRAECTOR_MCP_ALLOW_EXTERNAL=1 praector daemon   # on an already-enabled listener, permit a non-loopback addr; never auto-enabled from PRAECTOR_MCP alone
 ```
 
 The listener is decoupled from the reconcile loop and the scheduler lock. It
@@ -228,7 +236,9 @@ performs only durable Store reads and enqueue-only actions (for example
 `praector_run` and `praector_task_request` create durable work that the running
 daemon then executes); it never launches worker processes or runs a collection
 inline, and never bypasses dependency, planning, review, capability, or
-acceptance checks. A non-loopback address is refused at startup.
+acceptance checks. By default a non-loopback address is refused at startup; the
+`allow_external` opt-in is the only exception, and it never auto-enables from a
+non-loopback `PRAECTOR_MCP` address.
 
 The tool/resource surface is **commandHelp-driven**: every CLI command maps to
 exactly one MCP surface item, giving command/surface coverage parity (the CLI and
@@ -276,8 +286,22 @@ resource handler runs, the request's Host/local-authority and (when present) its
 literal `null` / otherwise-opaque Origin that names no host to validate — is
 rejected with HTTP 403. A request with no `Origin` (a non-browser client) is
 accepted on the Host check alone. This is defense in depth on top of the
-authoritative socket-bind gate that already refuses to bind a non-loopback
+authoritative socket-bind gate that by default refuses to bind a non-loopback
 address.
+
+The `allow_external` opt-in relaxes **only this authority gate**, and only when
+the effective bind address is genuinely non-loopback (`allow_external` **and** a
+non-loopback `addr`; enabling it against a loopback `addr` is byte-identical to the
+strict path above). A foreign server runs a reduced check instead: a request with
+no `Origin` is dispatched, a literal `null` Origin is still rejected with 403, and
+a non-empty `Origin` must still be `http`/`https` with its port matching the
+request `Host` port. This reduced check is a **DNS-rebinding / CSRF-shaped
+defense-in-depth control only** — it does not verify the caller's identity and is
+**never authentication or access control**. Every other gate stays fully enforced
+for foreign clients: the `MCP-Protocol-Version` header requirement on both POST
+and the SSE `GET`, the `privileged` opt-in, and the explicit-root/no-daemon-cwd
+rules. Because the authority gate runs above method dispatch, `GET` and `POST`
+cannot diverge.
 
 MCP operations carry **no implicit daemon cwd**. Any tool whose domain operation
 would otherwise infer a project from the working directory instead requires an
@@ -398,6 +422,11 @@ Behaviour and guarantees:
   authorization or access control: any local process that reaches the loopback
   listener can subscribe to any collection's events. Do not describe them as
   authorization, and do not describe loopback binding as stronger than it is.
+  With the explicit `allow_external` opt-in on a non-loopback bind, the remaining
+  Origin/port checks are **CSRF/DNS-rebinding-shaped only and never
+  authorization**; the control plane stays unauthenticated, so keep
+  `[mcp] privileged = false`, prefer binding the **docker bridge IP over
+  `0.0.0.0`**, and **do not** expose the listener through a public tunnel.
 - Each SSE frame carries **only** a JSON-RPC `notifications/message` — a
   JSON-RPC **response** is never written on the stream. The SSE `id:` line is
   the durable `EVT` id (so a reconnect can pass it back as `Last-Event-ID`),

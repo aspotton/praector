@@ -179,10 +179,19 @@ const DefaultMCPAddr = "127.0.0.1:8765"
 // writes but not these tools until the operator explicitly opts in, because they
 // are the boundary the acceptance/PR/init rules treat as operator-only
 // (DEC-aacb7bfc23).
+//
+// AllowExternal is a THIRD, independent, default-OFF opt-in. By default the
+// listener binds loopback only and every request must resolve to the loopback
+// authority. When allow_external is true AND the effective bind address is
+// non-loopback, the listener serves foreign clients under a reduced
+// DNS-rebinding/CSRF-shaped Origin check (never authentication). It never
+// auto-enables from a non-loopback address: the opt-in stays explicit and
+// fail-closed.
 type MCPServerConfig struct {
-	Enabled    bool
-	Addr       string
-	Privileged bool
+	Enabled       bool
+	Addr          string
+	Privileged    bool
+	AllowExternal bool
 }
 
 // LoadMCPServerConfig resolves the MCP listener settings from the global
@@ -196,11 +205,12 @@ type MCPServerConfig struct {
 // already-enabled listener. It never starts the listener: enabling MCP remains
 // governed exclusively by `enabled` / PRAECTOR_MCP.
 func LoadMCPServerConfig(g GlobalConfig) MCPServerConfig {
-	cfg := MCPServerConfig{Enabled: false, Addr: DefaultMCPAddr, Privileged: false}
+	cfg := MCPServerConfig{Enabled: false, Addr: DefaultMCPAddr, Privileged: false, AllowExternal: false}
 	if d, err := parseMarkerTOML(filepath.Join(g.Home, "config.toml")); err == nil {
 		if m := d["mcp"]; m != nil {
 			cfg.Enabled = boolOr(m["enabled"], false)
 			cfg.Privileged = boolOr(m["privileged"], false)
+			cfg.AllowExternal = boolOr(m["allow_external"], false)
 			if a := strings.TrimSpace(m["addr"]); a != "" {
 				cfg.Addr = a
 			}
@@ -232,6 +242,22 @@ func LoadMCPServerConfig(g GlobalConfig) MCPServerConfig {
 			cfg.Privileged = true
 		case "0", "false", "off", "no":
 			cfg.Privileged = false
+		}
+	}
+	// PRAECTOR_MCP_ALLOW_EXTERNAL is a THIRD, fully independent, default-OFF
+	// opt-in that lets the listener serve a non-loopback bind address under the
+	// reduced DNS-rebinding/CSRF-shaped Origin check. It NEVER auto-enables from a
+	// non-loopback PRAECTOR_MCP address: enabling MCP stays governed solely by
+	// `enabled` / PRAECTOR_MCP, and the relaxation only takes effect when this
+	// flag is true AND the effective addr is non-loopback. A truthy value forces it
+	// on; a falsey value forces it off; any other value leaves the file-derived
+	// setting untouched, mirroring the PRAECTOR_MCP_PRIVILEGED posture above.
+	if v := strings.TrimSpace(os.Getenv("PRAECTOR_MCP_ALLOW_EXTERNAL")); v != "" {
+		switch strings.ToLower(v) {
+		case "1", "true", "on", "yes":
+			cfg.AllowExternal = true
+		case "0", "false", "off", "no":
+			cfg.AllowExternal = false
 		}
 	}
 	return cfg

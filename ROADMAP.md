@@ -159,8 +159,14 @@ always exposed, and privileged write tools (explicit-root project
 validation or return the plan), and `collection cleanup` (which performs real
 worktree/branch removal) — none of which themselves push, merge, or finalize
 acceptance into the base branch) sit behind a separate,
-default-off `privileged` opt-in. The remaining work below (remote transport +
-auth, richer escalation integration) stays on the roadmap.
+default-off `privileged` opt-in. A separate, default-off `allow_external` opt-in
+now lets the listener bind a **non-loopback** address for host-based agents (e.g.
+Docker containers reaching the host via `host.docker.internal`); it is
+**unauthenticated**, only relaxes the authority gate to a CSRF/DNS-rebinding-shaped
+Origin check, prints a loud startup warning, and is orthogonal to the deferred
+2026-07-28 transport-shape redesign. Authentication, TLS, and a proper remote
+boundary remain deferred roadmap work. The remaining work below (authenticated
+remote transport, richer escalation integration) stays on the roadmap.
 
 ### Shared service/operation layer
 
@@ -172,7 +178,7 @@ auth, richer escalation integration) stays on the roadmap.
 
 ### Daemon-hosted transport
 
-When MCP is enabled, the running Praector daemon hosts the MCP endpoint. Target the modern stateless MCP model and Streamable HTTP for network clients. Default binding should be loopback-only (`127.0.0.1` / `::1`) so local coding agents can connect without exposing Praector on the LAN. Remote/LAN/Tailscale/public binding is a separate explicit security mode requiring authentication/authorization. An optional stdio bridge may be useful for clients that insist on spawning a local MCP process, but it should bridge to the same service layer rather than become a second server implementation.
+When MCP is enabled, the running Praector daemon hosts the MCP endpoint. Target the modern stateless MCP model and Streamable HTTP for network clients. Default binding should be loopback-only (`127.0.0.1` / `::1`) so local coding agents can connect without exposing Praector on the LAN. An **unauthenticated** non-loopback bind is already available as an explicit, default-off `allow_external` opt-in for host-based agents (prefer binding the docker bridge IP over `0.0.0.0`, and do not expose it through a public tunnel); a properly authenticated/authorized Remote/LAN/Tailscale/public security mode remains deferred roadmap work. An optional stdio bridge may be useful for clients that insist on spawning a local MCP process, but it should bridge to the same service layer rather than become a second server implementation.
 
 ### Server-initiated push: current scope and the deferred migration
 
@@ -236,6 +242,8 @@ Human -> agent records authorized response -> Praector resumes graph
 This should allow a person to ask an agent “what is Praector doing?”, “start this implementation”, or “what needs my attention?” without opening a shell. Attention responses must still be recorded as durable Praector decisions with responder/authority provenance; conversational prose alone is never approval.
 
 ### Authorization and exposure
+
+An unauthenticated non-loopback bind already ships as the explicit, default-off `allow_external` opt-in (safe local default unchanged); a properly authenticated/authorized remote mode remains the goal below.
 
 Before exposing Praector beyond trusted loopback clients:
 
