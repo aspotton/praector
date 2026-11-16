@@ -566,10 +566,12 @@ var gitCLIFlags = map[string]bool{
 	"--quiet": true, "-b": true, "-C": true, "-e": true, "-U0": true, "--unified=0": true,
 	"-c": true, "--full-name": true, "--no-color": true, "--abbrev-commit": true,
 	"--no-renames": true, "--git-dir": true, "--name-status": true, "--shortstat": true,
-	"merge": true, "diff": true, "status": true, "log": true, "show": true, "add": true,
+	"--write-tree": true,
+	"merge":        true, "diff": true, "status": true, "log": true, "show": true, "add": true,
 	"commit": true, "init": true, "checkout": true, "branch": true, "worktree": true,
 	"rev-parse": true, "show-ref": true, "merge-base": true, "ls-files": true,
 	"update-ref": true, "symbolic-ref": true, "stash": true, "reset": true, "rm": true,
+	"merge-tree": true,
 }
 
 // commonEnvVars are environment names so ubiquitous that reporting them as
@@ -810,6 +812,57 @@ func (w *GitWorkspace) IsAncestor(repo, ancestor, descendant string) (bool, erro
 		return false, err
 	}
 	return p.Code == 0, nil
+}
+
+// Re-integration conflict-probe verdicts (fix 4). They classify the outcome of a
+// working-tree-free `git merge-tree --write-tree` probe, whose process EXIT CODE is
+// the sole conflict predicate (official git spec: 0 clean, 1 conflict, anything
+// else the probe could not run). Nothing here scans a resulting tree for conflict
+// markers or treats an empty conflicted-file-info list as clean.
+const (
+	ReintegrateClean    = iota // exit 0: the re-integration would merge cleanly
+	ReintegrateConflict        // exit 1: a persistent conflict — keep FAILED
+	ReintegrateError           // probe could not run — keep FAILED, never retry the merge
+)
+
+// ProbeReintegration reports whether re-integrating the task's immutable checkpoint
+// against the CURRENT collection integration HEAD would merge cleanly, using a
+// working-tree-free plumbing probe that touches neither the integration worktree
+// index nor its working tree. The probe never mutates state; the caller decides
+// whether to re-invoke the real (merge --no-ff / merge --abort) integrate path. When
+// the probe itself cannot run (an older git lacking merge-tree, or a git error) it
+// reports ReintegrateError, which the scheduler treats as a safe FAILED outcome — the
+// existing post-merge --is-ancestor containment verification (IsAncestor above) stays
+// the documented probe-unavailable fallback, and no version floor is promised.
+func (w *GitWorkspace) ProbeReintegration(project, collection Row, task Row) (int, error) {
+	target, err := w.EnsureCollection(project, collection)
+	if err != nil {
+		return ReintegrateError, err
+	}
+	hp, err := w.git(target, true, "rev-parse", "HEAD")
+	if err != nil {
+		return ReintegrateError, err
+	}
+	integrationHead := strings.TrimSpace(hp.Stdout)
+	checkpoint := S(task, "current_head")
+	if checkpoint == "" {
+		checkpoint = S(task, "base_commit")
+	}
+	if integrationHead == "" || checkpoint == "" {
+		return ReintegrateError, nil
+	}
+	p, err := w.git(target, false, "merge-tree", "--write-tree", integrationHead, checkpoint)
+	if err != nil {
+		return ReintegrateError, err
+	}
+	switch p.Code {
+	case 0:
+		return ReintegrateClean, nil
+	case 1:
+		return ReintegrateConflict, nil
+	default:
+		return ReintegrateError, nil
+	}
 }
 
 func (w *GitWorkspace) AcceptancePlan(project, collection Row, targetBranch string) (Row, error) {

@@ -233,16 +233,17 @@ func (s *Service) ProjectShow(ctx context.Context, in ProjectShowInput) (Project
 // CollectionStatus carries the durable display fields for one collection,
 // gathered once so every adapter formats identically.
 type CollectionStatus struct {
-	ID         string
-	Status     string
-	Title      string
-	Objective  string
-	Branch     string
-	Acceptance Row
-	PR         Row
-	Revisions  Rows
-	TaskCounts []KV
-	Active     Rows
+	ID            string
+	Status        string
+	Title         string
+	Objective     string
+	Branch        string
+	Acceptance    Row
+	PR            Row
+	Revisions     Rows
+	TaskCounts    []KV
+	Active        Rows
+	BlockedReason string // named holding predicate for a coherent BLOCKED collection; "" otherwise
 }
 
 // KV is a sorted status -> count pair for collection task/revision summaries.
@@ -273,7 +274,24 @@ func (s *Service) collectionStatus(c Row) CollectionStatus {
 	st.PR, _ = s.store.GetCollectionPullRequest(cid, "github")
 	revs, _ := s.store.ListCollectionRevisions(cid, "")
 	st.Revisions = revs
+	st.BlockedReason, _ = s.store.CollectionBlockedReason(cid)
 	return st
+}
+
+// CollectionBlockedReason loads the collection's rows and names the mechanical
+// predicate holding a coherent BLOCKED collection in that state, reusing the same
+// blockedReasonFromSnapshot projection. It stays empty for a non-coherent or
+// non-BLOCKED collection so pre-cutoff / unchanged renders are byte-identical.
+func (s *Store) CollectionBlockedReason(cid string) (string, string) {
+	snaps, err := s.loadCollectionRows([]string{cid})
+	if err != nil {
+		return "", ""
+	}
+	sn := snaps[cid]
+	if sn == nil || sn.collection == nil {
+		return "", ""
+	}
+	return blockedReasonFromSnapshot(sn.collection, sn)
 }
 
 // sortedCounts tallies a value function over rows into a key-sorted slice.
@@ -398,7 +416,27 @@ func (s *Service) collectionStatusFromSnapshot(c Row, sn *collectionSnapshot) Co
 	st.Acceptance = sn.acceptance
 	st.PR = sn.pr
 	st.Revisions = sn.allRevisions
+	st.BlockedReason, _ = blockedReasonFromSnapshot(c, sn)
 	return st
+}
+
+// blockedReasonFromSnapshot names the mechanical predicate holding a coherent
+// BLOCKED collection in that state, projected from the same decision cores as
+// terminalStateForCollection over the already-loaded snapshot rows. It is scoped
+// to the planningGateCoherent-coherent surface (pre-cutoff collections stay
+// byte-identical) and stays empty for any collection the cores are not blocking,
+// so an unchanged status render gains no new output. The second return names the
+// offending ids (coverage-gap implements / open revisions) for event detail.
+func blockedReasonFromSnapshot(c Row, sn *collectionSnapshot) (string, string) {
+	if !planningGateCoherent(c) || S(c, "status") != "BLOCKED" {
+		return "", ""
+	}
+	var criticRow Row
+	allTerm, hasComplete, _ := collectionTerminalFlags(sn.tasks)
+	if len(sn.tasks) > 0 && len(sn.openRevisions) == 0 && allTerm && hasComplete {
+		criticRow = criticRevalidationFromRows(c, sn.tasks, sn.edges, sn.baselineEvents)
+	}
+	return collectionBlockedReason(c, sn.tasks, sn.edges, sn.openRevisions, sn.runnable, sn.runningSession, criticRow)
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +454,7 @@ type GraphOutput struct {
 	Collection Row
 	Tasks      Rows
 	Deps       map[string][]string
+	Verifies   map[string][]string // verifies carry edges keyed by dependent task id
 }
 
 // Graph resolves the target collection and returns its tasks with resolved
@@ -439,12 +478,16 @@ func (s *Service) Graph(ctx context.Context, in GraphInput) (GraphOutput, error)
 	tasks, _ := s.store.ListTasks(S(c, "id"))
 	edges, _ := s.store.ListEdges(S(c, "id"))
 	deps := map[string][]string{}
+	verifies := map[string][]string{}
 	for _, ed := range edges {
-		if S(ed, "relation") == "depends_on" {
+		switch S(ed, "relation") {
+		case "depends_on":
 			deps[S(ed, "to_task_id")] = append(deps[S(ed, "to_task_id")], S(ed, "from_task_id"))
+		case "verifies":
+			verifies[S(ed, "to_task_id")] = append(verifies[S(ed, "to_task_id")], S(ed, "from_task_id"))
 		}
 	}
-	return GraphOutput{Collection: c, Tasks: tasks, Deps: deps}, nil
+	return GraphOutput{Collection: c, Tasks: tasks, Deps: deps, Verifies: verifies}, nil
 }
 
 // ---------------------------------------------------------------------------
