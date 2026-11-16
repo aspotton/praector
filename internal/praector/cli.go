@@ -657,12 +657,23 @@ func cmdTaskSupersede(args []string) int {
 	return 0
 }
 func cmdTaskRequest(args []string) int {
-	p, e := parseArgs(args, map[string]bool{"task": true, "profile": true, "title": true, "objective": true, "reason": true, "blocking": false, "depends-on": true, "workspace": true})
+	p, e := parseArgs(args, map[string]bool{"task": true, "profile": true, "title": true, "objective": true, "objective-file": true, "reason": true, "blocking": false, "depends-on": true, "workspace": true})
 	if e != nil {
 		return fail(e)
 	}
-	if len(p.Pos) > 0 || p.str("profile") == "" || p.str("title") == "" || p.str("objective") == "" || p.str("reason") == "" {
-		return fail(fmt.Errorf("usage: praector task request --profile PROFILE --title TITLE --objective TEXT --reason TEXT [--blocking] [--depends-on TASK] [--workspace MODE]"))
+	// A lone "-" positional is the stdin objective form; any other positional is invalid.
+	if len(p.Pos) > 0 && !(len(p.Pos) == 1 && p.Pos[0] == "-") {
+		return fail(fmt.Errorf("usage: praector task request --profile PROFILE --title TITLE --objective TEXT [--objective-file PATH|-] --reason TEXT [--blocking] [--depends-on TASK] [--workspace MODE]"))
+	}
+	if p.str("profile") == "" || p.str("title") == "" || p.str("reason") == "" {
+		return fail(fmt.Errorf("usage: praector task request --profile PROFILE --title TITLE --objective TEXT [--objective-file PATH|-] --reason TEXT [--blocking] [--depends-on TASK] [--workspace MODE]"))
+	}
+	objective, e := resolveTaskObjective(p)
+	if e != nil {
+		return fail(e)
+	}
+	if objective == "" {
+		return fail(fmt.Errorf("usage: praector task request --profile PROFILE --title TITLE --objective TEXT [--objective-file PATH|-] --reason TEXT [--blocking] [--depends-on TASK] [--workspace MODE]"))
 	}
 	if p.str("profile") == "coordinator" {
 		return fail(fmt.Errorf("--profile coordinator is not valid for task request; use coordinator attention"))
@@ -671,7 +682,7 @@ func cmdTaskRequest(args []string) int {
 	if e != nil {
 		return fail(e)
 	}
-	out, e := svc.TaskRequest(context.Background(), TaskRequestInput{CallerID: p.str("task"), Profile: p.str("profile"), Title: p.str("title"), Objective: p.str("objective"), Reason: p.str("reason"), Blocking: p.bool("blocking"), DependsOn: p.strs("depends-on"), Workspace: p.str("workspace")})
+	out, e := svc.TaskRequest(context.Background(), TaskRequestInput{CallerID: p.str("task"), Profile: p.str("profile"), Title: p.str("title"), Objective: objective, Reason: p.str("reason"), Blocking: p.bool("blocking"), DependsOn: p.strs("depends-on"), Workspace: p.str("workspace")})
 	if e != nil {
 		return fail(e)
 	}
@@ -680,6 +691,52 @@ func cmdTaskRequest(args []string) int {
 		fmt.Fprintln(os.Stderr, "deduplicated")
 	}
 	return 0
+}
+
+// resolveTaskObjective compiles the durable objective text for `praector task
+// request` from exactly one of --objective TEXT, --objective-file PATH,
+// --objective-file - (stdin), or a lone "-" positional (stdin). File and stdin
+// bytes are stored verbatim (byte-exact, including backticks, $(), newlines, and
+// trailing whitespace) so shell substitution can never bake command output into
+// a durable objective, matching `result submit --stdin`/`--file`. More than one
+// source, or a file that cannot be read, fails closed without producing text.
+func resolveTaskObjective(p parsedArgs) (string, error) {
+	objFlag := p.str("objective")
+	objFile := p.str("objective-file")
+	stdinViaPos := len(p.Pos) == 1 && p.Pos[0] == "-"
+	stdinViaFlag := objFile == "-"
+	if stdinViaFlag {
+		objFile = ""
+	}
+	sources := 0
+	if objFlag != "" {
+		sources++
+	}
+	if objFile != "" {
+		sources++
+	}
+	if stdinViaPos || stdinViaFlag {
+		sources++
+	}
+	if sources != 1 {
+		return "", fmt.Errorf("exactly one objective source is required: --objective TEXT, --objective-file PATH, or --objective-file - / a lone - for stdin")
+	}
+	switch {
+	case objFlag != "":
+		return objFlag, nil
+	case objFile != "":
+		b, err := os.ReadFile(objFile)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	default:
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
 }
 
 func cmdContext(args []string) int {

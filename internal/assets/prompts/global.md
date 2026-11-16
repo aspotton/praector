@@ -35,3 +35,5 @@ When the Task Envelope contains `inherited_research_constraints`, those constrai
 When creating a plan, durable task, or set of steps for another worker, preserve these global rules as part of that worker's context.
 
 Praector automatically injects this global contract into every task envelope, so do not duplicate the entire contract in each task objective. Instead, include any task-specific implications in `DELIVERABLE`, `SCOPE`, `MUST HAVE`, `MUST NOT`, `VERIFY`, or `CONTEXT`.
+
+When delegating with `praector task request`, prefer `--objective-file PATH` (or `-`/stdin) over `--objective TEXT` for objectives containing quotes, backticks, or `$(...)` so shell substitution can never bake command output into the durable objective; file/stdin bytes are stored verbatim.

@@ -1024,11 +1024,20 @@ func (s *Store) ChildCount(tid string) (int, error) {
 }
 
 type CreateTaskOptions struct {
-	ProjectID, CollectionID, Profile, Title, Objective, Reason            string
-	ParentTaskID, RequestedByTaskID                                       string
-	DependsOn                                                             []string
-	WorkspaceMode, BaseCommit                                             string
-	Priority, Depth                                                       int
+	ProjectID, CollectionID, Profile, Title, Objective, Reason string
+	ParentTaskID, RequestedByTaskID                            string
+	DependsOn                                                  []string
+	WorkspaceMode, BaseCommit                                  string
+	Priority                                                   int
+	// Depth is the durable task-tree depth. It is stored verbatim and is NOT
+	// budget-checked here: CreateTask is the scaffolding entry point (policy
+	// research/critic/plan_review, revalidation staging, delivery repair,
+	// manual retry) and is deliberately EXCLUDED from max_task_depth so a late
+	// legitimate repair stays creatable deep inside a revalidation chain. Only
+	// worker/coordinator request-seam delegation consumes the budget, via
+	// requestSeamTaskDepth in RequestTask/RequestCoordinatorAttention
+	// (docs/STATE_AND_RECOVERY.md "Depth budget").
+	Depth                                                                 int
 	AllowDedupe                                                           bool
 	SpawnedByTaskID, BlockingCallerTaskID                                 string
 	GateImplementTasks                                                    bool
@@ -1054,6 +1063,16 @@ func uniqueStrings(in []string) []string {
 	}
 	return out
 }
+
+// requestSeamTaskDepth returns the durable depth assigned to a task created
+// through a worker/coordinator request seam (RequestTask or
+// RequestCoordinatorAttention): exactly one level below its caller. This is the
+// single definition of the depth that the max_task_depth budget is measured
+// against at both request-seam sites, so the two checks cannot drift apart or
+// off-by-one relative to each other. Scheduler-staged planning scaffolding does
+// NOT route through here; it is deliberately excluded from the budget (see
+// CreateTaskOptions.Depth).
+func requestSeamTaskDepth(callerDepth int) int { return callerDepth + 1 }
 
 func (s *Store) CreateTask(o CreateTaskOptions) (Row, bool, error) {
 	if !profileKnown(o.Profile) {
@@ -2086,7 +2105,7 @@ func (s *Store) RequestTask(callerID string, o RequestTaskOptions) (Row, bool, e
 	if n >= o.Limits.MaxTasksPerCollection {
 		return nil, false, errors.New("collection task limit reached")
 	}
-	depth := I(caller, "depth") + 1
+	depth := requestSeamTaskDepth(I(caller, "depth"))
 	if depth > o.Limits.MaxTaskDepth {
 		return nil, false, errors.New("maximum task depth reached")
 	}
@@ -2210,7 +2229,7 @@ func (s *Store) RequestCoordinatorAttention(callerID, reason string, blocking bo
 	if n >= limits.MaxTasksPerCollection {
 		return nil, false, errors.New("collection task limit reached")
 	}
-	depth := I(caller, "depth") + 1
+	depth := requestSeamTaskDepth(I(caller, "depth"))
 	if depth > limits.MaxTaskDepth {
 		return nil, false, errors.New("maximum task depth reached")
 	}

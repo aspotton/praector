@@ -336,7 +336,7 @@ praector task request \
   [--task CALLER] \
   --profile explore|critic|plan_review|research|implement|review|advise \
   --title TITLE \
-  --objective OBJECTIVE \
+  (--objective OBJECTIVE | --objective-file PATH | --objective-file - | -) \
   --reason REASON \
   [--blocking] \
   [--depends-on T-ID ...] \
@@ -344,6 +344,8 @@ praector task request \
 ```
 
 Managed workers normally omit `--task`; `PRAECTOR_TASK_ID` identifies the caller.
+
+Exactly one objective source is required: `--objective TEXT`, or `--objective-file PATH`, or stdin via `--objective-file -` / a lone `-` positional. File and stdin objectives are stored **byte-exactly** (parity with `result submit --stdin`/`--file`), so a long or substitution-prone objective can be written to a file or piped rather than pasted into a shell word — backtick or `$(...)` command substitution can then never bake live command output into a durable objective. More than one source, or an unreadable file, fails closed without creating a task. The MCP `praector_task_request` schema is unchanged (`objective` stays a required string); this input hygiene is CLI-side only, parsing into the identical service input.
 
 See [AGENT_PROTOCOL.md](AGENT_PROTOCOL.md#request-durable-work).
 
