@@ -124,9 +124,9 @@ List tasks in a collection (defaults to latest collection).
 
 Create a fresh replacement for a FAILED task and preserve prior attempts.
 `,
-	"task request": `Usage: praector task request --profile PROFILE --title TITLE --objective TEXT --reason TEXT [--task TASK] [--blocking] [--depends-on TASK]... [--workspace MODE]
+	"task request": `Usage: praector task request --profile PROFILE --title TITLE --objective TEXT [--objective-file PATH|-] --reason TEXT [--task TASK] [--blocking] [--depends-on TASK]... [--workspace MODE]
 
-Request durable delegated work.
+Request durable delegated work. --objective-file PATH (or - for stdin, or a lone - positional) stores objective bytes verbatim.
 `,
 	"task add-dependency": `Usage: praector task add-dependency TASK --on DEPENDENCY [--caller TASK]
 

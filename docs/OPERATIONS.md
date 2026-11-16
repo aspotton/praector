@@ -615,6 +615,8 @@ Common causes:
 
 The durable graph remains available for inspection/repair.
 
+**The holding predicate is named, not guessed.** For a coherent (post-cutoff) Collection that stays `BLOCKED`, `praector status`/`collection show` print a `blocked by:` line and the stuck-floor `Coordinator attention`/`STUCK_FLOOR_ATTENTION` event carry a named reason — `COVERAGE_GAP` (naming the un-covered implementation ids), `OPEN_REVISIONS`, `CRITIC_STALE`, or `DELIVERY_POLICY` — projected from the same terminal-decision cores that decide the state (never a speculative "recovery or floor-predicate bug" guess). To see the repair carry edges that the coverage rule depends on, run `praector graph COL-... --edges` (the `verifies` edges), so you never need raw Dolt SQL to tell a genuine coverage gap from an open revision or a stale critic. A `COVERAGE_GAP` naming an implement whose only review is a failed one is exactly the repair-lineage shape the per-tick backfill sweep heals; a `COLLECTION_BLOCKED_REASON` payload on the attention names the same thing.
+
 ## Run one reconciliation cycle
 
 Useful after installing a fix or recovering local state:

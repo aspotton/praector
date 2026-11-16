@@ -2138,6 +2138,55 @@ func (s *Scheduler) ensureReview(project, collection, impl Row) error {
 	return nil
 }
 
+// repairFindingsDigest renders a failed review's concrete blockers/findings from
+// its durable result so an auto-created repair objective carries the real,
+// actionable items instead of bare "address the review findings" text. The
+// rendering is deterministic (ordered findings then blockers then risks then
+// unresolved, deduped, verbatim) and bounded to the top 10 items and an explicit
+// byte cap; a truncation marker names the omitted count. Envelope-injected
+// decisions remain additive — this is not the sole evidence carrier.
+func repairFindingsDigest(result Row) string {
+	const itemCap = 10
+	const byteCap = 4000
+	keys := []string{"blockers", "findings", "risks", "unresolved"}
+	seen := map[string]bool{}
+	items := []string{}
+	for _, k := range keys {
+		for _, v := range Slice(result, k) {
+			s := strings.TrimSpace(fmt.Sprint(v))
+			if s == "" || seen[s] {
+				continue
+			}
+			seen[s] = true
+			items = append(items, s)
+		}
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	omitted := 0
+	used := 0
+	for i, it := range items {
+		if i >= itemCap {
+			omitted = len(items) - itemCap
+			break
+		}
+		line := "\n- " + it
+		if used+len(line) > byteCap {
+			omitted = len(items) - i
+			break
+		}
+		used += len(line)
+		b.WriteString(line)
+	}
+	out := "\nReview findings/blockers (verbatim, bounded):" + b.String()
+	if omitted > 0 {
+		out += fmt.Sprintf("\n(+%d further findings/blockers omitted by the repair-seeding cap; see the failed review's durable result)", omitted)
+	}
+	return out
+}
+
 func (s *Scheduler) handleFailedReview(project, task Row) error {
 	current, err := s.Store.GetTask(S(task, "id"))
 	if err != nil {
@@ -2151,7 +2200,8 @@ func (s *Scheduler) handleFailedReview(project, task Row) error {
 	if summary == "" {
 		summary = "Review found defects requiring repair."
 	}
-	repair, _, err := s.Store.RequestTask(S(current, "id"), RequestTaskOptions{Profile: "implement", Title: "Repair findings from " + S(current, "id"), Objective: fmt.Sprintf("Address the review findings from %s. Review summary: %s", S(current, "id"), summary), Reason: "Independent review returned verdict=fail. The failed review will complete as historical evidence; this repair must receive a fresh independent review task after integration.", Blocking: false, DependsOn: []string{S(current, "id")}, WorkspaceMode: "collection", Limits: s.limits(project)})
+	objective := fmt.Sprintf("Address the review findings from %s. Review summary: %s%s", S(current, "id"), summary, repairFindingsDigest(result))
+	repair, _, err := s.Store.RequestTask(S(current, "id"), RequestTaskOptions{Profile: "implement", Title: "Repair findings from " + S(current, "id"), Objective: objective, Reason: "Independent review returned verdict=fail. The failed review will complete as historical evidence; this repair must receive a fresh independent review task after integration.", Blocking: false, DependsOn: []string{S(current, "id")}, WorkspaceMode: "collection", Limits: s.limits(project)})
 	if err != nil {
 		return err
 	}

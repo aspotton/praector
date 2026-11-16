@@ -171,7 +171,7 @@ Integrate: Add authenticated GET /admin/secure-ping endpoint
 
 The merge commit body carries the implementation summary when available plus `Praector-Collection`, `Praector-Task`, and `Praector-Operation: integration` provenance. Task IDs therefore remain machine-traceable without making `git log --oneline` depend on Praector context.
 
-If integration conflicts, Praector aborts the merge, marks the implementation result failed, and requests coordinator attention for graph repair.
+If integration conflicts, Praector aborts the merge and — before submitting the failed result — makes **exactly one** automatic re-integration attempt: a working-tree-free `git merge-tree --write-tree` probe against a freshly re-read Collection integration HEAD decides the outcome by **process exit code only** (0 clean, 1 conflict, any other code probe-error). On a clean probe it re-invokes the same `--no-ff` merge (with the existing `merge --abort` and post-merge ancestor verification) against the current integration HEAD, emitting an audited `INTEGRATION_RETRY` event; on a persistent conflict or a probe error it keeps the `FAILED` result with conflict detail and requests coordinator attention for graph repair. A probe failure is never read as clean or as conflict. The retry never rebases, cherry-picks, auto-selects an ours/theirs side, or uses `--skip`, so fast-forward-safe acceptance is byte-identical; the existing post-merge `--is-ancestor` containment check remains the documented probe-unavailable fallback (no git version floor is promised). This closes the incident where correct, test-green code failed only on a README-only auto-merge conflict against an already-integrated sibling.
 
 ## Independent review workspace
 

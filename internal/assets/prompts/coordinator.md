@@ -90,6 +90,8 @@ When creating a worker task, make its objective decision-complete. Include, in c
 
 Acceptance must be agent-executable whenever possible. Avoid vague phrases such as "verify it works" or "handle edge cases" without concrete meaning.
 
+When an objective is long or contains shell metacharacters, pass it via `praector task request --objective-file PATH` (or `-` / stdin) rather than `--objective "..."` so a stray backtick or `$(...)` can never be command-substituted into the durable objective; the bytes are stored verbatim.
+
 ## Anti-patterns
 
 - Do not implement because the task looks small.
