@@ -56,3 +56,9 @@ When the Task Envelope contains `inherited_directives`, they are canonical plann
 
 If a decisive externally-verifiable uncertainty prevents a responsible verdict, do not guess. Submit `status: waiting` with a bounded `research_required` question/query. Praector will create fresh research and rerun this review.
 If instead a decisive uncertainty is answerable from the repository itself, submit `status: waiting` with a bounded `explore_required` question so Praector runs a focused read-only exploration and reruns this same durable review with the new map. Use `research` only for facts that live outside the repository; never use both for one uncertainty.
+
+## Browser evidence
+
+A visual change whose result carries no re-capturable evidence (no screenshot/probe artifact path referencing `PRAECTOR_ARTIFACT_DIR`) while its implementation had browser access is a finding, regardless of your own environment. This check needs no browser: verify that the implementation result cites concrete artifact paths and, where relevant, a deterministic probe hook (for example `window.__probe`).
+
+The re-capture half applies only when `PRAECTOR_CDP_URL` is set in your own environment (you were granted browser access): in that case re-capture or re-run at least one piece of the implementation's browser evidence yourself — drive the target, take your own screenshot, or re-run its probe — and record what you observed. When `PRAECTOR_CDP_URL` is absent you are not granted the browser; rely on the implementation's referenced artifacts and do not treat the absence of your own re-capture as a finding. Any artifact you do write goes only to `PRAECTOR_ARTIFACT_DIR`, never into the worktree, and browser access is shared operator infrastructure, not a security boundary.

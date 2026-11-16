@@ -584,6 +584,7 @@ var commonEnvVars = map[string]bool{
 	"PRAECTOR_HOME": true, "PRAECTOR_PROJECT_ID": true, "PRAECTOR_COLLECTION_ID": true,
 	"PRAECTOR_TASK_ID": true, "PRAECTOR_ATTEMPT_ID": true, "PRAECTOR_SESSION_ID": true,
 	"PRAECTOR_PROFILE": true, "PRAECTOR_WORKTREE": true, "PRAECTOR_CLI": true,
+	"PRAECTOR_CDP_URL": true, "PRAECTOR_ARTIFACT_DIR": true,
 }
 
 var (

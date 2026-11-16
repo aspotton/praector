@@ -26,7 +26,7 @@ type HarnessResult struct {
 }
 
 type Harness interface {
-	RunTask(prompt, workdir, profile, model string, env map[string]string, logPath string, timeout time.Duration, onStart func(int)) (HarnessResult, error)
+	RunTask(prompt, workdir, profile, model string, env map[string]string, browserGranted bool, browserCDPURL string, logPath string, timeout time.Duration, onStart func(int)) (HarnessResult, error)
 }
 
 type OpenCodeHarness struct{ Command string }
@@ -203,7 +203,7 @@ func installPraectorControlShim(processEnv map[string]string, taskEnv map[string
 	return shim
 }
 
-func inlineOpenCodeConfig(profile string) Row {
+func inlineOpenCodeConfig(profile string, browserGranted bool, browserCDPURL string) Row {
 	permission := Row{
 		"task":               "deny",
 		"question":           "deny",
@@ -215,11 +215,27 @@ func inlineOpenCodeConfig(profile string) Row {
 		permission["edit"] = "allow"
 	}
 	permission["bash"] = Row{"*": "allow", "git push*": "deny"}
-	return Row{
+	cfg := Row{
 		"$schema":    "https://opencode.ai/config.json",
 		"permission": permission,
 		"agent":      Row{"build": Row{"permission": permission}},
 	}
+	// Optional, config-free tool surface: the chrome-devtools-mcp entry is added ONLY
+	// when the SAME named grant predicate is on AND `npx` resolves here. The scheduler
+	// (not an inline profile check) supplies browserGranted, so this gate can never
+	// disagree with the env-injection gate or the audit header. When npx is absent the
+	// config degrades silently to env-var-only with no error. --no-usage-statistics
+	// keeps the entry from enabling telemetry. Never default-on, never per-profile.
+	if browserGranted {
+		if _, err := exec.LookPath("npx"); err == nil {
+			cfg["mcp"] = Row{"chrome-devtools": Row{
+				"type":    "local",
+				"command": []string{"npx", "-y", "chrome-devtools-mcp@latest", "--browser-url=" + browserCDPURL, "--no-usage-statistics"},
+				"enabled": true,
+			}}
+		}
+	}
+	return cfg
 }
 
 func deepMergeAny(base, over any) any {
@@ -254,7 +270,7 @@ func deepMergeAny(base, over any) any {
 	return out
 }
 
-func (h *OpenCodeHarness) RunTask(prompt, workdir, profile, model string, taskEnv map[string]string, logPath string, timeout time.Duration, onStart func(int)) (HarnessResult, error) {
+func (h *OpenCodeHarness) RunTask(prompt, workdir, profile, model string, taskEnv map[string]string, browserGranted bool, browserCDPURL string, logPath string, timeout time.Duration, onStart func(int)) (HarnessResult, error) {
 	sanitize := BoolEnv("PRAECTOR_SANITIZE_PARENT_VENV", true)
 	parent := envMap(os.Environ())
 	processEnv := parent
@@ -269,10 +285,18 @@ func (h *OpenCodeHarness) RunTask(prompt, workdir, profile, model string, taskEn
 	for k, v := range taskEnv {
 		processEnv[k] = v
 	}
+	// Explicitly omit the browser grant from a non-granted attempt's environment even
+	// when the parent/daemon environment leaked one in: the grant is decided by the
+	// scheduler predicate, so a stray PRAECTOR_CDP_URL / PRAECTOR_ARTIFACT_DIR can never
+	// grant browser access to a profile that was not granted.
+	if !browserGranted {
+		delete(processEnv, "PRAECTOR_CDP_URL")
+		delete(processEnv, "PRAECTOR_ARTIFACT_DIR")
+	}
 	control := installPraectorControlShim(processEnv, taskEnv)
 	processEnv["PWD"] = workdir
 
-	var injected any = inlineOpenCodeConfig(profile)
+	var injected any = inlineOpenCodeConfig(profile, browserGranted, browserCDPURL)
 	if raw := processEnv["OPENCODE_CONFIG_CONTENT"]; strings.TrimSpace(raw) != "" {
 		var existing any
 		if json.Unmarshal([]byte(raw), &existing) == nil {
@@ -351,7 +375,15 @@ func (h *OpenCodeHarness) RunTask(prompt, workdir, profile, model string, taskEn
 	}
 
 	hash := sha256.Sum256([]byte(prompt))
-	header := fmt.Sprintf("# HARNESS\ncommand=%s\nprofile=%s\nworkdir=%s\nmodel=%s\nprompt_bytes=%d\nprompt_sha256=%s\nprompt_transport=stdin\nsanitize_parent_venv=%t\nvirtual_env=%s\npraector_control=%s\n", h.Command, profile, workdir, model, len([]byte(prompt)), hex.EncodeToString(hash[:]), sanitize, processEnv["VIRTUAL_ENV"], control)
+	// browser_cdp is derived from the scheduler grant predicate (browserGranted), never
+	// from the merged environment, so the audit record can never disagree with what was
+	// actually injected. The field is present on EVERY attempt (granted url, else "off")
+	// with every preceding field kept byte-identical to today's header.
+	browserAudit := "off"
+	if browserGranted {
+		browserAudit = browserCDPURL
+	}
+	header := fmt.Sprintf("# HARNESS\ncommand=%s\nprofile=%s\nworkdir=%s\nmodel=%s\nprompt_bytes=%d\nprompt_sha256=%s\nprompt_transport=stdin\nsanitize_parent_venv=%t\nvirtual_env=%s\npraector_control=%s\nbrowser_cdp=%s\n", h.Command, profile, workdir, model, len([]byte(prompt)), hex.EncodeToString(hash[:]), sanitize, processEnv["VIRTUAL_ENV"], control, browserAudit)
 	_ = os.WriteFile(logPath, []byte(header+"# STDOUT\n"+stdout.String()+"\n# STDERR\n"+stderr.String()), 0644)
 
 	sessionID := ""

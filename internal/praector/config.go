@@ -14,6 +14,20 @@ var ProfileNames = []string{"coordinator", "explore", "critic", "plan_review", "
 var ReadOnlyProfiles = map[string]bool{"coordinator": true, "explore": true, "critic": true, "plan_review": true, "research": true, "review": true, "advise": true}
 var WriteProfiles = map[string]bool{"implement": true}
 
+// BrowserProfiles is the single named set of profiles that may receive real-browser
+// (CDP) access when a project's [capabilities] browser is enabled. It is the ONLY
+// grant predicate and is consulted at every browser-decision site: the scheduler
+// environment injection, the HARNESS header browser_cdp field, and the inline
+// chrome-devtools MCP entry. coordinator, explore, critic, plan_review, review, and
+// advise are deliberately absent so their attempts stay byte-identical to a
+// capability-off run.
+var BrowserProfiles = map[string]bool{"research": true, "implement": true}
+
+// DefaultCDPURL is the blessed Chrome DevTools endpoint used identically when the
+// browser capability is off and when it is on but no [browser] cdp_url is configured.
+// It is loopback-pinned by construction; Praector never probes or validates it.
+const DefaultCDPURL = "http://127.0.0.1:9222"
+
 var ProfileTitles = map[string]string{
 	"coordinator": "Coordinator / Planner",
 	"explore":     "Repository Explorer",
@@ -38,11 +52,12 @@ func DefaultLimits() Limits { return Limits{8, 100, 10, 4, 3, 3600} }
 
 type ProjectCapabilities struct {
 	CurrentExternalResearch bool `json:"current_external_research"`
+	Browser                 bool `json:"browser"`
 	explicit                bool
 }
 
 func DefaultProjectCapabilities() ProjectCapabilities {
-	return ProjectCapabilities{CurrentExternalResearch: true, explicit: true}
+	return ProjectCapabilities{CurrentExternalResearch: true, Browser: false, explicit: true}
 }
 
 type ProjectConfig struct {
@@ -55,10 +70,28 @@ type ProjectConfig struct {
 	Models          map[string]string
 	Limits          Limits
 	Capabilities    ProjectCapabilities
+	CDPURL          string
 }
 
 func (p ProjectConfig) ModelFor(profile string) string    { return strings.TrimSpace(p.Models[profile]) }
 func (p ProjectConfig) ResolvedOpenCode() (string, error) { return RequireBinary(p.OpenCodeCommand) }
+
+// BrowserGranted reports whether a profile receives real-browser (CDP) access under
+// the project's capabilities and the single BrowserProfiles grant set. It is the ONLY
+// grant predicate; every browser-decision site must call it rather than an inline
+// profile comparison.
+func (p ProjectConfig) BrowserGranted(profile string) bool {
+	return p.Capabilities.Browser && BrowserProfiles[profile]
+}
+
+// BrowserCDPURL resolves the CDP endpoint for a browser grant, falling back to the
+// blessed DefaultCDPURL when no [browser] cdp_url was configured.
+func (p ProjectConfig) BrowserCDPURL() string {
+	if u := strings.TrimSpace(p.CDPURL); u != "" {
+		return u
+	}
+	return DefaultCDPURL
+}
 
 type GlobalConfig struct{ Home string }
 
@@ -67,6 +100,14 @@ func (g GlobalConfig) LockFile() string      { return filepath.Join(g.Home, "sta
 func (g GlobalConfig) SchedulerLock() string { return filepath.Join(g.Home, "scheduler.lock") }
 func (g GlobalConfig) WorktreesDir() string  { return filepath.Join(g.Home, "worktrees") }
 func (g GlobalConfig) LogsDir() string       { return filepath.Join(g.Home, "logs") }
+
+// ArtifactsDir returns the durable per-attempt evidence directory
+// (~/.praector/artifacts/<task-id>/attempt-<n>). It lives strictly OUTSIDE any
+// worktree so evidence written by a browser-granted attempt (screenshots, probe
+// dumps) can never trip the worktree-scoped read-only Git-mutation check.
+func (g GlobalConfig) ArtifactsDir(taskID string, attemptNo int) string {
+	return filepath.Join(g.Home, "artifacts", taskID, fmt.Sprintf("attempt-%d", attemptNo))
+}
 
 func Global() (GlobalConfig, error) {
 	home := os.Getenv("PRAECTOR_HOME")
@@ -285,6 +326,7 @@ func ReadProjectMarker(path string) (ProjectConfig, error) {
 	md := d["models"]
 	lr := d["limits"]
 	cr := d["capabilities"]
+	br := d["browser"]
 	if pr["id"] == "" || pr["name"] == "" {
 		return ProjectConfig{}, fmt.Errorf("invalid project marker: missing project id/name")
 	}
@@ -309,6 +351,15 @@ func ReadProjectMarker(path string) (ProjectConfig, error) {
 			caps.CurrentExternalResearch = b
 		}
 	}
+	if v, ok := cr["browser"]; ok {
+		if b, e := strconv.ParseBool(strings.TrimSpace(v)); e == nil {
+			caps.Browser = b
+		}
+	}
+	cdpURL := DefaultCDPURL
+	if v := strings.TrimSpace(br["cdp_url"]); v != "" {
+		cdpURL = v
+	}
 	models := map[string]string{}
 	for _, n := range ProfileNames {
 		models[n] = md[n]
@@ -325,7 +376,7 @@ func ReadProjectMarker(path string) (ProjectConfig, error) {
 	if base == "" {
 		base = "main"
 	}
-	return ProjectConfig{ProjectID: pr["id"], Name: pr["name"], Root: filepath.Clean(root), BaseBranch: base, Harness: harness, OpenCodeCommand: cmd, Models: models, Limits: lim, Capabilities: caps}, nil
+	return ProjectConfig{ProjectID: pr["id"], Name: pr["name"], Root: filepath.Clean(root), BaseBranch: base, Harness: harness, OpenCodeCommand: cmd, Models: models, Limits: lim, Capabilities: caps, CDPURL: cdpURL}, nil
 }
 
 func tomlString(v string) string { return strconv.Quote(v) }
@@ -351,7 +402,8 @@ func WriteProjectMarker(c ProjectConfig) (string, error) {
 	if !caps.explicit {
 		caps = DefaultProjectCapabilities()
 	}
-	fmt.Fprintf(&b, "\n[capabilities]\ncurrent_external_research = %t\n", caps.CurrentExternalResearch)
+	fmt.Fprintf(&b, "\n[capabilities]\ncurrent_external_research = %t\nbrowser = %t\n", caps.CurrentExternalResearch, caps.Browser)
+	fmt.Fprintf(&b, "\n[browser]\ncdp_url = %s\n", tomlString(c.BrowserCDPURL()))
 	l := c.Limits
 	fmt.Fprintf(&b, "\n[limits]\nmax_task_depth = %d\nmax_tasks_per_collection = %d\nmax_children_per_task = %d\nmax_parallel_tasks = %d\nmax_attempts_per_task = %d\ntask_timeout_seconds = %d\n", l.MaxTaskDepth, l.MaxTasksPerCollection, l.MaxChildrenPerTask, l.MaxParallelTasks, l.MaxAttemptsPerTask, l.TaskTimeoutSeconds)
 	return p, os.WriteFile(p, []byte(b.String()), 0644)
@@ -362,7 +414,7 @@ func ProjectConfigJSON(c ProjectConfig) Row {
 	if !caps.explicit {
 		caps = DefaultProjectCapabilities()
 	}
-	return Row{"harness": c.Harness, "opencode_command": c.OpenCodeCommand, "models": c.Models, "capabilities": Row{"current_external_research": caps.CurrentExternalResearch}, "limits": Row{"max_task_depth": c.Limits.MaxTaskDepth, "max_tasks_per_collection": c.Limits.MaxTasksPerCollection, "max_children_per_task": c.Limits.MaxChildrenPerTask, "max_parallel_tasks": c.Limits.MaxParallelTasks, "max_attempts_per_task": c.Limits.MaxAttemptsPerTask, "task_timeout_seconds": c.Limits.TaskTimeoutSeconds}}
+	return Row{"harness": c.Harness, "opencode_command": c.OpenCodeCommand, "models": c.Models, "capabilities": Row{"current_external_research": caps.CurrentExternalResearch, "browser": caps.Browser}, "browser": Row{"cdp_url": c.BrowserCDPURL()}, "limits": Row{"max_task_depth": c.Limits.MaxTaskDepth, "max_tasks_per_collection": c.Limits.MaxTasksPerCollection, "max_children_per_task": c.Limits.MaxChildrenPerTask, "max_parallel_tasks": c.Limits.MaxParallelTasks, "max_attempts_per_task": c.Limits.MaxAttemptsPerTask, "task_timeout_seconds": c.Limits.TaskTimeoutSeconds}}
 }
 
 func ProjectConfigFromRow(r Row) ProjectConfig {
@@ -412,8 +464,17 @@ func ProjectConfigFromRow(r Row) ProjectConfig {
 	if cm != nil && cm["current_external_research"] != nil {
 		caps.CurrentExternalResearch = B(cm, "current_external_research")
 	}
+	if cm != nil && cm["browser"] != nil {
+		caps.Browser = B(cm, "browser")
+	}
+	cdpURL := DefaultCDPURL
+	if bm := M(raw, "browser"); bm != nil {
+		if u := strings.TrimSpace(S(bm, "cdp_url")); u != "" {
+			cdpURL = u
+		}
+	}
 	root, _ := filepath.Abs(S(r, "root_path"))
-	return ProjectConfig{ProjectID: S(r, "id"), Name: S(r, "name"), Root: root, BaseBranch: S(r, "base_branch"), Harness: h, OpenCodeCommand: cmd, Models: models, Limits: lim, Capabilities: caps}
+	return ProjectConfig{ProjectID: S(r, "id"), Name: S(r, "name"), Root: root, BaseBranch: S(r, "base_branch"), Harness: h, OpenCodeCommand: cmd, Models: models, Limits: lim, Capabilities: caps, CDPURL: cdpURL}
 }
 
 func MarshalPretty(v any) string { b, _ := json.MarshalIndent(v, "", "  "); return string(b) }

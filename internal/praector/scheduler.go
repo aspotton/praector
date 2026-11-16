@@ -2384,8 +2384,25 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 	env := map[string]string{
 		"PRAECTOR_HOME": s.Cfg.Home, "PRAECTOR_PROJECT_ID": S(task, "project_id"), "PRAECTOR_COLLECTION_ID": S(task, "collection_id"), "PRAECTOR_TASK_ID": taskID, "PRAECTOR_ATTEMPT_ID": S(attempt, "id"), "PRAECTOR_SESSION_ID": S(session, "id"), "PRAECTOR_PROFILE": S(task, "profile"), "PRAECTOR_WORKTREE": workdir,
 	}
+	// The browser grant is derived ONCE here from the single named BrowserGranted
+	// predicate and threaded explicitly to the harness (header + inline config). It is
+	// never read back out of the merged worker process environment, so a stray
+	// PRAECTOR_CDP_URL inherited from the parent/daemon can never forge an "on" grant
+	// or an audit record disagreeing with the injected env. For non-granted profiles
+	// both PRAECTOR_CDP_URL and PRAECTOR_ARTIFACT_DIR are deliberately omitted, so a
+	// capability-off (or non-granted-profile) attempt is byte-identical to today.
+	browserGranted := projectCfg.BrowserGranted(S(task, "profile"))
+	browserCDPURL := projectCfg.BrowserCDPURL()
+	if browserGranted {
+		env["PRAECTOR_CDP_URL"] = browserCDPURL
+		artifactDir := s.Cfg.ArtifactsDir(taskID, I(attempt, "attempt_no"))
+		// Created strictly outside any worktree so screenshots/probe dumps written by
+		// the granted attempt can never trip the worktree-scoped read-only mutation check.
+		_ = os.MkdirAll(artifactDir, 0755)
+		env["PRAECTOR_ARTIFACT_DIR"] = artifactDir
+	}
 	_ = s.Store.Event(S(task, "project_id"), S(task, "collection_id"), taskID, S(attempt, "id"), "SESSION_STARTED", Row{"workdir": workdir})
-	harnessResult, err = harness.RunTask(prompt, workdir, S(task, "profile"), projectCfg.ModelFor(S(task, "profile")), env, logPath, time.Duration(projectCfg.Limits.TaskTimeoutSeconds)*time.Second, func(pid int) { _ = s.Store.SetSessionPID(S(session, "id"), pid) })
+	harnessResult, err = harness.RunTask(prompt, workdir, S(task, "profile"), projectCfg.ModelFor(S(task, "profile")), env, browserGranted, browserCDPURL, logPath, time.Duration(projectCfg.Limits.TaskTimeoutSeconds)*time.Second, func(pid int) { _ = s.Store.SetSessionPID(S(session, "id"), pid) })
 	if err != nil {
 		handleErr(err)
 		return

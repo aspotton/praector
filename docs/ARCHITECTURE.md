@@ -218,12 +218,16 @@ The adapter is responsible for one disposable run:
 - clean inherited parent virtualenv leakage from the worker environment;
 - synchronize `$PWD` with the assigned worktree as well as subprocess cwd/`--dir`;
 - inject Praector's high-precedence OpenCode permissions;
+- strip `PRAECTOR_CDP_URL`/`PRAECTOR_ARTIFACT_DIR` from a non-granted attempt's merged environment and add the optional `chrome-devtools-mcp` inline server for a browser-granted attempt when `npx` resolves, both driven by the scheduler-supplied grant (never read back from the environment);
 - launch `opencode run --pure --format json --auto --agent build --dir <worktree>`;
 - stream/capture output;
 - expose PID/start callback;
+- record the durable `browser_cdp=<url|off>` audit field in the HARNESS header, derived from the scheduler's browser grant decision;
 - return process exit/final text/session metadata.
 
 Provider-specific behavior belongs here, not in scheduler/database logic.
+
+Real-browser (CDP) access is a **default-off** project capability (`[capabilities] browser` + a top-level `[browser] cdp_url`, defaulting to the blessed loopback constant `http://127.0.0.1:9222`) granted only to the `research` and `implement` profiles via the single named `BrowserProfiles` predicate. The scheduler computes the grant once and threads it to all three decision sites — the worker environment injection, the HARNESS `browser_cdp` header, and the harness's inline config — so a grant can never appear at one site but not another, and the audit header can never disagree with what was injected. A granted attempt also receives `PRAECTOR_ARTIFACT_DIR` under `$PRAECTOR_HOME/artifacts/<task>/attempt-<n>`, created strictly outside any worktree so evidence cannot trip the read-only Git-mutation check. Praector owns only the decision, injection, artifact-dir creation, audit field, and the optional inline MCP entry: it runs **no** CDP client, no container/health/lease/process lifecycle, and never probes or validates `cdp_url`, which is trusted, loopback-pinned operator configuration. CDP is unauthenticated drift-proofing for models, not a security boundary or host isolation. See [OPERATIONS.md](OPERATIONS.md).
 
 ## Objective lifecycle
 

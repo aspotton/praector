@@ -261,6 +261,7 @@ See [`docs/OPERATIONS.md`](docs/OPERATIONS.md#project-configuration) for the com
 - Read-only profiles are denied normal edit tools and are checked for Git mutations after execution.
 - Workers run in Praector-managed worktrees, not in the user's original checkout.
 - `git push` is denied inside managed OpenCode runs.
+- Real-browser (CDP) access is a **default-off** project capability (`[capabilities] browser`) granted only to `research` and `implement` attempts via one named predicate, and it is **not** a security boundary: Chrome DevTools is unauthenticated, so browser access is drift-proofing for models, not isolation against a compromised host. The operator browser is trusted, loopback-pinned infrastructure that Praector configures but never probes or manages.
 - Implementation results require independent review before collection acceptance.
 - Review completion requires an explicit `verdict: pass|fail`.
 - Collection completion and collection acceptance are separate lifecycle events.
