@@ -1839,12 +1839,52 @@ func (s *Scheduler) projectLimits(pid string) Limits {
 	return DefaultLimits()
 }
 
+// supersedeWalkBound bounds every transitive superseded_by walk so a supersede chain
+// (even a self-referential or pathological one) can never loop the resolver or backfill.
+const supersedeWalkBound = 64
+
+// supersededCurrentImplements walks superseded_by edges transitively (bounded by
+// supersedeWalkBound and a per-walk visited set) from startID and returns the COMPLETE
+// implement-profile tasks that currently carry its work. It exists so a repair reached
+// through superseded intermediates still resolves: the incident repair chain passed
+// through several supersedes, so the failed review's surviving implementation is a
+// supersede-descendant rather than a direct neighbor. The edges argument is the caller's
+// already-loaded edge set so the walk adds no extra Dolt reads.
+func (s *Scheduler) supersededCurrentImplements(edges Rows, startID string) []string {
+	out := []string{}
+	if startID == "" {
+		return out
+	}
+	seen := map[string]bool{startID: true}
+	queue := []string{startID}
+	for len(queue) > 0 && len(seen) <= supersedeWalkBound {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, e := range edges {
+			if S(e, "relation") != "superseded_by" || S(e, "from_task_id") != cur {
+				continue
+			}
+			nxt := S(e, "to_task_id")
+			if nxt == "" || seen[nxt] {
+				continue
+			}
+			seen[nxt] = true
+			queue = append(queue, nxt)
+			if t, e2 := s.Store.GetTask(nxt); e2 == nil && t != nil && S(t, "profile") == "implement" && S(t, "status") == TaskComplete {
+				out = append(out, nxt)
+			}
+		}
+	}
+	return out
+}
+
 // repairOriginalImplementations is the SINGLE discovery rule that resolves the
 // original implementation tasks a failed review verified. It is shared verbatim
 // by the trigger-time seam (ensureReview) and the retroactive daemon reconcile
 // backfill sweep, so the carry-edge invariant is one rule and cannot fork between
-// the paths that wire it live and the path that heals it later. Two shapes are
-// resolved, exactly as ensureReview always has:
+// the paths that wire it live and the path that heals it later. Four shapes are
+// resolved, exactly as ensureReview always has (the first two) plus the two the
+// incident repair-lineage gap needs (the third and fourth):
 //
 //  1. verifies edges INTO the failed review (scheduler-created review shape): the
 //     edge's from_task_id is an implementation the failed review was created to
@@ -1855,40 +1895,119 @@ func (s *Scheduler) projectLimits(pid string) Limits {
 //     implementation uncovered and the collection permanently BLOCKED. Every
 //     COMPLETE implement-profile depends_on prerequisite of the failed review is
 //     an implementation it reviewed.
+//  3. the superseded-intermediate shape: the incident's original (or a shape-1/2
+//     source) may itself now be SUPERSEDED because the repair chain passed through
+//     supersedes. Such a source is supersede-normalized transitively (bounded) so the
+//     surviving COMPLETE implementation is a carry member too.
+//  4. the chained-failed-review shape: when a resolved source implementation is itself
+//     a repair that depends_on ANOTHER verdict=fail review, that other failed review's
+//     originals (resolved through shapes 1-3 via the same walk) are carry members as
+//     well. The recursion is bounded by a shared visited-reviews set so a supersede or
+//     failed-review cycle cannot loop.
 //
 // excludeIDs are sources already accounted for elsewhere (the repair
 // implementation or deps already collected) and are skipped. The verifies edges
 // this rule feeds are INSERT IGNORE with no dependency cycle guard, but they are
 // not part of the dependency DAG (dependencyEdgesLocked filters relation='depends_on'),
 // so they cannot close a cycle. Order is stable: verifies-edge sources first, then
-// depends_on-prerequisite sources.
+// depends_on-prerequisite sources, with supersede-normalized and chained sources
+// appended after their origin shape.
 func (s *Scheduler) repairOriginalImplementations(cid string, failedReview Row, excludeIDs []string) ([]string, error) {
 	edges, err := s.Store.ListEdges(cid)
 	if err != nil {
 		return nil, err
 	}
 	sources := []string{}
-	for _, edge := range edges {
-		if S(edge, "relation") == "verifies" && S(edge, "to_task_id") == S(failedReview, "id") {
-			source := S(edge, "from_task_id")
-			if source != "" && !containsString(excludeIDs, source) && !containsString(sources, source) {
-				sources = append(sources, source)
+	addSource := func(id string) {
+		if id == "" || containsString(excludeIDs, id) || containsString(sources, id) {
+			return
+		}
+		sources = append(sources, id)
+	}
+	visitedReviews := map[string]bool{}
+	var walk func(fr Row) error
+	walk = func(fr Row) error {
+		if fr == nil {
+			return nil
+		}
+		id := S(fr, "id")
+		if id == "" || visitedReviews[id] {
+			return nil
+		}
+		visitedReviews[id] = true
+		direct := []string{}
+		addDirect := func(x string) {
+			if x == "" || containsString(excludeIDs, x) || containsString(direct, x) {
+				return
+			}
+			direct = append(direct, x)
+		}
+		// Shape 1: verifies edges INTO the failed review.
+		for _, edge := range edges {
+			if S(edge, "relation") == "verifies" && S(edge, "to_task_id") == id {
+				addDirect(S(edge, "from_task_id"))
 			}
 		}
+		// Shape 2: the coordinator-created shape — COMPLETE implement depends_on
+		// prerequisites of the failed review.
+		for _, edge := range edges {
+			if S(edge, "relation") != "depends_on" || S(edge, "to_task_id") != id {
+				continue
+			}
+			source := S(edge, "from_task_id")
+			if source == "" || containsString(excludeIDs, source) || containsString(direct, source) {
+				continue
+			}
+			src, e := s.Store.GetTask(source)
+			if e != nil || src == nil || S(src, "profile") != "implement" || S(src, "status") != TaskComplete {
+				continue
+			}
+			addDirect(source)
+		}
+		// Shape 3: supersede-normalize a source that is now SUPERSEDED so the
+		// surviving COMPLETE implementation is also a carry member.
+		for _, source := range append([]string{}, direct...) {
+			src, e := s.Store.GetTask(source)
+			if e == nil && src != nil && S(src, "profile") == "implement" && S(src, "status") == TaskSuperseded {
+				for _, cur := range s.supersededCurrentImplements(edges, source) {
+					addDirect(cur)
+				}
+			}
+		}
+		for _, source := range direct {
+			addSource(source)
+		}
+		// Shape 4: a source implementation that is itself a repair depending on another
+		// verdict=fail review folds in that other failed review's originals (bounded).
+		for _, source := range direct {
+			src, e := s.Store.GetTask(source)
+			if e != nil || src == nil || S(src, "profile") != "implement" || S(src, "status") != TaskComplete {
+				continue
+			}
+			for _, edge := range edges {
+				if S(edge, "relation") != "depends_on" || S(edge, "to_task_id") != S(src, "id") {
+					continue
+				}
+				fr2 := S(edge, "from_task_id")
+				if fr2 == "" || visitedReviews[fr2] {
+					continue
+				}
+				review, e2 := s.Store.GetTask(fr2)
+				if e2 != nil || review == nil || S(review, "profile") != "review" || S(review, "status") != TaskComplete {
+					continue
+				}
+				if strings.ToLower(strings.TrimSpace(S(M(review, "result"), "verdict"))) != "fail" {
+					continue
+				}
+				if err := walk(review); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	}
-	for _, edge := range edges {
-		if S(edge, "relation") != "depends_on" || S(edge, "to_task_id") != S(failedReview, "id") {
-			continue
-		}
-		source := S(edge, "from_task_id")
-		if source == "" || containsString(excludeIDs, source) || containsString(sources, source) {
-			continue
-		}
-		src, e := s.Store.GetTask(source)
-		if e != nil || src == nil || S(src, "profile") != "implement" || S(src, "status") != TaskComplete {
-			continue
-		}
-		sources = append(sources, source)
+	if err := walk(failedReview); err != nil {
+		return nil, err
 	}
 	return sources, nil
 }
@@ -2387,6 +2506,17 @@ func (s *Scheduler) maxWorkersFor(collectionID string) int {
 // include implements, so plain depends_on never counts as coverage (the coverage rule
 // stays zero-diff).
 //
+// The carrying-review discovery is extended beyond the direct depends_on shape to heal the
+// lemmings incident graph (COL-9d6d965db0), where the passing review exists only on the
+// final re-integrated repair and NO passing review directly depends_on the failed review:
+// a passing review that verifies a repair which (directly, or via a bounded transitive
+// superseded_by walk from a superseded dependent) belongs to the failed review's repair
+// lineage is also treated as a carrier. This is a genuine lineage membership test, not a
+// widening: the carrier's implementation is reachable from the failed review's own repair
+// dependents, so a passing review of an unrelated implementation (the negative guard test)
+// still gains no carry. The originals wired to these carriers are exactly what the shared
+// resolver resolves, so the coverage rule is unchanged and healthy graphs stay zero-diff.
+//
 // It is a strict Go-side no-op when the edge already exists: the existing (from,to,
 // relation) keys are loaded from ListEdges first because AddEdge('verifies') commits even
 // on a zero-row INSERT IGNORE, so an unconditional per-tick write would churn Dolt on
@@ -2415,10 +2545,14 @@ func (s *Scheduler) backfillRepairLineageCarryEdges(cid string) (int, error) {
 	}
 	keys := map[string]bool{}
 	depFromFailed := map[string][]string{}
+	verifiesFrom := map[string][]string{}
 	for _, e := range edges {
 		keys[S(e, "from_task_id")+"\x00"+S(e, "to_task_id")+"\x00"+S(e, "relation")] = true
 		if S(e, "relation") == "depends_on" {
 			depFromFailed[S(e, "from_task_id")] = append(depFromFailed[S(e, "from_task_id")], S(e, "to_task_id"))
+		}
+		if S(e, "relation") == "verifies" {
+			verifiesFrom[S(e, "from_task_id")] = append(verifiesFrom[S(e, "from_task_id")], S(e, "to_task_id"))
 		}
 	}
 	failedReviews := []Row{}
@@ -2426,6 +2560,63 @@ func (s *Scheduler) backfillRepairLineageCarryEdges(cid string) (int, error) {
 		if S(t, "profile") == "review" && S(t, "status") == TaskComplete && strings.ToLower(strings.TrimSpace(S(M(t, "result"), "verdict"))) == "fail" {
 			failedReviews = append(failedReviews, t)
 		}
+	}
+	// isPassingReview is the carrier predicate: a COMPLETE review whose durable verdict
+	// is pass. Coverage only counts such reviews, so a carrier must be exactly one.
+	isPassingReview := func(r Row) bool {
+		return r != nil && S(r, "profile") == "review" && S(r, "status") == TaskComplete && strings.ToLower(strings.TrimSpace(S(M(r, "result"), "verdict"))) == "pass"
+	}
+	// carryingReviews resolves the set of passing reviews that may carry this failed
+	// review's originals: (a) the direct shape — passing reviews that directly
+	// depends_on the failed review, exactly what ensureReview wires at trigger time —
+	// plus (b) the incident shape — passing reviews that verify a repair which is in
+	// the failed review's repair lineage (a depends_on dependent, supersede-normalized
+	// through a bounded transitive superseded_by walk). Membership is a genuine lineage
+	// reachability test, never a widening to unrelated passing reviews.
+	carryingReviews := func(fr Row) []Row {
+		out := []Row{}
+		seen := map[string]bool{}
+		add := func(r Row) {
+			if r == nil {
+				return
+			}
+			rid := S(r, "id")
+			if rid == "" || seen[rid] {
+				return
+			}
+			seen[rid] = true
+			out = append(out, r)
+		}
+		for _, toID := range depFromFailed[S(fr, "id")] {
+			dep := by[toID]
+			if dep == nil {
+				continue
+			}
+			// (a) direct: the dependent itself is a passing review.
+			if isPassingReview(dep) {
+				add(dep)
+			}
+			if S(dep, "profile") != "implement" {
+				continue
+			}
+			// (b) lineage: the dependent is a repair implementation (COMPLETE, or a
+			// SUPERSEDED repair whose surviving implementation is reached by the
+			// bounded supersede walk) — every passing review verifying it is a carrier.
+			lineageImplements := []string{}
+			if S(dep, "status") == TaskComplete {
+				lineageImplements = append(lineageImplements, toID)
+			} else if S(dep, "status") == TaskSuperseded {
+				lineageImplements = append(lineageImplements, s.supersededCurrentImplements(edges, toID)...)
+			}
+			for _, implID := range lineageImplements {
+				for _, rid := range verifiesFrom[implID] {
+					if cr := by[rid]; isPassingReview(cr) {
+						add(cr)
+					}
+				}
+			}
+		}
+		return out
 	}
 	added := 0
 	changed := true
@@ -2439,14 +2630,7 @@ func (s *Scheduler) backfillRepairLineageCarryEdges(cid string) (int, error) {
 			if len(originals) == 0 {
 				continue
 			}
-			for _, toID := range depFromFailed[S(fr, "id")] {
-				carrier := by[toID]
-				if carrier == nil || S(carrier, "profile") != "review" || S(carrier, "status") != TaskComplete {
-					continue
-				}
-				if strings.ToLower(strings.TrimSpace(S(M(carrier, "result"), "verdict"))) != "pass" {
-					continue
-				}
+			for _, carrier := range carryingReviews(fr) {
 				var carried []string
 				for _, impl := range originals {
 					k := impl + "\x00" + S(carrier, "id") + "\x00verifies"
