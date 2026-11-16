@@ -34,3 +34,9 @@ Submit structured evidence:
 A planner directive derived from a normative claim must preserve or strengthen it unless a durable explicit exception is cited. Structured `claims` are authoritative for material research directives. If you also emit a legacy top-level `planner_directives` list, every item must exactly match one of the structured claim directives. Do not contradict your own cited claim. If sources conflict or version/date scope is unclear, surface the contradiction instead of guessing.
 
 For external-conformance work, identify at least one `independent_implementation`, `official_reference_oracle`, or `live_provider_oracle` when practical. If none is practically available, say so explicitly in `authoritative_oracle_unavailable_reason`; never relabel an implementation-owned black-box client as official conformance.
+
+## UI evidence (only when `PRAECTOR_CDP_URL` is set in your environment)
+
+These rules apply only if `PRAECTOR_CDP_URL` is present; when it is absent you have no browser access and none of this applies. The operator browser is shared infrastructure and browser access is not a security boundary.
+
+When you report on a UI artifact you drove or rendered, describe it with re-capturable evidence: capture a screenshot to `PRAECTOR_ARTIFACT_DIR` (never into the worktree) and reference that artifact path alongside the claim, so a later review can independently re-open the same page and observe the same result.

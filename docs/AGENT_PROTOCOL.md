@@ -430,6 +430,10 @@ Every Envelope states that `PRAECTOR_WORKTREE` / `workspace.assigned_worktree` i
 
 Praector removes an inherited active Python virtualenv activation from the worker environment before launching OpenCode, preventing project `python`/`pip` commands from accidentally resolving to the operator shell's environment. The native Praector executable itself has no Python runtime dependency. Explicit task environment overrides remain possible.
 
+### Browser (CDP) access
+
+A worker receives real-browser access only when its project enables the **default-off** `[capabilities] browser` capability AND its profile is `research` or `implement`, decided by the single named `BrowserProfiles` predicate computed once in the scheduler. A granted attempt's environment carries `PRAECTOR_CDP_URL` (the configured `cdp_url`) and `PRAECTOR_ARTIFACT_DIR` (`~/.praector/artifacts/<task>/attempt-<n>`, created outside any worktree); a granted attempt whose environment also resolves `npx` additionally gets an inline `chrome-devtools-mcp` server pointed at that URL, disabled for telemetry and degrading silently to env-var-only when `npx` is absent. Every other profile is byte-identical to a capability-off run and has both variables stripped from its environment, even if the parent/daemon environment leaked one, so a stray variable can never forge browser access. The HARNESS audit header records `browser_cdp=<url|off>` for every attempt, derived from the scheduler's grant and never read back from the environment. Prompt guidance is static and env-conditional — a worker is only expected to attach browser evidence (screenshots/probes to `PRAECTOR_ARTIFACT_DIR`, never the worktree) when `PRAECTOR_CDP_URL` is present in its own environment. CDP is unauthenticated operator infrastructure and drift-proofing for models, not a security boundary; Praector runs no CDP client and never probes or validates `cdp_url`.
+
 ## Stop condition
 
 A worker should stop when either:

@@ -63,6 +63,8 @@ Role prompts reinforce these rules rather than duplicating them. The coordinator
 
 The mapping is conceptual, not a dependency. Praector does not import or invoke Oh My OpenAgent.
 
+Browser (CDP) access is a **default-off** project capability (`[capabilities] browser`) granted only to `research` and `implement` attempts, decided by the single named `BrowserProfiles` predicate and applied together at the scheduler environment, the HARNESS `browser_cdp` audit header, and the inline `chrome-devtools-mcp` config entry. A granted attempt gets `PRAECTOR_CDP_URL` and `PRAECTOR_ARTIFACT_DIR` (evidence outside the worktree, so the read-only Git-mutation check stays green); every other profile stays byte-identical to a capability-off run with both variables stripped. The prompt contracts add only **static, env-conditional** evidence guidance (conditional visual-claim/artifact rules, never unconditional mandates, and artifacts only to `PRAECTOR_ARTIFACT_DIR`): `implement` references screenshot/probe artifacts and exposes a probe hook, `research` describe-screenshot-stores UI evidence, and `review` flags missing re-capturable visual evidence unconditionally while the "re-capture browser evidence yourself" half applies only when the reviewer itself is granted. Browser access is unauthenticated drift-proofing for models, not a security boundary (see [`docs/OPERATIONS.md`](OPERATIONS.md)).
+
 ## Why `review` and `plan_review` are different
 
 This distinction matters:

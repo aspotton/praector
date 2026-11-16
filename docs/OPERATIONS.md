@@ -1004,3 +1004,29 @@ current_external_research = true
 ```
 
 The default is `true`, including for legacy project rows that predate the field. Set it to `false` when the configured harness must not be trusted to retrieve current external information. A Collection that deterministically needs fresh research, or a specialist that raises `RESEARCH_REQUIRED`, is then blocked/quarantined with `RESEARCH_CAPABILITY_REQUIRED` rather than continuing from model memory. Re-run project initialization/registration after changing durable project configuration so the stored project config is refreshed.
+
+## Opt-in browser (CDP) capability
+
+The real-browser capability is **default off**. Enable it and point it at an operator-run Chromium exposing CDP on host loopback:
+
+```toml
+[capabilities]
+browser = true
+
+[browser]
+cdp_url = "http://127.0.0.1:9222"
+```
+
+`browser` defaults to `false` (unlike `current_external_research`), including for legacy project rows and markers with no `[browser]` table, in which case `cdp_url` resolves to the blessed default `http://127.0.0.1:9222`. `cdp_url` is a top-level `[browser]` table (and a top-level `browser.cdp_url` config_json key), **not** nested under `[capabilities]`. `praector project show` and the MCP `praector_project_show` resource project both fields through the existing `config_json` passthrough; there is no separate CLI flag or MCP tool. Re-run project registration after changing durable project configuration so the stored config is refreshed.
+
+When enabled, the capability grants browser access to the `research` and `implement` profiles **only**, decided by the single named `BrowserProfiles` predicate and applied at every decision site together. A granted attempt receives `PRAECTOR_CDP_URL=<cdp_url>` and `PRAECTOR_ARTIFACT_DIR=~/.praector/artifacts/<task>/attempt-<n>` (created outside any worktree so evidence never trips the read-only Git-mutation check), and an optional `chrome-devtools-mcp` entry is added to its inline config when `npx` resolves (degrading silently to env-var-only otherwise). Every other profile — `coordinator`, `explore`, `critic`, `plan_review`, `review`, and `advise` — stays byte-identical to a capability-off run and has both variables stripped even if the parent/daemon environment leaked one. Every attempt's HARNESS log header records the durable audit field `browser_cdp=<url|off>`, derived from the scheduler's grant decision and never from the environment.
+
+Blessed operator browser (a container exposing CDP on host loopback only; Praector manages no container, health probe, lease, or process):
+
+```bash
+docker run -d --rm -p 127.0.0.1:9222:9222 chromedp/headless-shell
+```
+
+(Add `--shm-size 2G` for memory-heavy pages. Never use the interface-wide `-p 9222:9222` form, which publishes the port on every interface. If you instead point `cdp_url` at a host-side Chrome, launch it with an explicit `--user-data-dir`.)
+
+**Threat model:** Chrome DevTools Protocol is **unauthenticated**. This capability is drift-proofing for models (a live browser to observe and probe), **not** a security boundary or isolation against a compromised host, and the DevTools origin policy is never authentication. The operator browser is shared: a granted attempt creates its own CDP target and must not assume exclusive control. `cdp_url` is trusted operator configuration that Praector never probes or validates, so keep it pinned to host loopback.

@@ -29,7 +29,7 @@ printf '{"type":"text","text":"bytes=%s"}\n' "$n"
 	}
 	prompt := "evidence:" + strings.Repeat("x", 512_000)
 	logPath := filepath.Join(dir, "run.log")
-	got, err := h.RunTask(prompt, dir, "critic", "", map[string]string{"PRAECTOR_TASK_ID": "T-large"}, logPath, 30*time.Second, nil)
+	got, err := h.RunTask(prompt, dir, "critic", "", map[string]string{"PRAECTOR_TASK_ID": "T-large"}, false, "", logPath, 30*time.Second, nil)
 	if err != nil {
 		t.Fatalf("RunTask: %v", err)
 	}
