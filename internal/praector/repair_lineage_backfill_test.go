@@ -299,6 +299,203 @@ func TestRepairLineageBackfillReachesSecondGenerationCarry(t *testing.T) {
 	}
 }
 
+// incidentShape captures the durable lemmings incident (COL-9d6d965db0) graph shape that
+// the pre-fix resolver and backfill BOTH failed to heal: an original COMPLETE implementation
+// whose FAILED review carries a verifies edge onto it, a repair chain that passed through
+// SUPERSEDES (so the surviving re-integrated repair is reached through superseded
+// intermediates), that re-integrated repair directly depends_on the failed review, and a
+// fresh passing review verifying ONLY the final repair. No passing review directly
+// depends_on the failed review, so the pre-fix carrier discovery (which required a direct
+// depends_on) found no carrier and the collection stayed permanently BLOCKED.
+type incidentShape struct {
+	s     *Store
+	cfg   GlobalConfig
+	p     Row
+	c     Row
+	coord Row
+	orig  Row
+	fr    Row
+	r1    Row
+	r2    Row
+	final Row
+	pass  Row
+}
+
+// buildSupersededRepairIncident plants the exact incident graph. The failed review is
+// coordinator-created but given a scheduler-style verifies edge onto the original (the
+// incident's T-9bd8a82320 shape). The repair chain models three supersedes ending in a
+// re-integrated final repair that re-depends_on the failed review, plus a passing review
+// that verifies only that final repair.
+func buildSupersededRepairIncident(t *testing.T) incidentShape {
+	t.Helper()
+	s, cfg := newFakeStore(t)
+	p, err := s.RegisterProject(testProjectConfig(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, coord, err := s.CreateCollectionWithCoordinator(S(p, "id"), "Lemmings incident replay", "Add feature", "Plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	forceCollectionCreatedAt(t, s, S(c, "id"), preCutoffCreatedAt)
+	orig, _, err := s.CreateTask(CreateTaskOptions{ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "implement", Title: "Original", Objective: "o", Reason: "r", ParentTaskID: S(coord, "id"), WorkspaceMode: "collection", Depth: 1, AllowDedupe: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SetTaskStatus(S(orig, "id"), TaskComplete, "impl complete"); err != nil {
+		t.Fatal(err)
+	}
+	// Coordinator-created failed review (depends_on-only) plus the incident's verifies
+	// edge onto the original. It has NO passing review depending on it directly.
+	fr, _, err := s.CreateTask(CreateTaskOptions{ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "review", Title: "Failed", Objective: "o", Reason: "r", ParentTaskID: S(coord, "id"), DependsOn: []string{S(orig, "id")}, WorkspaceMode: "collection", Depth: 2, AllowDedupe: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.AddEdge(S(orig, "id"), S(fr, "id"), S(c, "id"), "verifies"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.SubmitResult(S(fr, "id"), Row{"status": "complete", "summary": "defect", "verdict": "fail"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SetTaskStatus(S(fr, "id"), TaskComplete, "semantic fail"); err != nil {
+		t.Fatal(err)
+	}
+	// Repair chain: r1 depends_on the failed review; r1 -> r2 -> final through supersedes.
+	r1, _, err := s.CreateTask(CreateTaskOptions{ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "implement", Title: "Repair1", Objective: "o", Reason: "r", ParentTaskID: S(fr, "id"), DependsOn: []string{S(fr, "id")}, WorkspaceMode: "collection", Depth: 3, AllowDedupe: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, _, err := s.CreateTask(CreateTaskOptions{ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "implement", Title: "Repair2", Objective: "o", Reason: "r", ParentTaskID: S(fr, "id"), WorkspaceMode: "collection", Depth: 3, AllowDedupe: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SupersedeTask(S(r1, "id"), S(r2, "id"), "rebase"); err != nil {
+		t.Fatal(err)
+	}
+	final, _, err := s.CreateTask(CreateTaskOptions{ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "implement", Title: "Repair3", Objective: "o", Reason: "r", ParentTaskID: S(fr, "id"), WorkspaceMode: "collection", Depth: 3, AllowDedupe: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SupersedeTask(S(r2, "id"), S(final, "id"), "rebase"); err != nil {
+		t.Fatal(err)
+	}
+	// The re-integrated repair re-depends_on the failed review (the incident's repair).
+	if err = s.AddEdge(S(fr, "id"), S(final, "id"), S(c, "id"), "depends_on"); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SetTaskStatus(S(final, "id"), TaskComplete, "repair integrated"); err != nil {
+		t.Fatal(err)
+	}
+	// A fresh passing review verifies ONLY the final repair (no direct depends_on FR).
+	pass, _, err := s.CreateTask(CreateTaskOptions{ProjectID: S(p, "id"), CollectionID: S(c, "id"), Profile: "review", Title: "Fresh pass", Objective: "o", Reason: "r", ParentTaskID: S(final, "id"), DependsOn: []string{S(final, "id")}, WorkspaceMode: "collection", Depth: 4, AllowDedupe: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.AddEdge(S(final, "id"), S(pass, "id"), S(c, "id"), "verifies"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.SubmitResult(S(pass, "id"), Row{"status": "complete", "summary": "repaired", "verdict": "pass", "impact_enumeration": passingImpactEnumeration()}); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SetTaskStatus(S(pass, "id"), TaskComplete, "fresh review passed"); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SetTaskStatus(S(coord, "id"), TaskComplete, "planning complete"); err != nil {
+		t.Fatal(err)
+	}
+	return incidentShape{s: s, cfg: cfg, p: p, c: c, coord: coord, orig: orig, fr: fr, r1: r1, r2: r2, final: final, pass: pass}
+}
+
+// (5) The lemmings incident replay driven by ONE daemon reconcile tick: the collection
+// reaches COMPLETE through the extended shared resolver (the superseded-intermediate shape)
+// and the extended backfill carrier discovery (a passing review verifying a repair in the
+// failed review's lineage), emitting exactly one named REPAIR_LINEAGE_BACKFILLED event and
+// wiring the missing original->passing-review carry. A second reconcile tick (and a fresh
+// scheduler simulating a daemon restart) is byte-idempotent.
+func TestReconcileTickBackfillsSupersededRepairIncidentToComplete(t *testing.T) {
+	sh := buildSupersededRepairIncident(t)
+	// Precondition: the settled incident shape is genuinely BLOCKED — the original is
+	// covered only by its FAILED review, and no carry edge onto the passing review exists.
+	if from := verifiesToT(t, sh.s, S(sh.c, "id"), S(sh.pass, "id")); containsString(from, S(sh.orig, "id")) {
+		t.Fatal("precondition: the original carry edge onto the passing review must be absent before the sweep")
+	}
+	if missing, err := sh.s.ImplementationsMissingPassingReview(S(sh.c, "id")); err != nil || !containsString(missing, S(sh.orig, "id")) {
+		t.Fatalf("precondition: the original must be reported uncovered before the sweep: %v %v", missing, err)
+	}
+
+	if state := backfillReconcileSched(sh.s).reconcileCollectionSafely(S(sh.c, "id")); state != "COMPLETE" {
+		t.Fatalf("one reconcile tick must heal the incident shape to COMPLETE, got %s", state)
+	}
+	if from := verifiesToT(t, sh.s, S(sh.c, "id"), S(sh.pass, "id")); !containsString(from, S(sh.orig, "id")) {
+		t.Fatalf("the sweep must add the original->passing-review carry edge, got %v", from)
+	}
+	if missing, err := sh.s.ImplementationsMissingPassingReview(S(sh.c, "id")); err != nil || len(missing) != 0 {
+		t.Fatalf("the healed incident must satisfy the single coverage rule, got %v %v", missing, err)
+	}
+	if evts := collectionEventsFor(t, sh.s, sh.c, "REPAIR_LINEAGE_BACKFILLED"); len(evts) != 1 {
+		t.Fatalf("the sweep must emit exactly one named backfill event, got %d", len(evts))
+	}
+	if _, _, err := validateCollectionForAcceptance(sh.s, sh.c); err != nil {
+		t.Fatalf("a healed incident collection must pass acceptance validation, got %v", err)
+	}
+
+	baseEdges := edgeCount(t, sh.s, S(sh.c, "id"))
+	baseEvents := len(collectionEventsFor(t, sh.s, sh.c, "REPAIR_LINEAGE_BACKFILLED"))
+	if got := backfillReconcileSched(sh.s).reconcileCollectionSafely(S(sh.c, "id")); got != "COMPLETE" {
+		t.Fatalf("a second tick must keep the healed incident COMPLETE, got %s", got)
+	}
+	if got := backfillReconcileSched(sh.s).reconcileCollectionSafely(S(sh.c, "id")); got != "COMPLETE" {
+		t.Fatalf("a restart-simulated tick must keep the healed incident COMPLETE, got %s", got)
+	}
+	if after := edgeCount(t, sh.s, S(sh.c, "id")); after != baseEdges {
+		t.Fatalf("repeated ticks must be byte-idempotent on edges: %d -> %d", baseEdges, after)
+	}
+	if after := len(collectionEventsFor(t, sh.s, sh.c, "REPAIR_LINEAGE_BACKFILLED")); after != baseEvents {
+		t.Fatalf("repeated ticks must emit zero further backfill events: %d -> %d", baseEvents, after)
+	}
+}
+
+// (6) The shared resolver's superseded-intermediate shape is a genuine discovery rule, not
+// a coverage widening: given the incident's failed review, repairOriginalImplementations
+// resolves the ORIGINAL even though the surviving repair is reached only through superseded
+// intermediates, while still counting depends_on edges as NOTHING (a passing review of an
+// unrelated implement outside the lineage is never a carrier).
+func TestResolverResolvesOriginalsThroughSupersededIntermediates(t *testing.T) {
+	sh := buildSupersededRepairIncident(t)
+	sch := backfillReconcileSched(sh.s)
+	// The failed review's originals include the original implementation directly (its
+	// verifies edge) — the resolver never needs the superseded repair for THAT edge, but
+	// the extended walk must not invent extra coverage: exactly the original is returned.
+	originals, err := sch.repairOriginalImplementations(S(sh.c, "id"), sh.fr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(originals, S(sh.orig, "id")) {
+		t.Fatalf("the shared resolver must resolve the original implementation of the failed review, got %v", originals)
+	}
+	// The passing review carries no coverage for the original until a carry edge exists.
+	if missing, err := sh.s.ImplementationsMissingPassingReview(S(sh.c, "id")); err != nil || !containsString(missing, S(sh.orig, "id")) {
+		t.Fatalf("before any carry wiring the original must remain uncovered: %v %v", missing, err)
+	}
+}
+
+// verifiesToT is the store-only variant of verifiesTo for graphs that are not built with
+// the repairShape helper (e.g. the incident graph).
+func verifiesToT(t *testing.T, s *Store, cid, reviewID string) []string {
+	t.Helper()
+	edges, err := s.ListEdges(cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var from []string
+	for _, edge := range edges {
+		if S(edge, "relation") == "verifies" && S(edge, "to_task_id") == reviewID {
+			from = append(from, S(edge, "from_task_id"))
+		}
+	}
+	return from
+}
+
 // The sweep must not be reachable through a renamed/moved seam: guard the invariant that
 // the carry rule stays a single shared resolver reused by both ensureReview and reconcile.
 func TestRepairLineageBackfillKeepsSharedResolverAndCoverageRule(t *testing.T) {
