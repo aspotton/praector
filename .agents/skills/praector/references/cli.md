@@ -20,7 +20,7 @@ Every `praector` command and its exact usage line (copied verbatim from `command
 | `init` | `Usage: praector init [--name NAME] [--base-branch BRANCH] [--opencode PATH]` | none (registers cwd) | Real write: registers the current repo; needs explicit authorization. | [Initialize](../../../../docs/CLI.md#initialize) |
 | `run` | `Usage: praector run OBJECTIVE [--title TITLE] [--project ID] [--detach] [--max-workers N]` | `OBJECTIVE` | Attached `run` **blocks**; `--detach` only enqueues for a daemon. | [Run an objective](../../../../docs/CLI.md#run-an-objective) |
 | `status` | `Usage: praector status [TARGET] [--project ID] [--no-reconcile]` | `[TARGET]` optional | No target → project-level status; pass a `COL-*`/`T-*` for that scope. `--no-reconcile` (alias `--observed`) renders stored state with zero writes. | [Status](../../../../docs/CLI.md#status) |
-| `graph` | `Usage: praector graph [COLLECTION] [--project ID]` | `[COLLECTION]` optional | Defaults to the latest collection. | [Graph](../../../../docs/CLI.md#graph) |
+| `graph` | `Usage: praector graph [COLLECTION] [--project ID] [--edges]` | `[COLLECTION]` optional | Defaults to the latest collection. | [Graph](../../../../docs/CLI.md#graph) |
 | `daemon` | `Usage: praector daemon [--once] [--max-workers N]` | none | Only one scheduler owner per `PRAECTOR_HOME`; `--once` reconciles and exits. | [Scheduler / daemon](../../../../docs/CLI.md#scheduler--daemon) |
 | `doctor` | `Usage: praector doctor` | none | Validates dependencies and registration; no args. | [Doctor](../../../../docs/CLI.md#doctor) |
 | `logs` | `Usage: praector logs TARGET [--tail N]` | `TARGET` (required) | `--tail N` streams a running Attempt's real output. | [Logs](../../../../docs/CLI.md#logs) |

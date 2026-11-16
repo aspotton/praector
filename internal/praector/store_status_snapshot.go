@@ -370,6 +370,70 @@ func terminalStateForCollection(collection Row, tasks, edges Rows, openRevisions
 	return desired
 }
 
+// Collection blocked-reason predicates. A terminal Collection that reconciles
+// BLOCKED always has one mechanical reason holding it there; these names replace
+// the former speculative recovery / floor-predicate guess string. They are
+// projected from the SAME decision cores as
+// terminalStateForCollection (implementationsMissingPassingReviewFromRows, the
+// open-revision bucket, critic revalidation staleness, and the delivery-policy
+// classifier) so no parallel predicate can drift from the one that actually
+// decided BLOCKED. They are observability labels only and change no decision.
+const (
+	blockedReasonCoverageGap     = "COVERAGE_GAP"
+	blockedReasonOpenRevisions   = "OPEN_REVISIONS"
+	blockedReasonCriticStale     = "CRITIC_STALE"
+	blockedReasonDeliveryPending = "DELIVERY_POLICY"
+)
+
+// collectionBlockedReason projects the single mechanical reason a terminal
+// Collection is being held BLOCKED, mirroring terminalStateForCollection exactly
+// over the already-loaded snapshot rows. It returns the empty predicate when the
+// cores would NOT hold the collection BLOCKED (i.e. they would call it COMPLETE
+// or RUNNING), so callers never name a reason for a collection the decision
+// cores are not actually blocking. The detail names the offending ids where the
+// core produces them (coverage-gap implement ids, or open-revision ids).
+func collectionBlockedReason(collection Row, tasks, edges Rows, openRevisions Rows, runnable, runningSession bool, criticRow Row) (predicate string, detail string) {
+	if len(tasks) == 0 {
+		return "", ""
+	}
+	allTerm, hasComplete, hasExec := collectionTerminalFlags(tasks)
+	if !hasExec && !runnable && runningSession {
+		hasExec = true
+	}
+	if len(openRevisions) > 0 {
+		if hasExec || runnable {
+			return "", ""
+		}
+		ids := make([]string, 0, len(openRevisions))
+		for _, r := range openRevisions {
+			ids = append(ids, S(r, "id"))
+		}
+		return blockedReasonOpenRevisions, strings.Join(ids, ",")
+	}
+	if allTerm && hasComplete {
+		dp := ClassifyDeliveryPolicy(S(collection, "objective"))
+		completedImpl := 0
+		for _, t := range tasks {
+			if S(t, "profile") == "implement" && S(t, "status") == TaskComplete {
+				completedImpl++
+			}
+		}
+		missingDelivery := dp.ImplementationRequired && completedImpl == 0
+		mr := implementationsMissingPassingReviewFromRows(tasks, edges)
+		stale := effectivePlanningPolicy(collection).CriticRequired && B(criticRow, "stale")
+		if missingDelivery {
+			return blockedReasonDeliveryPending, ""
+		}
+		if len(mr) > 0 {
+			return blockedReasonCoverageGap, strings.Join(mr, ",")
+		}
+		if stale {
+			return blockedReasonCriticStale, ""
+		}
+	}
+	return "", ""
+}
+
 // ---------------------------------------------------------------------------
 // Pure ancestry-walk core (Phase 3.5)
 // ---------------------------------------------------------------------------

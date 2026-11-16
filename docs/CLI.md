@@ -73,10 +73,12 @@ praector status T-def456
 ## Graph
 
 ```bash
-praector graph [COLLECTION] [--project PROJECT]
+praector graph [COLLECTION] [--project PROJECT] [--edges]
 ```
 
-Displays Tasks and dependency relationships for a Collection. With no Collection, defaults to the latest Collection in project context.
+Displays Tasks and dependency relationships for a Collection. With no Collection, defaults to the latest Collection in project context. `--edges` additionally lists the `verifies` carry edges (repair-lineage coverage) so operators can see which implementation each review verifies without raw Dolt SQL.
+
+A Collection held `BLOCKED` prints a `blocked by:` line naming the mechanical holding predicate (`COVERAGE_GAP`, `OPEN_REVISIONS`, `CRITIC_STALE`, or `DELIVERY_POLICY`) instead of a speculative diagnosis.
 
 ## Scheduler / daemon
 

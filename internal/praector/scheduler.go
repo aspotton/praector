@@ -1604,7 +1604,7 @@ func (s *Scheduler) observeStuckFloorHolds(c Row, tasks Rows, fp string) {
 		}
 		reason := "Implement " + tid + " is held by the artifact " + holdKind +
 			" and has been refused repeatedly with no graph movement since the last refusal; the floor predicate may be disagreeing with the graph."
-		s.raiseStuckFloorAttention(pid, cid, tid, fp, holdKind, tid, reason)
+		s.raiseStuckFloorAttention(pid, cid, tid, fp, holdKind, tid, reason, nil)
 	}
 }
 
@@ -1637,20 +1637,38 @@ func (s *Scheduler) observeStuckCollectionBlock(c Row, tasks Rows, fp string) {
 	if s.stuckFloorAttentionRaised(pid, cid, "", fp) {
 		return
 	}
-	reason := "Collection " + cid + " is BLOCKED but its graph contains no nonterminal or blocking task, so no graph movement can occur; it may be stuck on a recovery or floor-predicate bug."
-	s.raiseStuckFloorAttention(pid, cid, "", fp, "collection_block", caller, reason)
+	// Name the mechanical predicate the terminal-decision cores are actually
+	// holding this collection on, projected from the SAME cores as
+	// terminalStateForCollection (never a parallel predicate), instead of the
+	// former speculative recovery/floor-predicate guess.
+	predicate, offending := s.Store.CollectionBlockedReason(cid)
+	if predicate == "" {
+		predicate, offending = "COLLECTION_BLOCKED_REASON", ""
+	}
+	reason := "Collection " + cid + " is BLOCKED but its graph contains no nonterminal or blocking task, so no graph movement can occur; the holding predicate is " + predicate + "."
+	if offending != "" {
+		reason += " Offending task(s): " + offending + "."
+	}
+	s.raiseStuckFloorAttention(pid, cid, "", fp, "collection_block", caller, reason, Row{"blocked_reason": predicate, "offending": offending})
 }
 
 // raiseStuckFloorAttention emits the durable STUCK_FLOOR_ATTENTION marker (the dedup
 // record keyed to the graph-state fingerprint) and requests a single NON-blocking
 // Coordinator attention. It tolerates the RequestCoordinatorAttention error (task/depth
 // caps) WITHOUT emitting a marker or crashing reconciliation, so the sweep can retry on
-// a later cycle rather than falsely satisfying its own dedup on a no-op.
-func (s *Scheduler) raiseStuckFloorAttention(pid, cid, taskID, fp, holdKind, callerID, reason string) {
+// a later cycle rather than falsely satisfying its own dedup on a no-op. The optional
+// extra payload (for the collection-block twin: the named COLLECTION_BLOCKED_REASON /
+// COVERAGE_GAP holding predicate and its offending ids) rides on the same dedup marker
+// so operators see the mechanical blocker without a speculative guess.
+func (s *Scheduler) raiseStuckFloorAttention(pid, cid, taskID, fp, holdKind, callerID, reason string, extra Row) {
 	if _, _, err := s.Store.RequestCoordinatorAttention(callerID, reason, false, s.projectLimits(pid)); err != nil {
 		return
 	}
-	_ = s.Store.Event(pid, cid, taskID, "", "STUCK_FLOOR_ATTENTION", Row{"fingerprint": fp, "hold_kind": holdKind})
+	payload := Row{"fingerprint": fp, "hold_kind": holdKind}
+	for k, v := range extra {
+		payload[k] = v
+	}
+	_ = s.Store.Event(pid, cid, taskID, "", "STUCK_FLOOR_ATTENTION", payload)
 }
 
 // acceptanceReadinessEvent is the durable dedup marker for the acceptance-readiness
@@ -2396,6 +2414,11 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 		current, _ = s.Store.GetTask(taskID)
 	}
 	profile := S(task, "profile")
+	// Per-attempt single-attention latch (fix 5): an integration-failed implement and
+	// the generic task-failed site reference the SAME root failure, so they must yield
+	// exactly ONE Coordinator attention. The latch starts unset for this attempt, so an
+	// unrelated later failure still raises its own attention.
+	attentionRaised := false
 	if profile == "implement" && !phantomRejected {
 		head, e := s.Workspace.Checkpoint(current, I(attempt, "attempt_no"), "attempt-checkpoint")
 		if e != nil {
@@ -2408,7 +2431,7 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 			}
 			current, _ = s.Store.GetTask(taskID)
 			if S(current, "status") == TaskVerifying {
-				integrated, e := s.Workspace.IntegrateTask(project, collection, current)
+				integrated, e := s.integrateWithConflictRetry(project, collection, current, S(attempt, "id"))
 				if e == nil {
 					_ = s.Store.Event(S(current, "project_id"), S(current, "collection_id"), taskID, S(attempt, "id"), "TASK_INTEGRATED", Row{"head": integrated, "checkpoint": S(current, "current_head")})
 					e = s.ensureReview(project, collection, current)
@@ -2417,7 +2440,7 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 					_ = s.Store.SetTaskStatus(taskID, TaskComplete, "task "+taskID+": integration complete")
 				} else {
 					_, _ = s.Store.SubmitResult(taskID, Row{"status": "failed", "summary": "Implementation completed but integration failed: " + e.Error(), "risks": []any{"Git integration or workspace identity validation failed"}})
-					_, _, _ = s.Store.RequestCoordinatorAttention(taskID, "Integration failed for "+taskID+": "+e.Error(), false, s.limits(project))
+					s.raiseTaskFailureAttention(&attentionRaised, project, taskID, "Integration failed for "+taskID+": "+e.Error())
 				}
 			}
 		}
@@ -2441,7 +2464,10 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 	s.processResultMetadata(task)
 	finalTask, _ := s.Store.GetTask(taskID)
 	if S(finalTask, "status") == TaskFailed && S(finalTask, "profile") != "coordinator" {
-		_, _, _ = s.Store.RequestCoordinatorAttention(taskID, fmt.Sprintf("Task %s (%s) failed and may require replacement or graph repair.", taskID, S(finalTask, "title")), false, s.limits(project))
+		// Fix 5: the integration-failed site above already raised the single attention
+		// for this root failure; the generic site is skipped so one failure yields one
+		// attention. An unrelated FAILED (no integration attention raised) still gets one.
+		s.raiseTaskFailureAttention(&attentionRaised, project, taskID, fmt.Sprintf("Task %s (%s) failed and may require replacement or graph repair.", taskID, S(finalTask, "title")))
 	}
 	attemptStatus := AttemptSucceeded
 	if harnessResult.TimedOut {
@@ -2456,6 +2482,68 @@ func (s *Scheduler) ExecuteTask(taskID string) {
 	ec := harnessResult.ExitCode
 	_ = s.Store.FinishAttempt(S(attempt, "id"), attemptStatus, &ec, attemptResult, harnessResult.ExternalSessionID, logPath)
 	_ = s.Store.Event(S(finalTask, "project_id"), S(finalTask, "collection_id"), taskID, S(attempt, "id"), "ATTEMPT_FINISHED", Row{"task_status": S(finalTask, "status"), "attempt_status": attemptStatus})
+}
+
+// isIntegrationConflict reports whether an IntegrateTask error is a git merge
+// CONFLICT (the incident's README-only auto-merge failure against an integrated
+// sibling) as opposed to a workspace-identity, dirty-target, or verification
+// failure. Only the exact "Integration conflict for" marker emitted by
+// GitWorkspace.IntegrateTask on a merge that was already aborted is treated as a
+// retryable conflict, so an identity/verification failure is never retried as if
+// it were a content conflict.
+func isIntegrationConflict(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Integration conflict for ")
+}
+
+// integrateWithConflictRetry integrates a task checkpoint, and on a git merge
+// CONFLICT makes EXACTLY ONE automatic re-integration against a freshly re-read
+// collection integration HEAD (fix 4). The decision to re-attempt is gated by a
+// working-tree-free `git merge-tree --write-tree` probe whose process EXIT CODE is
+// the sole conflict predicate:
+//
+//   - probe clean (exit 0): emit one audited INTEGRATION_RETRY event and re-invoke
+//     the existing --no-ff integrate semantics (IntegrateTask re-reads the current
+//     integration HEAD itself); a clean merge then succeeds;
+//   - probe conflict (exit 1) or probe error: keep FAILED with the ORIGINAL
+//     conflict detail and DO NOT retry the merge (a probe failure is never read as
+//     clean or as a resolvable conflict).
+//
+// No rebase, cherry-pick, side-picking, or branch mutation is ever performed; the
+// re-integration is the same immutable-checkpoint --no-ff merge with merge --abort
+// on conflict, so fast-forward-safe acceptance stays byte-identical.
+func (s *Scheduler) integrateWithConflictRetry(project, collection Row, current Row, attemptID string) (string, error) {
+	integrated, err := s.Workspace.IntegrateTask(project, collection, current)
+	if err == nil || !isIntegrationConflict(err) {
+		return integrated, err
+	}
+	verdict, perr := s.Workspace.ProbeReintegration(project, collection, current)
+	if perr != nil || verdict != ReintegrateClean {
+		return integrated, err // persistent conflict or probe unavailable: keep FAILED with conflict detail
+	}
+	_ = s.Store.Event(S(current, "project_id"), S(current, "collection_id"), S(current, "id"), attemptID, "INTEGRATION_RETRY", Row{"checkpoint": S(current, "current_head"), "reason": "clean re-integration against current integration HEAD"})
+	retry, rerr := s.Workspace.IntegrateTask(project, collection, current)
+	if rerr != nil {
+		return integrated, rerr
+	}
+	return retry, nil
+}
+
+// raiseTaskFailureAttention requests one NON-blocking Coordinator attention for a
+// failed task (fix 5). The per-attempt `raised` latch collapses the integration-
+// failed site and the generic task-failed site — the SAME root failure — into a
+// single attention, while a distinct later failure in the attempt still raises its
+// own. It preserves RequestCoordinatorAttention's blocking=false / AllowDedupe:false
+// semantics exactly (only the call-site count is deduplicated); the blocking
+// plan-review-rejection attention and the stuck-floor attention sweeps are separate
+// call sites and untouched.
+func (s *Scheduler) raiseTaskFailureAttention(raised *bool, project Row, taskID, reason string) {
+	if raised != nil {
+		if *raised {
+			return
+		}
+		*raised = true
+	}
+	_, _, _ = s.Store.RequestCoordinatorAttention(taskID, reason, false, s.limits(project))
 }
 
 func (s *Scheduler) maxWorkersFor(collectionID string) int {

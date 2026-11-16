@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -354,6 +355,9 @@ func formatCollectionStatus(c CollectionStatus) {
 		summary = "no tasks (invalid/orphaned; `praector daemon --once` will repair)"
 	}
 	fmt.Printf("%s  %s  %s\n  objective: %s\n  branch: %s\n", c.ID, c.Status, c.Title, c.Objective, c.Branch)
+	if c.BlockedReason != "" {
+		fmt.Printf("  blocked by: %s\n", c.BlockedReason)
+	}
 	if c.Acceptance != nil {
 		fmt.Printf("  accepted: %s @ %s (%s, %s)\n", S(c.Acceptance, "target_branch"), shortSHA(S(c.Acceptance, "accepted_commit")), S(c.Acceptance, "merge_mode"), S(c.Acceptance, "created_at"))
 	}
@@ -415,12 +419,12 @@ func cmdStatus(args []string) int {
 	return 0
 }
 func cmdGraph(args []string) int {
-	p, e := parseArgs(args, map[string]bool{"project": true})
+	p, e := parseArgs(args, map[string]bool{"project": true, "edges": false})
 	if e != nil {
 		return fail(e)
 	}
 	if len(p.Pos) > 1 {
-		return fail(fmt.Errorf("usage: praector graph [COLLECTION] [--project ID]"))
+		return fail(fmt.Errorf("usage: praector graph [COLLECTION] [--project ID] [--edges]"))
 	}
 	svc, e := newService()
 	if e != nil {
@@ -442,6 +446,14 @@ func cmdGraph(args []string) int {
 			d = "-"
 		}
 		fmt.Printf("  %s [%-10s] %-11s %s  deps=%s\n", S(t, "id"), S(t, "status"), S(t, "profile"), S(t, "title"), d)
+	}
+	if p.bool("edges") {
+		for _, t := range out.Tasks {
+			if vs := out.Verifies[S(t, "id")]; len(vs) > 0 {
+				sort.Strings(vs)
+				fmt.Printf("  %s verifies<-%s\n", S(t, "id"), strings.Join(vs, ","))
+			}
+		}
 	}
 	return 0
 }

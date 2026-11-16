@@ -22,9 +22,9 @@ Create a collection and execute its evolving work graph.
 
 Show project, collection, or task status. Pass --no-reconcile (alias --observed) to render the stored state without reconciling (zero writes).
 `,
-	"graph": `Usage: praector graph [COLLECTION] [--project ID]
+	"graph": `Usage: praector graph [COLLECTION] [--project ID] [--edges]
 
-Show the current durable task graph.
+Show the current durable task graph. With --edges also list verifies carry edges.
 `,
 	"daemon": `Usage: praector daemon [--once] [--max-workers N]
 
