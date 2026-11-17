@@ -250,3 +250,19 @@ func TestBrowserEvidencePromptContract(t *testing.T) {
 		t.Fatal("embedded review.md must carry the browser-free single-frame-is-a-findings motion clause")
 	}
 }
+
+// The embedded implement prompt must carry the commit-increment expectation: worker
+// sessions are disposable and the git commit is the durability boundary, so commits
+// are an expectation, not a discretionary option. Pinned against the EMBEDDED assets
+// (assets.FS), not the on-disk file, so a build/embedding regression fails here; the
+// same canonical sentence is the docs/AGENT_PROTOCOL.md implement-section clause.
+func TestImplementCommitIncrementPromptContract(t *testing.T) {
+	const canonical = "Commit every coherent increment; assume the session can die at any moment, so uncommitted work is treated as lost work."
+	impl, err := assets.FS.ReadFile("prompts/implement.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(impl), canonical) {
+		t.Fatal("embedded implement.md must carry the commit-increment expectation")
+	}
+}

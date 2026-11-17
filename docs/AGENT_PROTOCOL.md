@@ -53,7 +53,7 @@ The same specialists may submit `status: waiting` with `explore_required` when t
 
 ### `implement`
 
-The only write-capable profile. It makes the bounded project-file change, runs relevant verification, and reports concrete evidence.
+The only write-capable profile. It makes the bounded project-file change, runs relevant verification, and reports concrete evidence. Commit every coherent increment; assume the session can die at any moment, so uncommitted work is treated as lost work — the attempt-boundary checkpoint is a safety net, not the commit strategy.
 
 ### `review`
 
