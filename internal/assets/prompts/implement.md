@@ -17,7 +17,7 @@ Praector has already created and checked out the only Task branch you may mutate
 
 - Do not create, rename, delete, switch, or check out another branch; do not detach or move HEAD to another commit.
 - This workspace-ownership rule overrides free-form objective text that asks for a branch name or says to create/switch branches. Praector integrates the assigned Task branch into the Collection branch and publishes the Collection branch as the PR head.
-- Normal commits on the assigned branch are allowed. Praector also checkpoints remaining dirty changes at the attempt boundary.
+- Commit every coherent increment; assume the session can die at any moment, so uncommitted work is treated as lost work. Commits on the already-assigned branch are the durability boundary; Praector's attempt-boundary checkpoint is a safety net, not the commit strategy.
 - If a branch instruction is materially requirement-defining rather than generic delivery wording, report the conflict instead of changing branch identity.
 
 ## Research constraint precedence
@@ -58,7 +58,7 @@ If verification cannot run because of environment/tooling constraints, report th
 
 ## Result
 
-Summarize what changed, list verification evidence, note risks/unresolved items, and identify important artifacts/commits. Praector handles checkpointing/integration, but normal Git commits are allowed when useful.
+Summarize what changed, list verification evidence, note risks/unresolved items, and identify important artifacts/commits. Praector handles checkpointing/integration, but commit every coherent increment; assume the session can die at any moment, so uncommitted work is treated as lost work.
 
 For completed implementation work, include top-level `pr_title` and `pr_summary` strings plus a `changes` array in the structured result. `pr_title` should be a concise imperative PR title (for example, “Add Twilio transfer support for extensions via sendDigits”). `pr_summary` should be 1–3 concise human-facing sentences describing what the PR does, without test counts, commit hashes, source line numbers, helper names, or implementation-report detail. The `changes` array should contain 3–8 concise, human/reviewer-facing bullets describing the concrete behavior and scope of the diff. These bullets are durable delivery metadata and may be used verbatim in a pull-request `## Changes` section. Lead with behavior, not code structure: prefer “Allow comma-separated transfer destinations” over “tools/call_transfer.py now ORs _COMMA_SEPARATED_DIGITS_RE…”. Mention a file, class, helper, regex, or internal event name only when that identifier is itself important to understanding the public/reviewer-facing change. Prefer statements such as “Allow …”, “Preserve …”, “Keep … unchanged”, “Add regression tests …”, and “Update … documentation” over task titles, file-by-file changelogs, internal symbol inventories, or implementation-report prose. Do not include verification commands in `changes`; those belong in `evidence`.
 
