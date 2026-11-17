@@ -1,6 +1,7 @@
 package praector
 
 import (
+	"github.com/datascape/praector/internal/assets"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -218,5 +219,34 @@ func TestStrayCDPURLStrippedForNonGranted(t *testing.T) {
 	}
 	if res.FinalText != "clean" {
 		t.Fatalf("a stray parent PRAECTOR_CDP_URL leaked into a non-granted attempt: %q", res.FinalText)
+	}
+}
+
+// The embedded browser-evidence prompt contracts must require MOTION evidence (a
+// tick-stepped frame sequence plus a per-tick state trace, not a single frame) in
+// implement.md, and must flag a single-frame motion claim as a finding in review.md.
+// Both sentences are pinned against the EMBEDDED assets (assets.FS), not the on-disk
+// files, so a build/embedding regression fails here rather than shipping a regressed prompt.
+func TestBrowserEvidencePromptContract(t *testing.T) {
+	impl, err := assets.FS.ReadFile("prompts/implement.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	implText := string(impl)
+	for _, want := range []string{
+		"A single frame proves placement, never motion.",
+		"tick-stepped frame sequence",
+		"per-tick state trace",
+	} {
+		if !strings.Contains(implText, want) {
+			t.Fatalf("embedded implement.md browser-evidence motion clause missing %q", want)
+		}
+	}
+	rev, err := assets.FS.ReadFile("prompts/review.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rev), "is a finding while its implementation made that motion/animation claim and had browser access") {
+		t.Fatal("embedded review.md must carry the browser-free single-frame-is-a-findings motion clause")
 	}
 }
